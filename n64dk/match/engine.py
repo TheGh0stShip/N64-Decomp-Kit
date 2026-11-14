@@ -61,7 +61,9 @@ class Outcome:
                "pipeline": self.spec.pipeline, "flags": " ".join(self.spec.flags), "exact": self.exact}
         if self.digest is not None:
             out["sha256_text"] = self.digest
-            out["digest_ok"] = self.digest_ok
+            out["digest_ok"] = self.digest_ok if self.digest_ok is not None else self.exact
+            out["digest_authority"] = ("expected-manifest-hash" if self.digest_ok is not None
+                                       else "exact-target-text-byte-comparison")
         if self.result is not None:
             out.update(self.result.as_dict())
             out["exact"] = self.exact

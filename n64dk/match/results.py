@@ -88,6 +88,29 @@ class ResultIndex:
     def close(self):
         self.db.close()
 
+    def record_direct(self, payload: dict, context: dict, source_path: str | Path,
+                      function_name: str | None = None, validity: str = "unknown_provenance") -> str:
+        source = Path(source_path)
+        raw = source.read_bytes()
+        source_digest = hashlib.sha256(raw).hexdigest()
+        self.db.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?,?)",
+                        (source_digest, str(source.resolve()), _source_digest(raw), len(raw)))
+        address = _integer(context.get("addr")); size = _integer(context.get("size"))
+        score = _integer(payload.get("diff", {}).get("score"))
+        exact = bool(payload.get("exact"))
+        value = {"image": context.get("rom_sha256"), "address": address, "size": size,
+                 "target": context.get("target_text_sha256"), "delta": context.get("vram_delta"),
+                 "source": source_digest, "pipeline": payload.get("pipeline"),
+                 "flags": payload.get("flags"), "object": payload.get("sha256_text")}
+        observation_id = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:24]
+        self.db.execute("INSERT OR REPLACE INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (observation_id, "direct-match", "result", function_name, address, size, score, int(exact),
+             str(source.resolve()), source_digest, context.get("rom_sha256"), context.get("vram_delta"),
+             context.get("target_text_sha256"), _residual(payload), validity, "direct-match",
+             json.dumps(payload, sort_keys=True, default=str), time.time_ns()))
+        self.db.commit()
+        return observation_id
+
     def _inventory_maps(self, inventory: dict | None):
         by_name, by_addr = {}, {}
         for row in (inventory or {}).get("functions", []):
@@ -262,7 +285,7 @@ class ResultIndex:
 
     def query(self, function=None, max_score=None, exact_only=False, validity=None,
               stale_mapping=False, missing_source=False, timeline=False, limit=100):
-        sql = "SELECT observation_id,file_path,function_name,address,size,score,exact,source_path,source_digest,residual,validity,payload,observed_ns FROM observations WHERE 1=1"
+        sql = "SELECT observation_id,file_path,function_name,address,size,score,exact,source_path,source_digest,image_digest,vram_delta,target_digest,residual,validity,payload,observed_ns FROM observations WHERE 1=1"
         args = []
         if function:
             sql += " AND function_name=?"; args.append(function)
@@ -278,13 +301,45 @@ class ResultIndex:
             sql += " AND validity NOT IN ('stale_mapping','boundary_changed','stale_image')"
         sql += " ORDER BY " + ("observed_ns" if timeline else "exact DESC,score IS NULL,score,observed_ns DESC")
         result = []
+        identities = {}
+        objects = {}
         for row in self.db.execute(sql, args):
             item = dict(zip(("observation_id","file","function","address","size","score","exact",
-                             "source","source_digest","residual","validity","payload","observed_ns"), row))
+                             "source","source_digest","image_digest","vram_delta","target_digest",
+                             "residual","validity","payload","observed_ns"), row))
             item["exact"] = bool(item["exact"])
             item["residual"] = json.loads(item["residual"])
             item["payload"] = json.loads(item["payload"])
+            payload = item["payload"]
+            object_digest = payload.get("sha256_text") or payload.get("generated_text_digest")
+            pipeline = payload.get("pipeline")
+            flags = payload.get("flags")
+            identity_value = {"function": item["function"], "image": item["image_digest"],
+                              "vram": item["address"], "size": item["size"],
+                              "target": item["target_digest"],
+                              "delta": item["vram_delta"], "source": item["source_digest"],
+                              "compiler": payload.get("compiler_digest"), "flags": flags,
+                              "pipeline": pipeline, "object": object_digest}
+            stable = hashlib.sha256(json.dumps(identity_value, sort_keys=True).encode()).hexdigest()[:24]
+            item["stable_identity"] = stable
+            item["observation_class"] = (
+                "exact_current_target" if item["exact"] and item["validity"] == "valid_current_target" and identity_value["target"] else
+                "exact_stale_target" if item["exact"] and item["validity"] in {"stale_mapping", "boundary_changed", "stale_image"} else
+                "exact_unknown_provenance" if item["exact"] else
+                "score_zero_normalized_only" if item["score"] == 0 else "near_match")
+            if stable in identities:
+                item["observation_class"] = "duplicate_observation"
+                item["duplicate_of"] = identities[stable]
+            else:
+                identities[stable] = item["observation_id"]
+            if object_digest:
+                previous = objects.get(object_digest)
+                if previous and previous != item["source_digest"]:
+                    item["relationship"] = "same_object_different_source"
+                objects.setdefault(object_digest, item["source_digest"])
             if missing_source and item["source"] and Path(item["source"]).exists():
+                continue
+            if item["observation_class"] == "duplicate_observation":
                 continue
             result.append(item)
             if len(result) >= limit:

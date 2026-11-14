@@ -111,6 +111,18 @@ export, and proof boundaries.
 | `residual-clusters --max-score N` | Group typed, address-independent residuals across related functions |
 | `script-index PROJECT...` / `script-query` | Inventory scattered sweeps, audits, transforms, scorers and build wrappers |
 | `operation-schema` / `automation-serve` | Expose typed operations over newline-delimited JSON for local controllers |
+| `doctor --profile matching` | Validate ROM, host tools, original toolchains, paths, storage and optional research capabilities |
+| `compiler-capabilities` | Inspect or selectively invalidate per-toolchain, stage and option capability evidence |
+| `prototype-matrix` / `register-lifetime-explore` / `match-matrix` | Run bounded ABI, allocation and declarative experiment families |
+| `control-flow-explore` / `clone-family-transfer` | Classify branch targets, test loop-exit forms and transfer sibling CFGs |
+| `family-session-start` / `tu-session-start` | Preserve cross-function and real translation-unit experiment context |
+| `frontier-synthesize` / `compiler-explain` / `residual-attribution` | Turn complementary residual evidence into discriminating experiments |
+| `code-query` / `asm-query` / `negatives-query` | Search source, manifests, historical failures and structural assembly without shell pipelines |
+| `boundary-audit` / `boundary-correct` | Audit CFG/Splat/ownership evidence and prepare denominator-safe corrections |
+| `integrate-winner` / `integration-audit` / `gate-delta` | Verify exact winners twice and prepare reviewable integration/gate transactions |
+| `project-gate` | Run project-defined gates with compact image and failure summaries |
+| `scheduler-plan` / `scheduler-status` | Persist separate discovery, exploitation, recovery, boundary, family and verification lanes |
+| `workbench-snapshot` / `self-test` | Produce one-call function context and run canonical test discovery |
 | `match-session-prepare-winner SESSION_ID DIR` | Independently recompile an exact winner and prepare an auditable export queue |
 | `match-job-run PROJECT.toml --unit UNIT` | Create or resume a bounded, persistent candidate/compile/diagnose search job |
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |
@@ -139,6 +151,7 @@ report = survey.run(rom)["report"]
 ## Documentation
 
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): module map and conventions
+* [docs/workbench.md](docs/workbench.md): ownership, bounded exploration, search, integration and scheduling
 * [docs/boot.md](docs/boot.md): entry-routine analysis and boot emulation
 * [docs/survey.md](docs/survey.md): program image, survey and ROM ledger
 * [docs/functions.md](docs/functions.md), [docs/datamap.md](docs/datamap.md),

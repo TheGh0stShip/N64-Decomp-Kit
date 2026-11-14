@@ -24,11 +24,44 @@ def _inventory_args(p):
     p.add_argument("--coverage-authority", choices=("manifest",), default="manifest")
     p.add_argument("--show-suspect-coverage", action="store_true")
     p.add_argument("--explain", help="explain classification for a function name or VRAM")
+    p.add_argument("--assert-consistent", action="store_true")
+    p.add_argument("--image")
+    p.add_argument("--state")
+    p.add_argument("--exclude", help="comma-separated ownership states")
+    p.add_argument("--after", type=lambda value: int(value, 0))
+    p.add_argument("--before", type=lambda value: int(value, 0))
+    p.add_argument("--fields", help="comma-separated output fields")
+    p.add_argument("--names-only", action="store_true")
+    p.add_argument("--count-only", action="store_true")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--summary-only", action="store_true")
+    p.add_argument("--image-file", action="append", default=[], metavar="NAME=PATH")
+    p.add_argument("--boundary-aware", action="store_true")
 
 
 @command("match-inventory", "Build an interval-correct function and translation-unit inventory")
 def match_inventory(args):
     result = invmod.build(args.project, args.refresh_sources)
+    if args.boundary_aware:
+        mappings = dict(value.split("=", 1) for value in args.image_file)
+        for row in result["functions"]:
+            image_path = mappings.get(row["image"])
+            if not image_path or row["state"] == "covered":
+                continue
+            try:
+                evidence = preflight(image_path, from_inventory(row), row.get("catalogue_status", ""))
+                row["entry_preflight"] = evidence["entry_preflight"]
+                if evidence["entry_preflight"]["entry_status"] == "reject" and not evidence["entry_preflight"]["call_target_evidence"]:
+                    row["state"] = "excluded"; row["ownership_state"] = "fragment"
+                    row["reason"] = "CFG/prologue fragment evidence: " + ", ".join(evidence["entry_preflight"]["reason_codes"])
+            except ValueError as error:
+                row["state"] = "excluded"; row["ownership_state"] = "fragment"
+                row["reason"] = str(error)
+    if args.assert_consistent and not result["consistency"]["ok"]:
+        raise ValueError(f"inventory inconsistent: {len(result['consistency']['conflicts'])} conflicts; "
+                         f"{len(result['consistency']['missing_ownership'])} unowned intervals; "
+                         f"denominator={result['consistency'].get('denominator_mismatch')}")
     if args.explain:
         try:
             address = int(args.explain, 0)
@@ -40,6 +73,31 @@ def match_inventory(args):
     elif args.show_suspect_coverage:
         result["suspect_coverage"] = [row for row in result["functions"]
                                       if row["candidate_source"] and row["state"] != "covered"]
+    elif args.remaining or args.image or args.state or args.exclude or args.after is not None or args.before is not None:
+        rows = result["functions"]
+        if args.remaining:
+            rows = [row for row in rows if row["state"] == "remaining"]
+        if args.image:
+            rows = [row for row in rows if row["image"] == args.image]
+        if args.state:
+            rows = [row for row in rows if row["state"] == args.state or row["ownership_state"] == args.state]
+        excluded = set((args.exclude or "").split(",")) - {""}
+        rows = [row for row in rows if row["ownership_state"] not in excluded]
+        if args.after is not None:
+            rows = [row for row in rows if int(row["vram"], 0) >= args.after]
+        if args.before is not None:
+            rows = [row for row in rows if int(row["vram"], 0) < args.before]
+        total = len(rows)
+        page = rows[args.offset:args.offset + max(0, args.limit)]
+        if args.names_only:
+            page = [row["name"] for row in page]
+        elif args.fields:
+            fields = args.fields.split(",")
+            page = [{key: row.get(key) for key in fields} for row in page]
+        result = {"summary": result["summary"], "count": total,
+                  "items": [] if args.count_only or args.summary_only else page,
+                  "next_cursor": args.offset + len(page) if args.offset + len(page) < total else None,
+                  "truncated": args.offset + len(page) < total}
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -402,6 +460,15 @@ def quickwin_sweep_status(args):
         result = {"tranche_id": args.tranche_id, "project": tranche[0],
                   "inventory_digest": tranche[1], "jobs": tranche[2], "status": counts,
                   "created_ns": tranche[3], "updated_ns": tranche[4], "matched": len(items)}
+        aggregate = db.execute("""SELECT COUNT(*), COUNT(candidate_source), COUNT(DISTINCT candidate_source),
+                                  COUNT(session_id), COUNT(DISTINCT session_id),
+                                  SUM(CASE WHEN status='exact' THEN 1 ELSE 0 END),
+                                  SUM(CASE WHEN comparison='improved' THEN 1 ELSE 0 END),
+                                  SUM(CASE WHEN comparison='tied' THEN 1 ELSE 0 END)
+                           FROM tranche_items WHERE tranche_id=?""", (args.tranche_id,)).fetchone()
+        result["quality_metrics"] = dict(zip(("catalogue_selected", "with_candidate_source",
+            "unique_candidate_sources", "compiled", "unique_sessions", "exact_matches",
+            "improved_frontiers", "unchanged_frontiers"), aggregate))
         if not args.summary_only:
             result["items"] = items
         return result

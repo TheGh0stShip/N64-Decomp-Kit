@@ -26,6 +26,8 @@ result_index.arguments = _index_args
 
 
 def _query_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
     p.add_argument("--database", default=".n64dk/results.sqlite")
     p.add_argument("--function")
     p.add_argument("--max-score", type=int)
@@ -41,11 +43,16 @@ def _query_args(p):
     p.add_argument("--not-in-manifest", action="store_true")
     p.add_argument("--same-residual")
     p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--summary-only", action="store_true")
 
 
 @command("result-query", "Query valid historical frontiers while excluding stale target observations")
 def result_query(args):
-    index = ResultIndex(args.database)
+    database = args.database
+    if database == ".n64dk/results.sqlite":
+        database = str(__import__("pathlib").Path(args.project).resolve() / database)
+    index = ResultIndex(database)
     try:
         rows = index.query(args.function or args.same_residual, args.max_score, args.exact_only,
                            args.validity, args.stale_mapping, args.missing_source,
@@ -54,7 +61,8 @@ def result_query(args):
             residual = rows[0]["residual"]
             rows = [row for row in index.query(max_score=args.max_score, limit=100000)
                     if row["residual"] == residual][:args.limit]
-        result = {"count": len(rows), "observations": rows}
+        rows = rows[args.offset:]
+        result = {"count": len(rows), "observations": [] if args.summary_only else rows}
         if args.function:
             result["bracketed_target"] = index.brackets(args.function)
         return result
@@ -66,18 +74,26 @@ result_query.arguments = _query_args
 
 
 def _clusters_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
     p.add_argument("--database", default=".n64dk/results.sqlite")
     p.add_argument("--max-score", type=int, default=32)
     p.add_argument("--remaining", action="store_true")
     p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--summary-only", action="store_true")
 
 
 @command("residual-clusters", "Group address-independent residual signatures across functions")
 def residual_clusters(args):
-    index = ResultIndex(args.database)
+    database = args.database
+    if database == ".n64dk/results.sqlite":
+        database = str(__import__("pathlib").Path(args.project).resolve() / database)
+    index = ResultIndex(database)
     try:
         rows = index.clusters(args.max_score, args.limit)
-        return {"count": len(rows), "clusters": rows}
+        rows = rows[args.offset:]
+        return {"count": len(rows), "clusters": [] if args.summary_only else rows}
     finally:
         index.close()
 

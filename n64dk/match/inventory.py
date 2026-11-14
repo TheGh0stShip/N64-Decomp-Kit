@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+import subprocess
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ class Interval:
     end: int
     source: str
     kind: str
+    manifest: str = ""
 
     def covers(self, start: int, end: int) -> bool:
         return self.start <= start and self.end >= end
@@ -80,29 +82,48 @@ def _manifest_intervals(project: Path, image: str,
     result: list[Interval] = []
     patterns = list(project.glob(f"config/**/matching_{image}_*units.tsv"))
     patterns += list(project.glob(f"config/**/matching_{image}_units.tsv"))
+    # The resident/main image commonly predates image-qualified manifest names.
+    # Include only generic compiler/assembler manifests, never overlay/loader/data rows.
+    if image in {"resident", "main"}:
+        for path in project.glob("config/**/matching_*units.tsv"):
+            stem = path.name.removeprefix("matching_").removesuffix("_units.tsv")
+            if stem in {"kmc", "ido", "asm"} or stem.startswith("ido"):
+                patterns.append(path)
+
+    def number(value: str) -> int:
+        value = value.strip()
+        try:
+            return int(value, 0)
+        except ValueError:
+            return int(value, 16)
+
     for path in sorted(set(patterns)):
+        qualified = path.name.startswith(f"matching_{image}_")
+        resident_rom_bias = 0x1000 if image in {"resident", "main"} and not qualified else 0
         with path.open(newline="") as stream:
             for row in csv.reader((line for line in stream if line.strip() and not line.startswith("#")),
                                   delimiter="\t"):
                 if len(row) < 3:
                     continue
                 try:
-                    rom, size = int(row[0], 0), int(row[1], 0)
+                    rom, size = number(row[0]), number(row[1])
                 except ValueError:  # unit-row manifests use VRAM in column two
                     try:
-                        vram, size = int(row[1], 0), int(row[2], 0)
+                        vram, size = number(row[1]), number(row[2])
                     except (ValueError, IndexError):
                         continue
                     source = row[0]
                 else:
                     source = row[2]
+                    rom -= resident_rom_bias
                     section = next((s for s in sections if s[1] <= rom < s[1] + s[2]), None)
                     if section is None:
                         continue
                     vram = section[0] + rom - section[1]
                 suffix = Path(source).suffix.lower()
                 kind = "assembly" if suffix in {".s", ".asm"} else "source"
-                result.append(Interval(vram, vram + size, source, kind))
+                result.append(Interval(vram, vram + size, source, kind,
+                                       str(path.relative_to(project))))
     return result
 
 
@@ -124,7 +145,10 @@ def _splat(project: Path) -> list[dict]:
     result = []
     scalar = re.compile(r"^\s*(target_path|symbol_addrs_path|compiler)\s*:\s*['\"]?([^#'\"]+)")
     segment = re.compile(r"^\s*-\s*\[\s*(0x[0-9a-fA-F]+|\d+)\s*,\s*([^,\]]+)(?:,\s*([^\]]+))?\]")
-    for path in sorted(project.glob("**/splat*.y*ml")):
+    scan = subprocess.run(["rg", "--files", str(project), "-g", "splat*.yml", "-g", "splat*.yaml",
+                           "-g", "!build/**", "-g", "!.tmp/**"], text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    for path in sorted(Path(value) for value in scan.stdout.splitlines()):
         values: dict[str, str] = {}
         subsegments = []
         for line in path.read_text().splitlines():
@@ -164,8 +188,12 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                 name, start_s, _size_s, comment = found.groups()
                 comments[(name, int(start_s, 0))] = (comment or "").strip()
         data = tomllib.loads(catalogue.read_text())
-        catalogue_rows = [row for section_data in data.get("section", [])
-                          for row in section_data.get("functions", [])]
+        catalogue_rows = sorted((row for section_data in data.get("section", [])
+                                 for row in section_data.get("functions", [])),
+                                key=lambda row: int(row["vram"]))
+        ordered_claims = sorted(claims, key=lambda claim: (claim.start, claim.end))
+        claim_cursor = 0
+        active_claims: list[Interval] = []
         for raw in catalogue_rows:
             name, start, size = str(raw["name"]), int(raw["vram"]), int(raw["size"])
             end = start + size
@@ -174,7 +202,22 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                 continue
             rom = section[1] + start - section[0]
             status = comments.get((name, start), str(raw.get("kind", "")))
-            owners = [claim for claim in claims if claim.covers(start, end)]
+            active_claims = [claim for claim in active_claims if start < claim.end]
+            while claim_cursor < len(ordered_claims) and ordered_claims[claim_cursor].start < end:
+                claim = ordered_claims[claim_cursor]; claim_cursor += 1
+                if start < claim.end: active_claims.append(claim)
+            intersecting = list(active_claims)
+            owners = [claim for claim in intersecting if claim.covers(start, end)]
+            partial = [claim for claim in intersecting if not claim.covers(start, end)]
+            clipped = sorted((max(start, claim.start), min(end, claim.end), claim)
+                             for claim in intersecting)
+            cursor = start
+            for left, right, _claim in clipped:
+                if left > cursor: break
+                cursor = max(cursor, right)
+            partitioned = cursor >= end and not any(
+                left < previous_right for (_pl, previous_right, _pc), (left, _r, _c)
+                in zip(clipped, clipped[1:]))
             source_owners = [claim for claim in owners if claim.kind == "source"]
             asm_owners = [claim for claim in owners if claim.kind == "assembly"]
             words = set(re.findall(r"[a-z]+", f"{name} {status}".lower()))
@@ -184,10 +227,27 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             candidate = _candidate_source(root, name, start, source_index)
             # A catalogue comment and a discovered source file are evidence, not proof of
             # coverage.  Only an exact matching manifest may remove an interval from work.
-            if source_owners:
+            padding_partition = (partitioned and len([claim for claim in intersecting if claim.kind == "source"]) == 1
+                                 and all(claim.kind == "source" or "padding" in claim.source.lower()
+                                         for claim in intersecting))
+            if padding_partition:
+                claim = next(claim for claim in intersecting if claim.kind == "source")
+                state, reason, owner = "covered", "C unit plus explicit padding partition owns catalogue interval", claim.source
+                ownership_state, coverage_authority, rank = "manifest_exact_member", "manifest", None
+                owners, partial = intersecting, []
+            elif len(source_owners) > 1:
+                state, reason, owner = "conflict", "multiple authoritative C owners", None
+                ownership_state, coverage_authority, rank = "duplicate_owner", None, None
+            elif partial:
+                state, reason, owner = "conflict", "manifest boundary partially overlaps catalogue interval", None
+                ownership_state, coverage_authority, rank = "boundary_conflict", None, None
+            elif source_owners:
                 state, reason = "covered", "covered by a C translation-unit interval"
                 owner = source_owners[0].source if source_owners else None
-                ownership_state, coverage_authority = "manifest_exact", "manifest"
+                claim = source_owners[0]
+                ownership_state = ("manifest_exact_unit" if claim.start == start and claim.end == end
+                                   else "manifest_exact_member")
+                coverage_authority = "manifest"
                 rank = None
             elif structural and not candidate:
                 state, reason = "excluded", "non-independent interval: " + ", ".join(sorted(structural))
@@ -196,8 +256,11 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                                    else "fragment")
                 coverage_authority = None
             elif asm_owners:
-                state, reason, owner = "remaining", "assembly-backed complete function", asm_owners[0].source
-                ownership_state, coverage_authority = "assembly_owned", None
+                state, reason, owner = "assembly", "authoritatively owned by assembly", asm_owners[0].source
+                claim = asm_owners[0]
+                ownership_state = ("assembly_unit" if claim.start == start and claim.end == end
+                                   else "assembly_member")
+                coverage_authority = None
                 rank = round(1000.0 / max(size, 4), 6)
             else:
                 state, reason, owner = "remaining", "uncovered complete catalogue interval", candidate
@@ -210,7 +273,8 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                 rank = round(1000.0 / max(size, 4) + (25 if candidate else 0), 6)
             identity = hashlib.sha256(f"{root.name}:{image}:{start:x}:{end:x}".encode()).hexdigest()[:20]
             evidence = [f"catalogue:{catalogue.relative_to(root)}:{section[1]:#x}->{section[0]:#x}"]
-            evidence += [f"manifest:{claim.source}:{claim.start:#x}-{claim.end:#x}" for claim in owners]
+            evidence += [f"manifest:{claim.manifest}:{claim.source}:{claim.start:#x}-{claim.end:#x}"
+                         for claim in owners + partial]
             item = InventoryFunction(identity, image, name, start, end, size, rom,
                                      section[1], section[0], section[2], status,
                                      state, reason, owner, ownership_state, coverage_authority,
@@ -221,9 +285,22 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                        "functions": len(image_rows),
                        "covered": sum(row.state == "covered" for row in image_rows),
                        "remaining": sum(row.state == "remaining" for row in image_rows),
-                       "excluded": sum(row.state == "excluded" for row in image_rows)})
+                       "assembly": sum(row.state == "assembly" for row in image_rows),
+                       "excluded": sum(row.state == "excluded" for row in image_rows),
+                       "conflicts": sum(row.state == "conflict" for row in image_rows)})
     functions.sort(key=lambda row: (row.image, row.vram))
     source_index.close()
+    conflicts = [row for row in functions if row.state == "conflict"]
+    unowned = [row for row in functions if row.ownership_state == "unowned"]
+    declared_functions = None
+    for progress_path in sorted(root.glob("config/**/progress.toml")):
+        try:
+            declared_functions = int(tomllib.loads(progress_path.read_text()).get("image", {}).get("total_functions"))
+            break
+        except (TypeError, ValueError, tomllib.TOMLDecodeError):
+            continue
+    denominator_delta = (len(functions) - declared_functions
+                         if declared_functions is not None else None)
     return {
         "project": str(root),
         "model": "interval-v2-authoritative-coverage",
@@ -231,9 +308,20 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
         "splat": _splat(root),
         "source_index": source_stats,
         "summary": {"functions": len(functions),
+                    "declared_functions": declared_functions,
+                    "denominator_delta": denominator_delta,
                     "covered": sum(row.state == "covered" for row in functions),
                     "remaining": sum(row.state == "remaining" for row in functions),
-                    "excluded": sum(row.state == "excluded" for row in functions)},
+                    "assembly": sum(row.state == "assembly" for row in functions),
+                    "excluded": sum(row.state == "excluded" for row in functions),
+                    "conflicts": len(conflicts), "unowned": len(unowned)},
+        "consistency": {"ok": not conflicts and not unowned and denominator_delta in (None, 0),
+                        "conflicts": [row.id for row in conflicts],
+                        "missing_ownership": [row.id for row in unowned],
+                        "denominator_mismatch": ({"catalogue_functions": len(functions),
+                                                   "declared_functions": declared_functions,
+                                                   "delta": denominator_delta}
+                                                  if denominator_delta not in (None, 0) else None)},
         "functions": [row.as_dict() for row in functions],
     }
 

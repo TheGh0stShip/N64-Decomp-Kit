@@ -156,7 +156,10 @@ def command_schema() -> dict:
                            "choices": list(action.choices) if action.choices else None,
                            "multiple": action.nargs in ("+", "*") or action.nargs == argparse.REMAINDER})
         commands.append({"name": name, "description": help_text, "arguments": fields})
-    return {"protocol": "n64dk.operations.v1", "commands": commands}
+    return {"protocol": "n64dk.operations.v1",
+            "global_arguments": [{"dest": "format", "flags": ["--format"],
+                                  "choices": ["text", "json"], "default": "text"}],
+            "commands": commands}
 
 
 def invoke(argv: list[str], timeout: float = 1800.0) -> dict:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+import subprocess
 from pathlib import Path
 
 from .. import mips
@@ -55,6 +56,19 @@ def _candidate(project: Path, row: dict) -> dict | None:
         found = index.find(row["name"], int(row["vram"], 0))
     finally:
         index.close()
+    known = {item["path"] for item in found}
+    scratch = project / ".tmp"
+    if scratch.is_dir():
+        scan = subprocess.run(["rg", "--files", str(scratch), "-g", f"*{row['name']}*.c"],
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for value in scan.stdout.splitlines():
+            path = Path(value)
+            relative = str(path.relative_to(project))
+            if relative not in known:
+                raw = path.read_bytes()
+                found.append({"path": relative, "digest": hashlib.sha256(raw).hexdigest(),
+                              "mtime_ns": path.stat().st_mtime_ns, "size": len(raw)})
+                known.add(relative)
     if not found:
         return None
     selected = found[0]
@@ -64,6 +78,7 @@ def _candidate(project: Path, row: dict) -> dict | None:
     named = bool(re.search(rf"\b{re.escape(row['name'])}\s*\(", text))
     prototypes = re.findall(r"(?m)^\s*([\w\s*]+\b\w+\s*\([^;{{]*\))\s*\{", text)
     return {**selected, "selected_because": "exact function name/address candidate index match",
+            "archived_sources": found,
             "function_name_present": named, "prototypes": prototypes[:4],
             "provenance": verdict.verdict.value, "provenance_reasons": list(verdict.reasons)}
 
@@ -72,15 +87,34 @@ def dossier(project: str | Path, inventory: dict, row: dict, image_path: str | P
             corpus_path: str | Path | None = None, include_all: bool = False) -> dict:
     root = Path(project).resolve()
     layout = from_inventory(row)
-    check = preflight(image_path, layout, row.get("catalogue_status", ""))
     data = Path(image_path).read_bytes()
-    code = data[layout.rom:layout.rom + layout.function_size]
+    try:
+        check = preflight(image_path, layout, row.get("catalogue_status", ""))
+        selected_offset = int(check["selected_image_offset"], 0)
+    except ValueError as error:
+        candidates = []
+        for authority, offset in (("raw-overlay", layout.rom),
+                                  ("resident-composite", layout.function_vram - 0x80000400 + 0x1000)):
+            if 0 <= offset <= len(data) - layout.function_size:
+                candidate_code = data[offset:offset + layout.function_size]
+                decoded = list(mips.instructions(candidate_code, layout.function_vram))
+                valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in decoded)
+                terminal = any(ins.isJrRa() or ins.isJrNotRa() or ins.isBranch() or ins.isJumpWithAddress()
+                               for ins in decoded[-2:])
+                candidates.append({"authority": authority, "offset": f"0x{offset:X}",
+                                   "score": valid + int(terminal) * len(decoded)})
+        selected = max(candidates, key=lambda item: item["score"]) if candidates else {"offset": f"0x{layout.rom:X}"}
+        selected_offset = int(selected["offset"], 0)
+        check = {"ok": False, "error": str(error), "mapping": layout.as_dict(),
+                 "mapping_candidates": candidates, "selected_image_offset": selected["offset"],
+                 "warnings": ["preflight disagreement; dossier evidence retained"], "returns": []}
+    code = data[selected_offset:selected_offset + layout.function_size]
     same = [item for item in inventory["functions"] if item["image"] == row["image"]]
     index = same.index(row)
     neighbours = [{key: item[key] for key in ("name", "vram", "size", "state", "catalogue_status")}
                   for item in same[max(0, index - 3):index + 4] if item is not row]
     context = contextmod.bundle(image_path, layout.function_vram, layout.function_size,
-                                layout.rom, neighbours)
+                                selected_offset, neighbours)
     callers = len(context["callers"])
     returns = len(check["returns"])
     confidence = 0.45 + min(callers, 3) * 0.1 + (0.2 if returns else 0)

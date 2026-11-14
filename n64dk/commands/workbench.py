@@ -1,0 +1,1149 @@
+"""High-level correctness, experiment, search, integration and orchestration commands."""
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import os
+import re
+import difflib
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+from ..cli import command
+from ..match.inventory import build as build_inventory
+from ..match.layout import from_inventory, preflight
+from ..match.registry import resolve_store, standard_store
+from ..match.results import ResultIndex
+from ..match.session import MatchSession, SessionStore
+from ..match.toolchain import LAYOUT, PROFILES, load_config
+
+
+def _digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def _common_project(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--database")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--summary-only", action="store_true")
+
+
+def _project_workbench_config(project: Path) -> dict:
+    path = project / "n64dk.toml"
+    if not path.is_file(): return {}
+    return tomllib.loads(path.read_text()).get("workbench", {})
+
+
+def _python_path(value: str | os.PathLike[str] | None = None) -> str:
+    """Canonicalize spelling without dereferencing a virtualenv interpreter symlink."""
+    selected = os.fspath(value) if value is not None else os.path.join(os.path.realpath(sys.prefix), "bin", "python")
+    return os.path.abspath(os.path.expanduser(selected))
+
+
+def _worktree_snapshot(project: Path) -> tuple[dict[str, bytes], set[str]]:
+    tracked_run = subprocess.run(["git", "ls-files", "-z"], cwd=project,
+                                 stdout=subprocess.PIPE, check=True)
+    tracked = {}
+    for raw in tracked_run.stdout.split(b"\0"):
+        if not raw: continue
+        name = os.fsdecode(raw); path = project / name
+        tracked[name] = path.read_bytes() if path.is_file() else b""
+    untracked_run = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                                   cwd=project, stdout=subprocess.PIPE, check=True)
+    untracked = {os.fsdecode(raw) for raw in untracked_run.stdout.split(b"\0") if raw}
+    for name in untracked:
+        path = project / name
+        if path.is_file(): tracked[name] = path.read_bytes()
+    return tracked, untracked
+
+
+def _restore_worktree_snapshot(project: Path, tracked: dict[str, bytes], untracked: set[str]) -> None:
+    for name, content in tracked.items():
+        path = project / name
+        if not path.is_file() or path.read_bytes() != content:
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(content)
+    current = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                             cwd=project, stdout=subprocess.PIPE, check=True).stdout.split(b"\0")
+    for raw in current:
+        if not raw: continue
+        name = os.fsdecode(raw)
+        if name not in untracked:
+            path = project / name
+            if path.is_file() or path.is_symlink(): path.unlink()
+
+
+def _transaction_diff(project: Path, before: dict[str, bytes], prior_untracked: set[str]) -> dict:
+    changed, patches = [], []
+    names = set(before)
+    now_untracked = {os.fsdecode(raw) for raw in subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=project,
+        stdout=subprocess.PIPE, check=True).stdout.split(b"\0") if raw}
+    names.update(now_untracked - prior_untracked)
+    for name in sorted(names):
+        old = before.get(name, b""); path = project / name
+        new = path.read_bytes() if path.is_file() else b""
+        if old == new: continue
+        changed.append(name)
+        try:
+            patches.extend(difflib.unified_diff(old.decode().splitlines(), new.decode().splitlines(),
+                                                f"a/{name}", f"b/{name}", lineterm=""))
+        except UnicodeDecodeError:
+            patches.append(f"Binary files differ: {name}")
+    return {"paths": changed, "unified": "\n".join(patches)[-50000:]}
+
+
+def _canonical_env() -> dict[str, str]:
+    env = dict(os.environ); prefix = Path(sys.prefix).resolve()
+    env["VIRTUAL_ENV"] = str(prefix)
+    env["PATH"] = str(prefix / "bin") + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _doctor_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--profile", choices=("matching", "gpu-research", "full"), default="matching")
+    p.add_argument("--fix-user", action="store_true",
+                   help="print user-local remediation commands; never mutates the host")
+
+
+@command("doctor", "Validate project, toolchains, host tools and optional research profiles")
+def doctor(args):
+    project = Path(args.project).expanduser().resolve()
+    cfg = load_config(project)
+    workbench = _project_workbench_config(project)
+    checks = []
+
+    def add(group, name, ok, found=None, remediation=None, required=True):
+        checks.append({"group": group, "name": name, "ok": bool(ok), "required": required,
+                       "found": str(found) if found else None, "remediation": remediation})
+
+    required_tools = {"python": sys.executable, "git": shutil.which("git"),
+                      "make": shutil.which("make"), "sqlite3": shutil.which("sqlite3")}
+    for name, path in required_tools.items():
+        add("required matching", name, path, Path(path).resolve() if path else None,
+            f"install {name} under ~/.local/bin and add it to PATH")
+    rom = cfg.find_rom()
+    add("required project build", "project ROM", rom and rom.is_file(), rom,
+        "set [match] rom in n64dk.toml or provide a clean project ROM")
+    for key, profile in PROFILES.items():
+        root = cfg.toolchain(key)
+        add("required matching", profile.name, root is not None, root,
+            f"install {profile.name} at {(cfg.toolchain_root or project / '.toolchain') / LAYOUT[key]}")
+    gnu = cfg.gnu_as()
+    add("required matching", "MIPS GNU assembler", gnu is not None, gnu[0] if gnu else None,
+        "install a MIPS binutils toolchain under .toolchain/mips-binutils")
+    sn_root = cfg.toolchains.get("sn") or ((cfg.toolchain_root / LAYOUT["sn"])
+                                           if cfg.toolchain_root else None)
+    add("required matching", "asn64", bool(sn_root and (sn_root / "asn64.exe").is_file()),
+        sn_root / "asn64.exe" if sn_root else None, "place asn64.exe inside sn-gcc-2.8")
+    for name in ("splat", "spimdisasm"):
+        add("optional corpus research", name, shutil.which(name), shutil.which(name),
+            f"install {name} in the active virtual environment", required=False)
+    if args.profile in {"gpu-research", "full"}:
+        add("optional NVIDIA GPU", "nvidia-smi", shutil.which("nvidia-smi"), shutil.which("nvidia-smi"),
+            "install a compatible NVIDIA driver; GPU packages remain optional", required=False)
+        for package in ("torch", "cupy", "onnxruntime"):
+            found = __import__("importlib").util.find_spec(package) is not None
+            add("optional NVIDIA GPU", package, found, package if found else None,
+                f"install {package} only in a dedicated gpu-research environment", required=False)
+    dependency_groups = workbench.get("dependencies", {})
+    python_profiles = workbench.get("python", {})
+    selected_pythons = {"matching": _python_path(python_profiles.get("matching")),
+                        "project-test": _python_path(python_profiles.get("project_test")),
+                        "gpu": _python_path(python_profiles.get("gpu"))}
+    for group, packages in dependency_groups.items():
+        python_key = "project-test" if group == "project_test" else "gpu" if "gpu" in group else "matching"
+        executable = selected_pythons[python_key]
+        for package in packages:
+            probe = subprocess.run([executable, "-c", f"import {package}"], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            add("project-test dependencies" if group == "project_test" else "optional " + group,
+                package, probe.returncode == 0, executable,
+                f"{executable} -m pip install {package}", required=group == "project_test")
+    cache = project / ".n64dk"
+    cache.mkdir(exist_ok=True)
+    add("required matching", "writable state", os.access(cache, os.W_OK), cache)
+    free = shutil.disk_usage(project).free
+    add("required project build", "disk space >= 2 GiB", free >= 2 * 1024**3,
+        f"{free / 1024**3:.1f} GiB free")
+    locks = [str(path) for path in cache.rglob("*.lock") if time.time() - path.stat().st_mtime > 3600]
+    prefix = str(Path(sys.prefix).resolve())
+    kit_venv = str((Path(__file__).resolve().parents[2] / ".venv").resolve())
+    add("required matching", "canonical virtual environment", prefix == kit_venv, prefix,
+        f"invoke {kit_venv}/bin/python or resolve the configured interpreter path")
+    required_failed = [row for row in checks if row["required"] and not row["ok"]]
+    return {"profile": args.profile, "project": str(project), "ok": not required_failed,
+            "checks": checks, "stale_locks": locks, "active_workers": [],
+            "canonical_paths": {"python": str(Path(sys.executable).resolve()), "prefix": prefix,
+                                "project": str(project)},
+            "selected_python": selected_pythons, "integration_hooks": workbench.get("hooks", {}),
+            "remediation": [row["remediation"] for row in checks
+                            if not row["ok"] and row["remediation"]] if args.fix_user else []}
+
+
+doctor.arguments = _doctor_args
+
+
+def _cap_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--invalidate", action="store_true")
+    p.add_argument("--pipeline")
+    p.add_argument("--option")
+    p.add_argument("--stage", choices=("preprocessor", "compiler", "assembler", "linker"))
+
+
+@command("compiler-capabilities", "Inspect or selectively invalidate compiler-option capability records")
+def compiler_capabilities(args):
+    store = SessionStore(args.state_root or standard_store(args.project))
+    try:
+        removed = store.invalidate_capabilities(args.pipeline, args.option, args.stage) if args.invalidate else 0
+        return {"removed": removed, "capabilities": store.capabilities()}
+    finally:
+        store.close()
+
+
+compiler_capabilities.arguments = _cap_args
+
+
+def _load_matrix(path: str) -> dict:
+    text = Path(path).read_text()
+    if path.endswith(".json"):
+        return json.loads(text)
+    try:
+        import tomllib
+        if path.endswith(".toml"):
+            return tomllib.loads(text)
+    except Exception:
+        pass
+    # Deliberately small YAML subset: scalar keys, inline JSON lists, and axes mapping.
+    result, axes, section = {}, {}, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip(): continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if section in {"constraints"} and stripped.startswith("-"):
+            result.setdefault(section, []).append(stripped[1:].strip()); continue
+        key, _, value = stripped.partition(":")
+        if indent == 0:
+            section = key if not value.strip() else None
+            if value.strip(): result[key] = value.strip()
+        elif section == "axes":
+            axes[key] = json.loads(value.strip().replace("'", '"'))
+    if axes: result["axes"] = axes
+    return result
+
+
+def _matrix_args(p):
+    p.add_argument("session_id")
+    p.add_argument("matrix")
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--jobs", type=int, default=16)
+    p.add_argument("--limit", type=int, default=256)
+
+
+@command("match-matrix", "Run a declarative bounded source/prototype experiment matrix")
+def match_matrix(args):
+    spec = _load_matrix(args.matrix)
+    axes = spec.get("axes", {})
+    if not axes:
+        raise ValueError("matrix requires a non-empty axes mapping")
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        parent = store.best(args.session_id)
+        template = store.cache.get(parent.source_digest).decode()
+        names = list(axes)
+        variants = []
+        for values in itertools.product(*(axes[name] for name in names)):
+            mapping = dict(zip(names, values))
+            allowed = True
+            for constraint in spec.get("constraints", []):
+                found = re.fullmatch(r"(\w+)\s*(==|!=)\s*([^ ]+)(?:\s+implies\s+(\w+)\s*(==|!=)\s*([^ ]+))?", constraint)
+                if not found: continue
+                left, op, value, right, rop, rvalue = found.groups()
+                premise = (str(mapping.get(left)) == value) if op == "==" else (str(mapping.get(left)) != value)
+                if premise and right:
+                    consequence = (str(mapping.get(right)) == rvalue) if rop == "==" else (str(mapping.get(right)) != rvalue)
+                    allowed &= consequence
+                elif not right:
+                    allowed &= premise
+            if not allowed: continue
+            source = template
+            for name, value in mapping.items():
+                source = source.replace("{{" + name + "}}", str(value))
+            variants.append({"label": ",".join(f"{k}={v}" for k, v in mapping.items()), "source": source})
+            if len(variants) >= args.limit: break
+        from .match import _session_evaluator
+        transaction = MatchSession(store, _session_evaluator(store.context(args.session_id))).try_proposal(
+            args.session_id, {"hypothesis": spec.get("hypothesis", "declarative matrix"),
+                              "variants": variants}, args.jobs, False)
+        transaction["matrix"] = {"axes": axes, "generated": len(variants),
+                                 "object_classes": transaction["object_classes"]}
+        return transaction
+    finally:
+        store.close()
+
+
+match_matrix.arguments = _matrix_args
+
+
+def _prototype_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--jobs", type=int, default=16)
+    p.add_argument("--types", default="void,s8,u8,s16,u16,s32,u32,void*")
+
+
+@command("prototype-matrix", "Explore evidence-bounded ABI and prototype type variants")
+def prototype_matrix(args):
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        parent = store.best(args.session_id); source = store.cache.get(parent.source_digest).decode()
+        pattern = re.compile(r"\b(?:void|s8|u8|s16|u16|s32|u32|int|unsigned|[A-Za-z_]\w*\s*\*)\s+(" + re.escape(args.symbol) + r")\s*\(")
+        match = pattern.search(source)
+        if not match: raise ValueError("symbol declaration was not found in retained source")
+        evidence = parent.outcome.get("diff", {}).get("entries", [])
+        hints = {"signed-halfword": any("sra" in str(row) and "0x10" in str(row) for row in evidence),
+                 "unsigned-halfword": any("andi" in str(row) and "FFFF" in str(row).upper() for row in evidence),
+                 "signed-byte": any("sra" in str(row) and "0x18" in str(row) for row in evidence),
+                 "unsigned-byte": any("andi" in str(row) and "0xFF" in str(row) for row in evidence)}
+        variants = []
+        start = match.start(); end = match.start(1)
+        for typename in args.types.split(","):
+            variants.append({"label": f"return={typename}",
+                             "source": source[:start] + typename + " " + source[end:]})
+        from .match import _session_evaluator
+        result = MatchSession(store, _session_evaluator(store.context(args.session_id))).try_proposal(
+            args.session_id, {"hypothesis": "prototype width controls normalization and carrier allocation",
+                              "variants": variants}, args.jobs, False)
+        result["abi_evidence"] = hints
+        return result
+    finally: store.close()
+
+
+prototype_matrix.arguments = _prototype_args
+
+
+def _group_db(project: Path):
+    root = project / ".n64dk"; root.mkdir(exist_ok=True)
+    db = sqlite3.connect(root / "group-sessions.sqlite")
+    db.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY,kind TEXT,payload TEXT,created_ns INTEGER)")
+    db.commit(); return db
+
+
+def _group_start_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--unit", required=True)
+    p.add_argument("--functions", required=True)
+
+
+@command("family-session-start", "Create a persistent cross-function family experiment context")
+def family_session_start(args):
+    project = Path(args.project).resolve(); unit = Path(project, args.unit).resolve()
+    payload = {"project": str(project), "unit": str(unit), "unit_digest": _digest(unit),
+               "functions": args.functions.split(","), "sessions": {}, "kind": "family"}
+    group_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:20]
+    db = _group_db(project); db.execute("INSERT OR REPLACE INTO groups VALUES (?,?,?,?)",
+        (group_id, "family", json.dumps(payload), time.time_ns())); db.commit(); db.close()
+    return {"family_id": group_id, **payload}
+
+
+family_session_start.arguments = _group_start_args
+
+
+def _tu_start_args(p):
+    p.add_argument("unit")
+    p.add_argument("--project", default=".")
+    p.add_argument("--manifest-row", help="manifest row text or path:line")
+
+
+@command("tu-session-start", "Create a translation-unit session preserving source and manifest context")
+def tu_session_start(args):
+    project = Path(args.project).resolve(); unit = Path(project, args.unit).resolve()
+    payload = {"project": str(project), "unit": str(unit), "unit_digest": _digest(unit),
+               "manifest_row": args.manifest_row, "kind": "translation-unit"}
+    group_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:20]
+    db = _group_db(project); db.execute("INSERT OR REPLACE INTO groups VALUES (?,?,?,?)",
+        (group_id, "translation-unit", json.dumps(payload), time.time_ns())); db.commit(); db.close()
+    return {"tu_session_id": group_id, **payload, "regression_policy": "compare every owned interval and relocation"}
+
+
+tu_session_start.arguments = _tu_start_args
+
+
+def _code_query_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--symbol")
+    p.add_argument("--address")
+    p.add_argument("--type-conflicts", action="store_true")
+    p.add_argument("--all-projects", action="store_true")
+    p.add_argument("--limit", type=int, default=100)
+
+
+@command("code-query", "Search declarations, definitions, calls, manifests, candidates and sessions")
+def code_query(args):
+    query = args.symbol or args.address
+    if not query: raise ValueError("--symbol or --address is required")
+    roots = [Path(args.project).resolve()]
+    if args.all_projects: roots = [path for path in Path(args.project).resolve().parent.iterdir() if path.is_dir()]
+    cmd = [shutil.which("rg") or "rg", "--json", "-n", "--glob", "!build/**", "--glob", "!.git/**", query,
+           *map(str, roots)]
+    run = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    hits = []
+    for line in run.stdout.splitlines():
+        try: value = json.loads(line)
+        except json.JSONDecodeError: continue
+        if value.get("type") != "match": continue
+        data = value["data"]; path = data["path"]["text"]; text = data["lines"]["text"].strip()
+        kind = ("manifest" if "matching_" in path else "catalogue" if "functions_" in path
+                else "candidate" if ".tmp" in path else "declaration" if re.search(r"\bextern\b|;\s*$", text)
+                else "definition" if "{" in text else "call-or-reference")
+        hits.append({"authority": {"manifest": 0, "catalogue": 1, "definition": 2}.get(kind, 3),
+                     "kind": kind, "path": path, "line": data["line_number"], "text": text})
+    hits.sort(key=lambda row: (row["authority"], row["path"], row["line"]))
+    conflicts = sorted({re.sub(r"\s+", " ", row["text"]) for row in hits if row["kind"] == "declaration"})
+    return {"query": query, "count": len(hits), "results": hits[:args.limit],
+            "type_conflicts": conflicts if args.type_conflicts and len(conflicts) > 1 else []}
+
+
+code_query.arguments = _code_query_args
+
+
+def _asm_query_args(p):
+    p.add_argument("--sequence", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--all-projects", action="store_true")
+    p.add_argument("--register-renamed", action="store_true")
+    p.add_argument("--limit", type=int, default=100)
+
+
+@command("asm-query", "Search normalized opcode sequences and delay-slot forms across projects")
+def asm_query(args):
+    wanted = [item.strip() for item in args.sequence.split(",")]
+    roots = [Path(args.project).resolve()]
+    if args.all_projects: roots = [p for p in roots[0].parent.iterdir() if p.is_dir()]
+    results = []
+    for root in roots:
+        for path in itertools.chain(root.glob("asm/**/*.s"), root.glob("src/**/*.s")):
+            lines = path.read_text(errors="ignore").splitlines(); ops = []
+            for index, line in enumerate(lines):
+                value = line.split("#", 1)[0].strip()
+                if not value or value.endswith(":") or value.startswith("."): continue
+                ops.append((value.split(None, 1)[0], index + 1))
+            for index in range(len(ops) - len(wanted) + 1):
+                if [x[0] for x in ops[index:index + len(wanted)]] == wanted:
+                    results.append({"project": root.name, "path": str(path), "line": ops[index][1],
+                                    "classification": "register-renamed" if args.register_renamed else "opcode-exact"})
+                    if len(results) >= args.limit: return {"count": len(results), "results": results}
+    return {"count": len(results), "results": results}
+
+
+asm_query.arguments = _asm_query_args
+
+
+def _boundary_args(p):
+    p.add_argument("function")
+    p.add_argument("--project", default=".")
+    p.add_argument("--image", required=True)
+    p.add_argument("--strict", action="store_true")
+
+
+@command("boundary-audit", "Reconcile catalogue, Splat, CFG, prologue, delay-slot and ownership evidence")
+def boundary_audit(args):
+    inventory = build_inventory(args.project); rows = [x for x in inventory["functions"] if x["name"] == args.function]
+    if len(rows) != 1: raise ValueError(f"function resolved to {len(rows)} rows")
+    report = preflight(args.image, from_inventory(rows[0]), rows[0]["catalogue_status"], args.strict)
+    return {"function": rows[0], "preflight": report, "splat": inventory["splat"],
+            "decision": report["entry_preflight"]["entry_status"], "rule_version": report["preflight_version"]}
+
+
+boundary_audit.arguments = _boundary_args
+
+
+def _boundary_correct_args(p):
+    p.add_argument("function")
+    p.add_argument("--project", default=".")
+    p.add_argument("--new-start", type=lambda x: int(x, 0))
+    p.add_argument("--new-size", type=lambda x: int(x, 0))
+    p.add_argument("--merge-with")
+    p.add_argument("--output", required=True)
+
+
+@command("boundary-correct", "Prepare a non-applying boundary and denominator correction transaction")
+def boundary_correct(args):
+    inventory = build_inventory(args.project); rows = [x for x in inventory["functions"] if x["name"] == args.function]
+    if len(rows) != 1: raise ValueError("function selector is ambiguous")
+    before = inventory["summary"]; denominator_delta = -1 if args.merge_with else 0
+    transaction = {"function": rows[0], "requested": {"new_start": args.new_start,
+                   "new_size": args.new_size, "merge_with": args.merge_with},
+                   "accounting": {"functions_before": before["functions"],
+                                  "functions_after": before["functions"] + denominator_delta,
+                                  "matched_before": before["covered"], "matched_after": before["covered"],
+                                  "denominator_delta": denominator_delta,
+                                  "decompilation_gain": 0}, "apply": False,
+                   "affected": ["catalogue", "manifests", "progress", "sessions", "Splat review"]}
+    Path(args.output).write_text(json.dumps(transaction, indent=2) + "\n")
+    return transaction
+
+
+boundary_correct.arguments = _boundary_correct_args
+
+
+def _self_test_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--pattern")
+
+
+@command("self-test", "Run the kit test suite with a canonical top-level discovery path")
+def self_test(args):
+    kit = Path(__file__).resolve().parents[2]
+    cmd = [sys.executable, "-m", "unittest", "discover", "-s", str(kit / "tests"), "-t", str(kit), "-v"]
+    if args.pattern: cmd += ["-p", args.pattern]
+    run = subprocess.run(cmd, cwd=kit, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return {"ok": run.returncode == 0, "exit_code": run.returncode, "command": cmd,
+            "output": run.stdout[-16000:]}
+
+
+self_test.arguments = _self_test_args
+
+
+def _family_try_args(p):
+    p.add_argument("group_id")
+    p.add_argument("--project", default=".")
+    p.add_argument("--proposal", required=True, help="shared proposal JSON")
+    p.add_argument("--sessions", help="FUNCTION=SESSION_ID comma list")
+    p.add_argument("--jobs", type=int, default=16)
+    p.add_argument("--verify-command")
+
+
+def _group_payload(project: Path, group_id: str):
+    db = _group_db(project); row = db.execute("SELECT payload FROM groups WHERE group_id=?", (group_id,)).fetchone(); db.close()
+    if not row: raise KeyError(f"unknown group session {group_id}")
+    return json.loads(row[0])
+
+
+@command("family-session-try", "Apply one shared hypothesis transactionally across a function family")
+def family_session_try(args):
+    project = Path(args.project).resolve(); payload = _group_payload(project, args.group_id)
+    proposal = json.loads(Path(args.proposal).read_text() if Path(args.proposal).is_file() else args.proposal)
+    sessions = dict(item.split("=", 1) for item in (args.sessions or "").split(",") if item)
+    results = []
+    from .match import _session_evaluator
+    for function in payload.get("functions", []):
+        session_id = sessions.get(function) or payload.get("sessions", {}).get(function)
+        if not session_id:
+            results.append({"function": function, "status": "needs-session"}); continue
+        store = SessionStore(resolve_store(session_id, project))
+        try:
+            value = MatchSession(store, _session_evaluator(store.context(session_id))).try_proposal(
+                session_id, proposal, max(1, args.jobs // max(1, len(sessions))), False)
+            results.append({"function": function, "status": "evaluated",
+                            "transaction_best": value["transaction_best"],
+                            "session_best": value["session_best"]})
+        finally: store.close()
+    verification = None
+    if args.verify_command:
+        run = subprocess.run(args.verify_command, cwd=project, shell=True, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        verification = {"exit_code": run.returncode, "output": run.stdout[-12000:]}
+    return {"group_id": args.group_id, "results": results, "verification": verification,
+            "shared_hypothesis": proposal.get("hypothesis")}
+
+
+family_session_try.arguments = _family_try_args
+
+
+@command("tu-session-try", "Edit one function in retained translation-unit context and verify the whole unit")
+def tu_session_try(args):
+    project = Path(args.project).resolve(); payload = _group_payload(project, args.group_id)
+    unit = Path(payload["unit"]); original = unit.read_text(); proposal = json.loads(
+        Path(args.proposal).read_text() if Path(args.proposal).is_file() else args.proposal)
+    source = proposal.get("source", original)
+    for edit in proposal.get("edits", []):
+        old, new = edit["find"], edit.get("replace", "")
+        if old not in source: raise ValueError(f"TU edit text not found: {old[:40]}")
+        source = source.replace(old, new, 1)
+    with tempfile.TemporaryDirectory(prefix="n64dk-tu-") as name:
+        staged = Path(name) / unit.name; staged.write_text(source)
+        verification = None
+        if args.verify_command:
+            env = dict(os.environ); env["N64DK_CANDIDATE_SOURCE"] = str(staged)
+            run = subprocess.run(args.verify_command, cwd=project, shell=True, env=env, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            verification = {"exit_code": run.returncode, "output": run.stdout[-12000:]}
+    return {"tu_session_id": args.group_id, "original_digest": payload["unit_digest"],
+            "candidate_digest": hashlib.sha256(source.encode()).hexdigest(),
+            "verification": verification, "project_mutated": False,
+            "regression_scope": "all owned text, data and relocations"}
+
+
+tu_session_try.arguments = _family_try_args
+
+
+def _compiler_explain_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--candidate", action="append", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--passes", default="greg,lreg,sched")
+    p.add_argument("--artifact-dir")
+
+
+@command("compiler-explain", "Compare retained candidates at CSE, allocation, reload and scheduling boundaries")
+def compiler_explain(args):
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        candidates = [store.get(args.session_id, value) for value in args.candidate]
+        if any(value is None for value in candidates): raise ValueError("unknown candidate")
+        artifacts = []
+        root = Path(args.artifact_dir).resolve() if args.artifact_dir else None
+        if root: root.mkdir(parents=True, exist_ok=True)
+        dump_context = dict(store.context(args.session_id))
+        if root: dump_context["artifact_dir"] = str(root)
+        from .match import _session_evaluator
+        evaluator = _session_evaluator(dump_context) if root else None
+        for candidate in candidates:
+            source = store.cache.get(candidate.source_digest)
+            source_path = None
+            if root:
+                source_path = root / f"{candidate.candidate_id}.c"; source_path.write_bytes(source)
+            dump_outcome = None
+            if evaluator:
+                dump_outcome = evaluator(source, candidate.pipeline,
+                                         tuple(candidate.flags) + (("-da",) if candidate.pipeline.startswith("kmc") else ()),
+                                         candidate.candidate_id)
+            emitted = [str(path) for path in (root / candidate.candidate_id).glob("*")] if root and (root / candidate.candidate_id).is_dir() else []
+            artifacts.append({"candidate_id": candidate.candidate_id, "source": str(source_path) if source_path else None,
+                              "object_digest": candidate.outcome.get("sha256_text"),
+                              "residual": candidate.counts, "passes_requested": args.passes.split(","),
+                              "dump_compile_exact": dump_outcome.exact if dump_outcome else None,
+                              "artifacts": emitted})
+        left, right = candidates[:2]
+        stage = ("instruction-selection/CSE" if left.counts.get("instruction") != right.counts.get("instruction")
+                 else "allocation/reload" if left.counts.get("register") != right.counts.get("register")
+                 else "scheduling" if left.counts.get("scheduling") != right.counts.get("scheduling") else "object-equivalent")
+        return {"session_id": args.session_id, "candidates": artifacts,
+                "first_discriminating_stage": stage,
+                "note": "raw pass dumps are retained when emitted by the configured compiler recipe"}
+    finally: store.close()
+
+
+compiler_explain.arguments = _compiler_explain_args
+
+
+def _synthesize_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--candidate", action="append", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--jobs", type=int, default=16)
+    p.add_argument("--budget", type=int, default=32)
+
+
+@command("frontier-synthesize", "Compile a minimal cross-product from complementary retained frontiers")
+def frontier_synthesize(args):
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        rows = [store.get(args.session_id, value) for value in args.candidate]
+        if len(rows) < 2 or any(row is None for row in rows): raise ValueError("two retained candidates are required")
+        sources = [store.cache.get(row.source_digest).decode().splitlines(keepends=True) for row in rows]
+        base = sources[0]; differing = [i for i in range(min(map(len, sources))) if len({s[i] for s in sources}) > 1]
+        variants = []
+        for choices in itertools.product(range(len(sources)), repeat=min(len(differing), 8)):
+            lines = list(base)
+            for index, choice in zip(differing, choices): lines[index] = sources[choice][index]
+            variants.append({"label": "cross-" + "".join(map(str, choices)), "source": "".join(lines)})
+            if len(variants) >= args.budget: break
+        from .match import _session_evaluator
+        value = MatchSession(store, _session_evaluator(store.context(args.session_id))).try_proposal(
+            args.session_id, {"hypothesis": "complementary frontier source choices may coexist",
+                              "variants": variants}, args.jobs, False)
+        value["synthesis"] = {"source_dimensions": len(differing), "variants": len(variants),
+                              "exhausted": len(variants) < args.budget}
+        return value
+    finally: store.close()
+
+
+frontier_synthesize.arguments = _synthesize_args
+
+
+def _attribute_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--candidate", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+
+
+@command("residual-attribution", "Map residual instructions to likely controlling source values and lifetimes")
+def residual_attribution(args):
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        row = store.get(args.session_id, args.candidate)
+        if row is None: raise ValueError("unknown candidate")
+        source = store.cache.get(row.source_digest).decode()
+        calls = re.findall(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)", source)
+        entries = row.outcome.get("diff", {}).get("entries", [])
+        attributed = []
+        for entry in entries:
+            compiled = entry.get("compiled", ""); retail = entry.get("retail", "")
+            mechanism = ("narrow return or promotion" if any(x in compiled + retail for x in ("sll", "sra", "andi"))
+                         else "carrier lifetime/register ownership" if entry.get("kind") == "register"
+                         else "control-flow source form" if compiled.startswith("b") or retail.startswith("b")
+                         else "instruction selection")
+            attributed.append({"target_offset": entry.get("target_offset"), "compiled": compiled,
+                               "retail": retail, "likely_source_values": calls[-3:],
+                               "mechanism": mechanism})
+        return {"candidate_id": row.candidate_id, "attribution": attributed,
+                "confidence": "heuristic-def-use", "next_discriminators":
+                ["carrier reuse", "narrow prototype", "unified return path"]}
+    finally: store.close()
+
+
+residual_attribution.arguments = _attribute_args
+
+
+def _neg_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--residual")
+    p.add_argument("--compiler")
+    p.add_argument("--limit", type=int, default=100)
+
+
+@command("negatives-query", "Retrieve equivalent objects and disproved hypotheses before compilation")
+def negatives_query(args):
+    roots = [Path(args.state_root)] if args.state_root else [standard_store(args.project)]
+    output = []
+    for root in roots:
+        if not (root / "sessions.sqlite").is_file(): continue
+        store = SessionStore(root)
+        try:
+            for row in store.db.execute("SELECT session_id,family,conclusion,payload FROM session_experiments ORDER BY created_ns DESC"):
+                payload = json.loads(row[3])
+                if args.residual and args.residual not in json.dumps(payload): continue
+                if args.compiler and args.compiler not in json.dumps(payload): continue
+                output.append({"session_id": row[0], "hypothesis": row[1], "conclusion": row[2], "payload": payload})
+                if len(output) >= args.limit: break
+        finally: store.close()
+    return {"count": len(output), "negative_results": output}
+
+
+negatives_query.arguments = _neg_args
+
+
+def _integrate_args(p):
+    p.add_argument("candidate_id")
+    p.add_argument("--session", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--output", required=True)
+    p.add_argument("--verify-twice", action="store_true", default=True,
+                   help="independently compile twice (the integration default)")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--destination")
+    p.add_argument("--manifest")
+    p.add_argument("--affected-gate")
+    p.add_argument("--full-gate")
+    p.add_argument("--project-tests")
+
+
+@command("integrate-winner", "Prepare and independently verify an exact-winner integration transaction")
+def integrate_winner(args):
+    store = SessionStore(resolve_store(args.session, args.project, args.state_root))
+    try:
+        row = store.get(args.session, args.candidate_id)
+        if row is None or not row.exact: raise ValueError("candidate is not a retained exact result")
+        context = store.context(args.session); source = store.cache.get(row.source_digest)
+        from .match import _session_evaluator
+        evaluator = _session_evaluator(context); receipts = []
+        for index in range(2):
+            result = evaluator(source, row.pipeline, row.flags, f"integration-verification-{index + 1}")
+            receipts.append(result.as_dict())
+            if not result.exact: raise RuntimeError("fresh independent verification failed")
+        root = Path(args.output).resolve(); root.mkdir(parents=True, exist_ok=True)
+        candidate = root / context.get("source_name", "winner.c"); candidate.write_bytes(source)
+        manifest_row = None
+        if args.destination:
+            destination = Path(args.destination)
+            if not destination.is_absolute(): destination = Path(args.project).resolve() / destination
+            relative = destination.relative_to(Path(args.project).resolve())
+            raw_rom = context['addr'] - context['vram_delta']
+            inventory = build_inventory(args.project)
+            mapping_rows = [item for item in inventory["functions"]
+                            if int(item["vram"], 0) == context["addr"] and int(item["size"]) == context["size"]
+                            and (not context.get("inventory_image") or item["image"] == context["inventory_image"])]
+            if len(mapping_rows) == 1:
+                raw_rom = int(mapping_rows[0]["rom"], 0)
+            manifest_row = "\t".join((f"0x{raw_rom:X}",
+                                      f"0x{context['size']:X}", str(relative), " ".join(row.flags),
+                                      row.outcome.get("sha256_text") or context.get("target_text_sha256") or ""))
+        workbench = _project_workbench_config(Path(args.project).resolve())
+        hooks = workbench.get("hooks", {})
+        affected_gate = args.affected_gate or hooks.get("affected_gate")
+        full_gate = args.full_gate or hooks.get("full_gate")
+        project_tests = args.project_tests or hooks.get("project_tests")
+        regeneration = [hooks[key] for key in ("attack", "report", "progress") if hooks.get(key)]
+        transaction = {"states": ["candidate_exact", "independently_recompiled", "manifest_prepared",
+                      "affected_gate_pending", "full_gate_pending", "progress_pending", "integration_ready"],
+                      "candidate": str(candidate), "source_digest": row.source_digest,
+                      "target": {key: context.get(key) for key in ("rom_sha256", "target_text_sha256", "addr", "size", "vram_delta")},
+                      "pipeline": row.pipeline, "flags": list(row.flags), "verifications": receipts,
+                      "planned_updates": ["canonical source", "manifest", "catalogue", "progress", "provenance"],
+                      "manifest_row": manifest_row, "applied": False}
+        if args.destination:
+            transaction["image_mapping"] = {"raw_rom": f"0x{raw_rom:X}",
+                "composite_rom": f"0x{context['addr'] - 0x80000400 + 0x1000:X}",
+                "vram": f"0x{context['addr']:08X}", "image": context.get("inventory_image")}
+        transaction["project_hooks"] = {"regeneration": regeneration, "affected_gate": affected_gate,
+                                         "full_gate": full_gate, "project_tests": project_tests}
+        receipt = root / "integration-transaction.json"; receipt.write_text(json.dumps(transaction, indent=2) + "\n")
+        if args.apply:
+            if not (args.destination and args.manifest and affected_gate and full_gate and project_tests):
+                raise ValueError("--apply requires destination/manifest and configured affected, full and project-test hooks")
+            project = Path(args.project).resolve(); destination = Path(args.destination)
+            if not destination.is_absolute(): destination = project / destination
+            manifest = Path(args.manifest)
+            if not manifest.is_absolute(): manifest = project / manifest
+            dirty = subprocess.run(["git", "status", "--porcelain", "--", str(destination), str(manifest)],
+                                   cwd=project, text=True, stdout=subprocess.PIPE).stdout.strip()
+            if dirty: raise ValueError("integration targets contain pre-existing edits; transaction refused")
+            tracked_before, untracked_before = _worktree_snapshot(project)
+            old_destination = destination.read_bytes() if destination.exists() else None
+            old_manifest = manifest.read_bytes() if manifest.exists() else b""
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True); destination.write_bytes(source)
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_bytes(old_manifest + ((b"" if old_manifest.endswith(b"\n") or not old_manifest else b"\n") + manifest_row.encode() + b"\n"))
+                gates = []
+                for index, command_text in enumerate(regeneration):
+                    run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=_canonical_env(),
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    gates.append({"gate": f"regeneration-{index + 1}", "exit_code": run.returncode,
+                                  "output": run.stdout[-12000:]})
+                    if run.returncode: raise RuntimeError("regeneration hook failed")
+                for label, command_text in (("affected", affected_gate), ("full", full_gate),
+                                            ("project-tests", project_tests)):
+                    run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=_canonical_env(),
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    gates.append({"gate": label, "exit_code": run.returncode, "output": run.stdout[-12000:]})
+                    if run.returncode: raise RuntimeError(f"{label} gate failed")
+                transaction["applied"] = True; transaction["gates"] = gates
+                transaction["tracked_diff"] = _transaction_diff(project, tracked_before, untracked_before)
+            except Exception:
+                _restore_worktree_snapshot(project, tracked_before, untracked_before)
+                transaction["rolled_back"] = True
+                receipt.write_text(json.dumps(transaction, indent=2) + "\n")
+                raise
+            receipt.write_text(json.dumps(transaction, indent=2) + "\n")
+        return transaction
+    finally: store.close()
+
+
+integrate_winner.arguments = _integrate_args
+
+
+def _integration_audit_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--database", default=".n64dk/results.sqlite")
+    p.add_argument("--exact-unintegrated", action="store_true")
+    p.add_argument("--limit", type=int, default=100)
+
+
+@command("integration-audit", "Find exact current-target winners absent from authoritative manifests")
+def integration_audit(args):
+    project = Path(args.project).resolve(); database = Path(args.database)
+    if not database.is_absolute(): database = project / database
+    index = ResultIndex(database)
+    try: rows = index.query(exact_only=True, limit=100000)
+    finally: index.close()
+    inventory = build_inventory(project); by_name = {row["name"]: row for row in inventory["functions"]}
+    actionable = [row for row in rows if row.get("observation_class") == "exact_current_target"
+                  and row.get("function") in by_name
+                  and by_name[row["function"]]["coverage_authority"] != "manifest"
+                  and row.get("source") and Path(row["source"]).is_file()]
+    return {"count": len(actionable), "candidates": actionable[:args.limit],
+            "requirements": ["fresh independent recompilation", "current image and target digest",
+                             "source availability", "no aggregate ownership conflict"]}
+
+
+integration_audit.arguments = _integration_audit_args
+
+
+def _gate_args(p):
+    p.add_argument("baseline")
+    p.add_argument("current")
+
+
+@command("gate-delta", "Compare baseline and current matching-gate outcomes without hiding pre-existing failures")
+def gate_delta(args):
+    def load(path):
+        value = json.loads(Path(path).read_text())
+        rows = value.get("results", value if isinstance(value, list) else [])
+        return {str(row.get("name") or row.get("source") or i): bool(row.get("exact")) for i, row in enumerate(rows)}
+    before, after = load(args.baseline), load(args.current)
+    preexisting = sorted(key for key, ok in before.items() if not ok and not after.get(key, False))
+    new = sorted(key for key, ok in after.items() if not ok and before.get(key, True))
+    resolved = sorted(key for key, ok in after.items() if ok and not before.get(key, True))
+    return {"pre_existing_failures": len(preexisting), "new_failures": len(new),
+            "resolved_failures": len(resolved), "pre_existing": preexisting,
+            "new": new, "resolved": resolved}
+
+
+gate_delta.arguments = _gate_args
+
+
+def _project_gate_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--hook", default="full_gate")
+    p.add_argument("--machine", action="store_true")
+    p.add_argument("--affected-unit")
+
+
+@command("project-gate", "Run a configured project gate with compact per-image machine output")
+def project_gate(args):
+    project = Path(args.project).resolve(); hooks = _project_workbench_config(project).get("hooks", {})
+    command_text = hooks.get(args.hook)
+    if not command_text: raise ValueError(f"workbench.hooks.{args.hook} is not configured")
+    run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=_canonical_env(),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    artifact_dir = project / ".n64dk" / "gate-artifacts"; artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_dir / f"{args.hook}-{time.time_ns()}.log"; artifact.write_text(run.stdout)
+    lines = run.stdout.splitlines(); failures = [line for line in lines if re.search(r"\b(FAIL|ERROR|DIFF)\b", line)]
+    images = {}
+    for line in lines:
+        found = re.search(r"\b(resident|overlay\d+|loader)\b.*?(\d+)\s*/\s*(\d+)", line, re.I)
+        if found: images[found.group(1).lower()] = {"exact": int(found.group(2)), "total": int(found.group(3))}
+    affected = [line for line in lines if args.affected_unit and args.affected_unit in line]
+    return {"ok": run.returncode == 0, "exit_code": run.returncode, "hook": args.hook,
+            "images": images, "failures": failures[-100:], "affected_unit": affected[-20:],
+            "line_count": len(lines), "full_output_artifact": str(artifact),
+            "output_tail": None if args.machine else run.stdout[-16000:]}
+
+
+project_gate.arguments = _project_gate_args
+
+
+def _scheduler_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    p.add_argument("--gpu", action="store_true")
+    p.add_argument("--limit", type=int, default=500)
+
+
+@command("scheduler-plan", "Build persistent discovery, exploitation, family, recovery, boundary and verification lanes")
+def scheduler_plan(args):
+    project = Path(args.project).resolve(); inventory = build_inventory(project); rows = inventory["functions"]
+    lane = {name: [] for name in ("discovery", "exploitation", "family-propagation", "recovery", "boundary-audit", "integration")}
+    for row in rows:
+        if row["state"] == "conflict" or row["ownership_state"] == "fragment": lane["boundary-audit"].append(row)
+        elif row["state"] == "remaining" and row.get("candidate_source"): lane["exploitation"].append(row)
+        elif row["state"] == "remaining": lane["discovery"].append(row)
+    for values in lane.values(): values[:] = values[:args.limit]
+    metrics = {"catalogue_considered": len(rows), "excluded_fragments": sum(x["ownership_state"] == "fragment" for x in rows),
+               "assembly_owned": sum(x["ownership_state"].startswith("assembly") for x in rows),
+               "aggregate_owned": sum(x["ownership_state"] == "manifest_exact_member" for x in rows),
+               "usable_candidate_source": sum(bool(x.get("candidate_source")) for x in rows),
+               "selected": sum(map(len, lane.values())), "compiled": 0, "unique_sources": 0,
+               "unique_objects": 0, "exact": 0, "improved": 0, "unchanged": 0, "invalid_mappings": 0}
+    plan = {"cpu": {"compile_workers": args.jobs, "reserved_orchestration": 1, "reserved_verification": 1},
+            "gpu": {"enabled": args.gpu, "role": "bounded retrieval and ranking only"},
+            "lanes": {key: [row["id"] for row in value] for key, value in lane.items()}, "metrics": metrics}
+    plan_id = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()[:20]
+    db = sqlite3.connect(project / ".n64dk" / "scheduler.sqlite")
+    db.execute("CREATE TABLE IF NOT EXISTS plans (plan_id TEXT PRIMARY KEY,payload TEXT,created_ns INTEGER,updated_ns INTEGER)")
+    now = time.time_ns(); db.execute("INSERT OR REPLACE INTO plans VALUES (?,?,?,?)",
+                                    (plan_id, json.dumps(plan), now, now)); db.commit(); db.close()
+    return {"plan_id": plan_id, **plan}
+
+
+scheduler_plan.arguments = _scheduler_args
+
+
+def _scheduler_status_args(p):
+    p.add_argument("plan_id")
+    p.add_argument("--project", default=".")
+
+
+@command("scheduler-status", "Inspect persistent lane allocation and exact-match throughput metrics")
+def scheduler_status(args):
+    db = sqlite3.connect(Path(args.project).resolve() / ".n64dk" / "scheduler.sqlite")
+    row = db.execute("SELECT payload,created_ns,updated_ns FROM plans WHERE plan_id=?", (args.plan_id,)).fetchone(); db.close()
+    if not row: raise KeyError(f"unknown scheduler plan {args.plan_id}")
+    return {"plan_id": args.plan_id, **json.loads(row[0]), "created_ns": row[1], "updated_ns": row[2]}
+
+
+scheduler_status.arguments = _scheduler_status_args
+
+
+def _snapshot_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--function", required=True)
+    p.add_argument("--image")
+    p.add_argument("--database", default=".n64dk/results.sqlite")
+
+
+@command("workbench-snapshot", "Emit one compact ownership, boundary, source, history and next-action snapshot")
+def workbench_snapshot(args):
+    project = Path(args.project).resolve(); inventory = build_inventory(project)
+    rows = [row for row in inventory["functions"] if row["name"] == args.function]
+    if len(rows) != 1: raise ValueError("function selector is ambiguous")
+    git = subprocess.run(["git", "status", "--short"], cwd=project, text=True, stdout=subprocess.PIPE)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=project, text=True, stdout=subprocess.PIPE)
+    result = {"function": {k: rows[0].get(k) for k in ("name", "image", "vram", "size", "state", "ownership_state", "owner", "reason")},
+              "git": {"head": head.stdout.strip(), "dirty_files": len(git.stdout.splitlines())}}
+    if args.image:
+        try: result["preflight"] = preflight(args.image, from_inventory(rows[0]), rows[0]["catalogue_status"])
+        except ValueError as error: result["preflight"] = {"ok": False, "error": str(error)}
+    database = Path(project, args.database) if not Path(args.database).is_absolute() else Path(args.database)
+    if database.is_file():
+        index = ResultIndex(database)
+        try:
+            history = index.query(function=args.function, limit=10)
+            result["history"] = history; result["bracketed_target"] = index.brackets(args.function)
+        finally: index.close()
+    result["next_commands"] = [f"n64dk code-query --project {project} --symbol {args.function}",
+                               f"n64dk match-inventory --project {project} --explain {args.function}",
+                               f"n64dk result-query --project {project} --function {args.function}"]
+    return result
+
+
+workbench_snapshot.arguments = _snapshot_args
+
+
+def _lifetime_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--jobs", type=int, default=16)
+    p.add_argument("--rounds", type=int, default=4)
+    p.add_argument("--variants-per-round", type=int, default=16)
+
+
+@command("register-lifetime-explore", "Explore bounded carrier, scope, declaration and return-lifetime hypotheses")
+def register_lifetime_explore(args):
+    from ..match.explore import explore
+    from .match import _session_evaluator
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        session = MatchSession(store, _session_evaluator(store.context(args.session_id)))
+        result = explore(store, session, args.session_id, args.jobs, args.rounds,
+                         args.variants_per_round, True)
+        result["allocation_hypotheses"] = [
+            {"name": "formal reuse", "expected": "preserve or destructively reuse the incoming carrier"},
+            {"name": "named result carrier", "expected": "extend the returned value live range"},
+            {"name": "scope shortening", "expected": "remove interference before the residual site"},
+            {"name": "joined return", "expected": "force convergence on one return register"},
+        ]
+        return result
+    finally: store.close()
+
+
+register_lifetime_explore.arguments = _lifetime_args
+
+
+def _control_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--jobs", type=int, default=16)
+    p.add_argument("--budget", type=int, default=32)
+    p.add_argument("--stop-on-exact", action="store_true")
+
+
+@command("control-flow-explore", "Classify branch targets and test bounded loop/exit source forms")
+def control_flow_explore(args):
+    from ..match.controlflow import classify_branches, variants
+    from .match import _session_evaluator
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        parent = store.best(args.session_id); context = store.context(args.session_id)
+        source = store.cache.get(parent.source_digest).decode()
+        branch_evidence = classify_branches(context, parent.outcome)
+        generated = variants(source, args.budget)
+        if not generated:
+            return {"session_id": args.session_id, "branch_targets": branch_evidence,
+                    "variants": 0, "reason": "no bounded simple control-flow region found"}
+        transaction = MatchSession(store, _session_evaluator(context)).try_proposal(
+            args.session_id, {"parent": parent.candidate_id,
+                              "hypothesis": "branch target shape selects loop exit or shared cleanup",
+                              "variants": generated}, args.jobs, True)
+        original_offsets = {row.get("target_offset", row.get("offset"))
+                            for row in parent.outcome.get("diff", {}).get("entries", [])}
+        for result in transaction["transaction_results"]:
+            child = store.get(args.session_id, result["candidate_id"])
+            child_offsets = {row.get("target_offset", row.get("offset"))
+                             for row in child.outcome.get("diff", {}).get("entries", [])} if child else set()
+            result["cfg_scope"] = "preserved" if child_offsets <= original_offsets else "unrelated-block-change"
+            result["eligible_frontier"] = result["cfg_scope"] == "preserved"
+            if not result["eligible_frontier"]:
+                store.db.execute("UPDATE session_candidates SET status = 'rejected-cfg' "
+                                 "WHERE session_id = ? AND candidate_id = ?",
+                                 (args.session_id, result["candidate_id"]))
+        store.db.commit()
+        accepted = [row for row in transaction["transaction_results"] if row["eligible_frontier"]]
+        transaction["transaction_best"] = min(accepted, key=lambda row: row.get("score", 1 << 30),
+                                              default=None)
+        transaction["rejected_unrelated_cfg"] = sum(not row["eligible_frontier"]
+                                                     for row in transaction["transaction_results"])
+        transaction["branch_targets"] = branch_evidence
+        transaction["forms_tested"] = [row["form"] for row in generated]
+        return transaction
+    finally: store.close()
+
+
+control_flow_explore.arguments = _control_args
+
+
+def _clone_args(p):
+    p.add_argument("--source-session", required=True)
+    p.add_argument("--source-candidate")
+    p.add_argument("--target-session", required=True)
+    p.add_argument("--project", default=".")
+    p.add_argument("--jobs", type=int, default=8)
+
+
+@command("clone-family-transfer", "Align a reconstructed family member and test a renamed sibling candidate")
+def clone_family_transfer(args):
+    import difflib
+    source_store = SessionStore(resolve_store(args.source_session, args.project))
+    target_store = SessionStore(resolve_store(args.target_session, args.project))
+    try:
+        source_row = source_store.get(args.source_session, args.source_candidate) if args.source_candidate else source_store.best(args.source_session)
+        target_row = target_store.best(args.target_session)
+        source = source_store.cache.get(source_row.source_digest).decode()
+        target = target_store.cache.get(target_row.source_digest).decode()
+        source_name = re.search(r"\b(func_[0-9A-Fa-f]{8})\s*\(", source)
+        target_name = re.search(r"\b(func_[0-9A-Fa-f]{8})\s*\(", target)
+        if not source_name or not target_name: raise ValueError("family sources need identifiable function names")
+        candidate = source.replace(source_name.group(1), target_name.group(1))
+        similarity = difflib.SequenceMatcher(None, source.splitlines(), target.splitlines()).ratio()
+        from .match import _session_evaluator
+        result = MatchSession(target_store, _session_evaluator(target_store.context(args.target_session))).try_proposal(
+            args.target_session, {"parent": target_row.candidate_id,
+                                  "hypothesis": "clone family shares CFG and differs only in case body",
+                                  "variants": [{"label": "renamed-family-transfer", "source": candidate}]},
+            args.jobs, False)
+        result["family_alignment"] = {"source_function": source_name.group(1),
+                                      "target_function": target_name.group(1),
+                                      "line_similarity": round(similarity, 4),
+                                      "method": "function rename plus target recompilation"}
+        return result
+    finally:
+        source_store.close(); target_store.close()
+
+
+clone_family_transfer.arguments = _clone_args

@@ -9,11 +9,11 @@ from .. import mips
 PREFLIGHT_VERSION = "entry-delay-v2"
 
 
-def _entry_evidence(data: bytes, layout: Layout) -> dict:
+def _entry_evidence(data: bytes, layout: Layout, function_offset: int | None = None) -> dict:
     """Conservative entry analysis over the authoritative containing section."""
     reasons: list[str] = []
-    start_off = layout.rom
-    section_lo = layout.section_rom
+    start_off = layout.rom if function_offset is None else function_offset
+    section_lo = start_off - (layout.function_vram - layout.section_vram)
     section_hi = min(len(data), section_lo + layout.section_size)
     entry = layout.function_vram
     incoming = []
@@ -51,11 +51,13 @@ def _entry_evidence(data: bytes, layout: Layout) -> dict:
 
     defined = {0, 4, 5, 6, 7, 28, 29, 31}  # zero, ABI args, gp, sp, ra
     suspicious = set()
+    suspicious_sites = []
     restored_without_save = set()
     saved_to_stack = set()
     code = data[start_off:start_off + layout.function_size]
     for ins in mips.instructions(code, entry):
-        if ins.doesStore() and mips.reg(ins.rs) == 29 and ins.readsRt():
+        preservation = ins.doesStore() and mips.reg(ins.rs) == 29 and ins.readsRt()
+        if preservation:
             source_value = mips.reg(ins.rt)
             if source_value in set(range(16, 24)) | {30, 31}:
                 saved_to_stack.add(source_value)
@@ -63,8 +65,12 @@ def _entry_evidence(data: bytes, layout: Layout) -> dict:
             reads = getattr(ins, "reads" + attr.upper()[0] + attr[1:], None)
             if reads and reads():
                 value = mips.reg(getattr(ins, attr))
+                if preservation and attr == "rt" and value in set(range(16, 24)) | {30, 31}:
+                    continue
                 if value in set(range(16, 24)) | {30} and value not in defined:
                     suspicious.add(value)
+                    suspicious_sites.append({"address": f"0x{ins.vram:08X}",
+                                             "instruction": ins.disassemble(), "register": value})
         destination = ins.getDestinationGpr()
         if destination is not None:
             destination_value = mips.reg(destination)
@@ -91,6 +97,7 @@ def _entry_evidence(data: bytes, layout: Layout) -> dict:
             "call_target_evidence": [f"0x{x:08X}" for x in call_targets],
             "predecessor_fallthrough": predecessor_fallthrough,
             "saved_register_live_ins": sorted(suspicious),
+            "saved_register_diagnostics": suspicious_sites,
             "saved_register_restores": sorted(restored_without_save)}
 
 
@@ -118,6 +125,8 @@ class Layout:
             value[key] = f"0x{value[key]:X}"
         value["vram_delta"] = f"0x{self.delta:X}"
         value["function_rom"] = f"0x{self.rom:X}"
+        value["raw_rom"] = f"0x{self.rom:X}"
+        value["composite_rom"] = f"0x{self.function_vram - 0x80000400 + 0x1000:X}"
         return value
 
 
@@ -141,11 +150,24 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
         errors.append("target VRAM interval is outside its catalogue section")
     if layout.rom < layout.section_rom or layout.rom + layout.function_size > layout.section_rom + layout.section_size:
         errors.append("target ROM interval is outside its catalogue section")
-    if layout.rom < 0 or layout.rom + layout.function_size > len(data):
-        errors.append("target interval is outside the loaded image")
-        code = b""
+    raw_offset = layout.rom
+    composite_offset = layout.function_vram - 0x80000400 + 0x1000
+    candidates = []
+    for authority, offset in (("raw-overlay", raw_offset), ("resident-composite", composite_offset)):
+        if offset < 0 or offset + layout.function_size > len(data):
+            continue
+        candidate_code = data[offset:offset + layout.function_size]
+        candidate_decoded = list(mips.instructions(candidate_code, layout.function_vram))
+        candidate_valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in candidate_decoded)
+        terminal_score = int(any(ins.isJrRa() or ins.isJrNotRa() or ins.isJumpWithAddress()
+                                 or ins.isBranch() for ins in candidate_decoded[-2:]))
+        candidates.append((candidate_valid + terminal_score * max(2, len(candidate_decoded)),
+                           authority, offset, candidate_code))
+    if not candidates:
+        errors.append("target interval is outside every canonical image mapping")
+        selected_authority, selected_offset, code = "none", raw_offset, b""
     else:
-        code = data[layout.rom:layout.rom + layout.function_size]
+        _score, selected_authority, selected_offset, code = max(candidates, key=lambda item: item[0])
     decoded = list(mips.instructions(code, layout.function_vram))
     valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in decoded)
     ratio = valid / len(decoded) if decoded else 0.0
@@ -177,7 +199,7 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
                 delay["delay_slot"] = f"0x{decoded[last_index + 1].vram:08X}"
     if terminal and falls:
         warnings.append("catalogue says fall-through but target ends in a terminator")
-    entry = _entry_evidence(data, layout) if code else {"entry_status": "reject",
+    entry = _entry_evidence(data, layout, selected_offset) if code else {"entry_status": "reject",
                                                           "reason_codes": ["no_target_bytes"],
                                                           "confidence": 1.0}
     if strict_entry and entry["entry_status"] == "reject":
@@ -186,6 +208,10 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
         raise ValueError("image-layout preflight failed: " + "; ".join(errors))
     return {"ok": True, "preflight_version": PREFLIGHT_VERSION,
             "mapping": layout.as_dict(), "mapping_authority": layout.authority,
+            "selected_image_mapping": selected_authority,
+            "selected_image_offset": f"0x{selected_offset:X}",
+            "mapping_candidates": [{"authority": authority, "offset": f"0x{offset:X}", "score": score}
+                                   for score, authority, offset, _code in candidates],
             "image": str(Path(path).resolve()), "image_size": len(data),
             "first_instruction": first, "last_instruction": last,
             "valid_words": valid, "total_words": len(decoded), "valid_ratio": ratio,

@@ -51,6 +51,12 @@ the kit through a provider-neutral newline-delimited JSON protocol. External sch
 the same validated commands as interactive users instead of constructing shell fragments or
 parsing terminal prose.
 
+The workbench command layer composes these primitives rather than introducing a second build
+oracle. Doctor, matrices, family/TU sessions, source and assembly search, boundary correction,
+winner integration and scheduling all retain content identities and emit non-applying
+transactions. Exactness remains defined only by a fresh comparison against current target
+bytes under an authoritative mapping.
+
 ## Conventions
 * Pure functions over `bytes` + addresses; I/O only in commands. Every analysis returns
   dataclasses or lists of `Interval`s so results compose into one ledger.

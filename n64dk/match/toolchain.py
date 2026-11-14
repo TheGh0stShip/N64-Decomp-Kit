@@ -116,7 +116,7 @@ class Config:
 
 def _resolve(base: Path, value: str | os.PathLike) -> Path:
     path = Path(value).expanduser()
-    return path if path.is_absolute() else (base / path).resolve()
+    return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
 def load_config(project: str | Path | None = None, config: str | Path | None = None,

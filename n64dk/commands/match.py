@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -16,9 +18,57 @@ from ..match.engine import Target, batch, default_pipelines, manifest_row, match
 from ..match.pipeline import PIPELINES, BuildSpec, split_flags, scratch_dir
 from ..match.session import MatchSession, SessionStore
 from ..match.registry import SessionRegistry, resolve_store, standard_store
-from ..match.layout import Layout, preflight
+from ..match.layout import Layout, from_inventory, preflight
 from ..match.toolchain import Config, PROFILES, load_config
+from ..match import inventory as inventorymod
 from ..rom import Rom
+
+
+def _exact_project_evidence(cfg, args, outcome, source, spec, target):
+    if not outcome.exact or outcome.vram is None:
+        return {}
+    try:
+        inventory = inventorymod.build(cfg.project)
+        rows = [row for row in inventory["functions"] if int(row["vram"], 0) == outcome.vram
+                and int(row["size"]) == outcome.size]
+    except Exception:
+        rows = []
+    selected = None
+    for row in rows:
+        try:
+            check = preflight(args.rom, from_inventory(row), row.get("catalogue_status", ""))
+        except Exception:
+            continue
+        if int(check["selected_image_offset"], 0) == outcome.vram - target.delta:
+            selected = (row, check); break
+    if selected is None and len(rows) == 1:
+        row = rows[0]; selected = (row, None)
+    if selected is None:
+        return {"exact_evidence": {"target_text": outcome.result.text.match if outcome.result else True,
+                                   "source_sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
+                                   "generated_text_sha256": outcome.as_dict().get("sha256_text")}}
+    row, check = selected; layout = from_inventory(row)
+    target_digest = outcome.as_dict().get("sha256_text")
+    relative = str(Path(source).resolve().relative_to(cfg.project)) if Path(source).resolve().is_relative_to(cfg.project) else str(source)
+    project_row = "\t".join((f"0x{layout.rom:X}", f"0x{outcome.size:X}", relative,
+                             spec.manifest_flags(), target_digest or ""))
+    profile_key = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}.get(spec.pipeline, "kmc")
+    compiler_root = cfg.toolchain(profile_key); compiler_hasher = hashlib.sha256()
+    if compiler_root:
+        for relative_name in PROFILES[profile_key].required:
+            compiler_hasher.update(relative_name.encode()); compiler_hasher.update(hashlib.sha256((compiler_root / relative_name).read_bytes()).digest())
+    compiler_digest = compiler_hasher.hexdigest() if compiler_root else None
+    return {"image_mapping": {"raw_rom": f"0x{layout.rom:X}",
+                              "composite_rom": f"0x{outcome.vram - 0x80000400 + 0x1000:X}",
+                              "vram": f"0x{outcome.vram:08X}", "image": row["image"]},
+            "project_manifest_row": project_row,
+            "exact_evidence": {"target_text_sha256": target_digest,
+                               "complete_owned_sections": all(section.match for section in outcome.result.sections) if outcome.result else True,
+                               "expected_manifest_hash": target_digest,
+                               "compiler_binary_digest": compiler_digest,
+                               "source_sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
+                               "relocations_checked": bool(outcome.result and outcome.result.sections),
+                               "mapping_preflight": check}}
 
 
 def _common(p, rom_required: bool):
@@ -116,10 +166,28 @@ def match(args):
     with scratch_dir() as tmp:
         o = match_source(source, spec, cfg, target, args.addr, args.size, syms, Path(tmp),
                          infer_externals=not args.no_infer)
+    # Direct observations enter the same durable history as sessions immediately.
+    try:
+        from ..match.results import ResultIndex
+        address, size = o.vram, o.size
+        target_offset = address - target.delta
+        target_digest = (hashlib.sha256(target.rom[target_offset:target_offset + size]).hexdigest()
+                         if 0 <= target_offset <= len(target.rom) - size else None)
+        history = ResultIndex(cfg.project / ".n64dk" / "results.sqlite")
+        try:
+            history.record_direct(o.as_dict(), {"rom_sha256": hashlib.sha256(target.rom).hexdigest(),
+                "target_text_sha256": target_digest, "vram_delta": target.delta,
+                "addr": address, "size": size}, source,
+                source.stem if re.fullmatch(r"func_[0-9A-Fa-f]{8}", source.stem) else None,
+                "valid_current_target" if target_digest else "unknown_provenance")
+        finally: history.close()
+    except Exception:
+        pass  # matching remains available when the optional history store is unavailable
     if args.format == "json":
         d = o.as_dict()
         if o.exact:
             d["manifest_row"] = manifest_row(o, cfg.project, source, target, syms)
+            d.update(_exact_project_evidence(cfg, args, o, source, spec, target))
         return d
     lines = [f"{'MATCH' if o.exact else 'DIFF'} {source.name} @ 0x{o.vram:08X} "
              f"[{spec.pipeline} {' '.join(spec.flags)}]"]
@@ -150,6 +218,20 @@ match.arguments = _match_args
 def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec,
                      source_bytes: bytes) -> dict:
     rom_path = Path(args.rom).expanduser().resolve()
+    toolchain_hasher = hashlib.sha256()
+    for key, root in sorted(cfg.toolchains.items()):
+        toolchain_hasher.update(key.encode())
+        if root.is_dir():
+            for item in sorted(path for path in root.iterdir() if path.is_file()):
+                toolchain_hasher.update(item.name.encode()); toolchain_hasher.update(hashlib.sha256(item.read_bytes()).digest())
+    if cfg.toolchain_root:
+        toolchain_hasher.update(str(cfg.toolchain_root.resolve()).encode())
+    profile_key = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}.get(spec.pipeline, "kmc")
+    profile_root = cfg.toolchain(profile_key)
+    if profile_root:
+        for relative in PROFILES[profile_key].required:
+            binary = profile_root / relative
+            toolchain_hasher.update(relative.encode()); toolchain_hasher.update(hashlib.sha256(binary.read_bytes()).digest())
     context = {
         "source_name": source.name,
         "source_suffix": source.suffix or ".c",
@@ -169,6 +251,7 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
         "default_flags": list(spec.flags),
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "compiler_recipe": {"pipeline": spec.pipeline, "flags": list(spec.flags)},
+        "toolchain_digest": toolchain_hasher.hexdigest(),
     }
     if args.addr is not None and args.size is not None:
         layout = Layout("standalone", 0, target.delta, len(target.rom), args.addr, args.size,
@@ -214,11 +297,19 @@ def _session_evaluator(context: dict):
             source_path.write_bytes(source)
             workdir = root / "build"
             workdir.mkdir()
-            return match_source(
+            outcome = match_source(
                 source_path, spec, cfg, target, context.get("addr"), context.get("size"),
                 syms, workdir, infer_externals=context.get("infer_externals", True),
                 name=label,
             )
+            artifact_dir = context.get("artifact_dir")
+            if artifact_dir:
+                destination = Path(artifact_dir) / re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+                destination.mkdir(parents=True, exist_ok=True)
+                for artifact in workdir.rglob("*"):
+                    if artifact.is_file() and artifact.suffix not in {".o"}:
+                        shutil.copy2(artifact, destination / artifact.name)
+            return outcome
     return evaluate
 
 
@@ -320,6 +411,12 @@ def _session_try_args(p):
                    help="JSON object, JSON file, or - for stdin (default)")
     p.add_argument("--jobs", type=int, default=4)
     p.add_argument("--details", action="store_true", help="include full outcome and diff entries")
+    p.add_argument("--transaction-results", action="store_true")
+    p.add_argument("--transaction-best", action="store_true")
+    p.add_argument("--session-best", action="store_true")
+    p.add_argument("--changed-only", action="store_true")
+    p.add_argument("--object-classes", action="store_true")
+    p.add_argument("--why-not-better", action="store_true")
     _session_output_args(p)
 
 
@@ -331,6 +428,15 @@ def match_session_try(args):
         session = MatchSession(store, _session_evaluator(context))
         value = session.try_proposal(args.session_id, _read_proposal(args.proposal),
                                      args.jobs, args.details or args.best_details)
+        selected = [name for name in ("transaction_results", "transaction_best", "session_best",
+                    "object_classes", "why_not_better") if getattr(args, name, False)]
+        if args.changed_only:
+            value["transaction_results"] = [row for row in value["transaction_results"]
+                                             if not row.get("cache_hit") and
+                                             (row.get("delta", {}).get("score") or
+                                              row.get("delta", {}).get("counts"))]
+        if selected:
+            value = {"session_id": args.session_id, **{key: value.get(key) for key in selected}}
         return _project_session_output(value, args, store)
     finally:
         store.close()

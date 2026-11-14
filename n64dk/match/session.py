@@ -105,6 +105,12 @@ class SessionStore:
                 updated_ns INTEGER NOT NULL,
                 PRIMARY KEY (pipeline_family, flag)
             );
+            CREATE TABLE IF NOT EXISTS option_capabilities (
+                toolchain_digest TEXT NOT NULL, pipeline_family TEXT NOT NULL,
+                stage TEXT NOT NULL, option TEXT NOT NULL, option_argument TEXT NOT NULL,
+                supported INTEGER NOT NULL, evidence TEXT NOT NULL, updated_ns INTEGER NOT NULL,
+                PRIMARY KEY(toolchain_digest,pipeline_family,stage,option,option_argument)
+            );
             CREATE TABLE IF NOT EXISTS session_experiments (
                 session_id TEXT NOT NULL, signature TEXT NOT NULL, round INTEGER NOT NULL,
                 family TEXT NOT NULL, parent_id TEXT NOT NULL, variants INTEGER NOT NULL,
@@ -190,22 +196,44 @@ class SessionStore:
     def _family(pipeline: str) -> str:
         return pipeline.split("+", 1)[0]
 
-    def flag_supported(self, pipeline: str, flag: str) -> bool | None:
+    def flag_supported(self, pipeline: str, flag: str, toolchain_digest: str = "unknown",
+                       stage: str = "compiler") -> bool | None:
+        option, _, argument = flag.partition("=")
         with self._lock:
             row = self.db.execute(
-                "SELECT supported FROM flag_capabilities WHERE pipeline_family = ? AND flag = ?",
-                (self._family(pipeline), flag)).fetchone()
+                "SELECT supported FROM option_capabilities WHERE toolchain_digest=? AND "
+                "pipeline_family=? AND stage=? AND option=? AND option_argument=?",
+                (toolchain_digest, self._family(pipeline), stage, option, argument)).fetchone()
         return bool(row[0]) if row else None
 
-    def record_flag(self, pipeline: str, flag: str, supported: bool, evidence: str) -> None:
+    def record_flag(self, pipeline: str, flag: str, supported: bool, evidence: str,
+                    toolchain_digest: str = "unknown", stage: str = "compiler") -> None:
+        option, _, argument = flag.partition("=")
         with self._lock:
             self.db.execute("""
-                INSERT INTO flag_capabilities VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(pipeline_family, flag) DO UPDATE SET
+                INSERT INTO option_capabilities VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(toolchain_digest,pipeline_family,stage,option,option_argument) DO UPDATE SET
                     supported=excluded.supported, evidence=excluded.evidence,
                     updated_ns=excluded.updated_ns
-            """, (self._family(pipeline), flag, int(supported), evidence[-2000:], time.time_ns()))
+            """, (toolchain_digest, self._family(pipeline), stage, option, argument,
+                  int(supported), evidence[-2000:], time.time_ns()))
             self.db.commit()
+
+    def capabilities(self) -> list[dict]:
+        columns = ("toolchain_digest", "pipeline_family", "stage", "option",
+                   "option_argument", "supported", "evidence", "updated_ns")
+        return [dict(zip(columns, row)) for row in self.db.execute(
+            "SELECT * FROM option_capabilities ORDER BY pipeline_family,stage,option")]
+
+    def invalidate_capabilities(self, pipeline=None, option=None, stage=None) -> int:
+        clauses, values = [], []
+        for column, value in (("pipeline_family", pipeline), ("option", option), ("stage", stage)):
+            if value:
+                clauses.append(column + "=?"); values.append(value)
+        sql = "DELETE FROM option_capabilities" + (" WHERE " + " AND ".join(clauses) if clauses else "")
+        before = self.db.total_changes
+        self.db.execute(sql, values); self.db.commit()
+        return self.db.total_changes - before
 
     def experiment_seen(self, session_id: str, signature: str) -> bool:
         return self.db.execute("""SELECT 1 FROM session_experiments
@@ -364,9 +392,15 @@ class MatchSession:
                 lowered = outcome.error.lower()
                 if "invalid option" in lowered or "unrecognized option" in lowered \
                         or "unknown option" in lowered:
+                    # Attribute rejection only to an option named by the compiler error.
+                    # Never poison the inherited base recipe because one added flag failed.
+                    toolchain_digest = self.store.context(session_id).get("toolchain_digest", "unknown")
                     for flag in flags:
-                        if flag.startswith("-"):
-                            self.store.record_flag(pipeline, flag, False, outcome.error)
+                        option = flag.partition("=")[0]
+                        if option.startswith("-") and option in outcome.error:
+                            stage = "assembler" if flag.startswith("-Wa,") else "preprocessor" if flag.startswith("-Wp,") else "compiler"
+                            self.store.record_flag(pipeline, flag, False, outcome.error,
+                                                   toolchain_digest, stage)
             return SessionCandidate(candidate_id, parent_id, source_digest, label,
                                     hypothesis, pipeline, flags, status, outcome.exact,
                                     score, counts, payload, error, time.time_ns())
@@ -441,18 +475,22 @@ class MatchSession:
         # Reject previously disproved compiler flags before allocating a worker.  Two options
         # frequently proposed for KMC GCC are known absent and seed the cache immediately.
         known_absent = {"kmc": {"-fno-cse", "-fno-cse2"}}
+        toolchain_digest = context.get("toolchain_digest", "unknown")
         rejected = []
         supported_work = []
         for item in work:
             source, label, pipeline, flags = item
             bad = [flag for flag in flags if (flag in known_absent.get(pipeline.split("+", 1)[0], set())
-                   or self.store.flag_supported(pipeline, flag) is False)]
+                   or self.store.flag_supported(pipeline, flag, toolchain_digest,
+                       "assembler" if flag.startswith("-Wa,") else "preprocessor" if flag.startswith("-Wp,") else "compiler") is False)]
             if bad:
                 rejected.append({"label": label, "pipeline": pipeline, "flags": list(flags),
                                  "status": "unsupported", "unsupported_flags": bad,
                                  "reason": "compiler capability preflight"})
                 for flag in bad:
-                    self.store.record_flag(pipeline, flag, False, "compiler capability preflight")
+                    stage = "assembler" if flag.startswith("-Wa,") else "preprocessor" if flag.startswith("-Wp,") else "compiler"
+                    self.store.record_flag(pipeline, flag, False, "compiler capability preflight",
+                                           toolchain_digest, stage)
             else:
                 supported_work.append(item)
         work = supported_work
@@ -482,12 +520,31 @@ class MatchSession:
                             "suggestions": suggest(retained.counts),
                             "cache_hit": retained.candidate_id not in inserted})
         current_frontier = frontier(rows)
+        transaction_viable = [row for row in evaluated if row.status == "evaluated"]
+        transaction_best = (min(transaction_viable, key=lambda row: (not row.exact,
+                            row.score if row.score is not None else 2**63)).summary(details)
+                            if transaction_viable else None)
+        object_classes = {}
+        for candidate in evaluated:
+            digest = candidate.outcome.get("sha256_text") if candidate.outcome else None
+            object_classes.setdefault(digest or "no-object", []).append(candidate.candidate_id)
+        session_best = self.store.best(session_id)
         return {
             "session_id": session_id,
             "parent": parent.summary(details),
             "results": results,
             "rejected": rejected,
-            "best": self.store.best(session_id).summary(details),
+            "best": session_best.summary(details),
+            "transaction_results": results,
+            "transaction_best": transaction_best,
+            "session_best": session_best.summary(details),
+            "object_classes": [{"object_digest": digest, "candidate_ids": ids,
+                                "equivalent_sources": len(ids)}
+                               for digest, ids in object_classes.items()],
+            "why_not_better": ("transaction did not improve the retained session frontier"
+                               if transaction_best and transaction_best.get("score") is not None
+                               and session_best.score is not None
+                               and transaction_best["score"] >= session_best.score else None),
             "frontier": [row.summary(details) for row in current_frontier],
             "attempts": len(rows),
             "suggestions": suggest(self.store.best(session_id).counts),

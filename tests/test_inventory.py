@@ -44,10 +44,25 @@ functions = [
             self.assertEqual(rows["first"]["state"], "covered")
             self.assertEqual(rows["second"]["state"], "covered")
             self.assertEqual(rows["shared_tail"]["state"], "excluded")
-            self.assertEqual(rows["remaining"]["state"], "remaining")
+            self.assertEqual(rows["remaining"]["state"], "assembly")
             self.assertEqual(rows["remaining"]["candidate_source"], ".tmp/remaining_candidate.c")
-            self.assertEqual(rows["remaining"]["ownership_state"], "assembly_owned")
-            self.assertEqual(rows["first"]["ownership_state"], "manifest_exact")
+            self.assertEqual(rows["remaining"]["ownership_state"], "assembly_unit")
+            self.assertEqual(rows["first"]["ownership_state"], "manifest_exact_member")
+
+    def test_progress_denominator_mismatch_is_explicit(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = root / "config/us"; config.mkdir(parents=True)
+            (config / "functions_main.toml").write_text('''
+[[section]]
+rom = 0
+vram = 0x80000000
+size = 0x20
+functions = [{ name = "one", vram = 0x80000000, size = 0x10 }]
+''')
+            (config / "progress.toml").write_text("[image]\ntotal_functions = 2\n")
+            result = inventory.build(root)
+            self.assertEqual(result["summary"]["denominator_delta"], -1)
+            self.assertEqual(result["consistency"]["denominator_mismatch"]["declared_functions"], 2)
 
     def test_scratch_candidate_never_claims_coverage(self):
         with tempfile.TemporaryDirectory() as name:
@@ -68,6 +83,48 @@ functions = [{ name = "func_80000000", vram = 0x80000000, size = 0x10 }] # c can
             self.assertEqual(row["state"], "remaining")
             self.assertEqual(row["ownership_state"], "scratch_candidate")
             self.assertIsNone(row["coverage_authority"])
+
+    def test_generic_resident_manifest_expands_aggregate_unit(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = root / "config/us"; config.mkdir(parents=True)
+            (config / "functions_resident.toml").write_text('''
+[[section]]
+rom = 0
+vram = 0x80000400
+size = 0x100
+functions = [
+ { name = "member_a", vram = 0x80000440, size = 0x10 },
+ { name = "member_b", vram = 0x80000450, size = 0x10 },
+]
+''')
+            (config / "matching_kmc_units.tsv").write_text(
+                "0x1040\t0x20\tsrc/aggregate.c\t-O2\t" + "a" * 64 + "\n")
+            rows = inventory.build(root)["functions"]
+            self.assertTrue(all(row["state"] == "covered" for row in rows))
+            self.assertTrue(all(row["ownership_state"] == "manifest_exact_member" for row in rows))
+
+    def test_callee_save_store_is_not_semantic_live_in(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "function.bin"
+            path.write_bytes(struct.pack(">IIIIII", 0x27BDFFE8, 0xAFB00010, 0x00008025,
+                                         0x8FB00010, 0x03E00008, 0x27BD0018))
+            layout = Layout("main", 0, 0x80000000, 24, 0x80000000, 24)
+            report = preflight(path, layout, strict_entry=True)
+            self.assertEqual(report["entry_preflight"]["entry_status"], "accept")
+
+    def test_canonical_raw_and_composite_offsets(self):
+        with tempfile.TemporaryDirectory() as name:
+            layout = Layout("overlay2", 0x1000, 0x8008B8E0, 0x40000, 0x800AEF84, 12)
+            code = struct.pack(">III", 0x24020001, 0x03E00008, 0)
+            raw = bytearray(0x40000); raw[layout.rom:layout.rom + 12] = code
+            raw_path = Path(name) / "raw.bin"; raw_path.write_bytes(raw)
+            composite = bytearray(0xC0000); composite_offset = 0xAFB84
+            composite[composite_offset:composite_offset + 12] = code
+            composite_path = Path(name) / "composite.bin"; composite_path.write_bytes(composite)
+            self.assertEqual(preflight(raw_path, layout)["selected_image_mapping"], "raw-overlay")
+            report = preflight(composite_path, layout)
+            self.assertEqual(report["selected_image_mapping"], "resident-composite")
+            self.assertEqual(report["mapping"]["composite_rom"], "0xAFB84")
 
     def test_splat_metadata_and_context_bundle(self):
         with tempfile.TemporaryDirectory() as name:

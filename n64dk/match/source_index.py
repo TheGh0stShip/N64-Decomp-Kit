@@ -8,8 +8,9 @@ import time
 from pathlib import Path
 
 
-_NAME = re.compile(r"(?:func_)?([0-9A-Fa-f]{8})_candidate\.c$")
-_IGNORED = {"build", "extract", "extracted", "bundle", "bundles", "campaigns", "archive",
+_NAME = re.compile(r"(?:func_)?([0-9A-Fa-f]{8})(?:_[^/]*)?\.c$")
+_FUNCTION = re.compile(r"\b(func_[0-9A-Fa-f]{8})\s*\(")
+_IGNORED = {"build", "extract", "extracted", "bundle", "bundles", "campaigns",
             ".git", ".n64dk", "__pycache__"}
 
 
@@ -22,6 +23,9 @@ class SourceIndex:
         self.db.execute("""CREATE TABLE IF NOT EXISTS sources (
             path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,
             digest TEXT NOT NULL, function_name TEXT, vram INTEGER, indexed_ns INTEGER NOT NULL)""")
+        self.db.execute("CREATE INDEX IF NOT EXISTS sources_function_name ON sources(function_name)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS sources_vram ON sources(vram)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS sources_digest ON sources(digest)")
         self.db.commit()
 
     def close(self) -> None:
@@ -35,36 +39,36 @@ class SourceIndex:
         root = self.project / ".tmp"
         seen = set()
         scanned = hashed = 0
+        existing = {row[0]: row[1:] for row in self.db.execute(
+            "SELECT path,mtime_ns,size,digest FROM sources")}
         if root.is_dir():
             for path in root.rglob("*.c"):
                 relative = path.relative_to(self.project)
                 if any(part.lower() in _IGNORED for part in relative.parts):
                     continue
-                if not (path.name.endswith("_candidate.c") or path.name == "candidate.c"):
-                    continue
                 scanned += 1
                 key = str(relative)
                 seen.add(key)
                 stat = path.stat()
-                old = self.db.execute("SELECT mtime_ns, size, digest FROM sources WHERE path = ?",
-                                      (key,)).fetchone()
+                old = existing.get(key)
                 if old and old[0] == stat.st_mtime_ns and old[1] == stat.st_size:
                     continue
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                raw = path.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
                 hashed += 1
                 match = _NAME.search(path.name)
                 vram = int(match.group(1), 16) if match else None
-                function_name = path.name.removesuffix("_candidate.c") if match else None
+                content_match = _FUNCTION.search(raw.decode("utf-8", "replace"))
+                function_name = content_match.group(1) if content_match else (
+                    f"func_{match.group(1).upper()}" if match else None)
                 self.db.execute("""INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(path) DO UPDATE SET mtime_ns=excluded.mtime_ns, size=excluded.size,
                     digest=excluded.digest, function_name=excluded.function_name,
                     vram=excluded.vram, indexed_ns=excluded.indexed_ns""",
                     (key, stat.st_mtime_ns, stat.st_size, digest, function_name, vram, time.time_ns()))
-        if seen:
-            placeholders = ",".join("?" for _ in seen)
-            self.db.execute(f"DELETE FROM sources WHERE path NOT IN ({placeholders})", tuple(seen))
-        else:
-            self.db.execute("DELETE FROM sources")
+        stale = set(existing) - seen
+        if stale:
+            self.db.executemany("DELETE FROM sources WHERE path=?", ((value,) for value in stale))
         self.db.commit()
         return {"scanned": scanned, "hashed": hashed, "elapsed_seconds": round(time.monotonic() - started, 6)}
 
