@@ -1,6 +1,13 @@
 """Historical observation indexing, querying, and residual clustering."""
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from ..cli import command
 from ..match.inventory import build
 from ..match.results import ResultIndex
@@ -54,12 +61,15 @@ def result_query(args):
         database = str(__import__("pathlib").Path(args.project).resolve() / database)
     index = ResultIndex(database)
     try:
+        inventory = build(args.project)
         rows = index.query(args.function or args.same_residual, args.max_score, args.exact_only,
                            args.validity, args.stale_mapping, args.missing_source,
-                           args.timeline, args.limit)
+                           args.timeline, args.limit, args.project, inventory, args.not_in_manifest)
         if args.same_residual and rows:
             residual = rows[0]["residual"]
-            rows = [row for row in index.query(max_score=args.max_score, limit=100000)
+            rows = [row for row in index.query(max_score=args.max_score, limit=100000,
+                                               project=args.project, inventory=inventory,
+                                               not_in_manifest=args.not_in_manifest)
                     if row["residual"] == residual][:args.limit]
         rows = rows[args.offset:]
         result = {"count": len(rows), "observations": [] if args.summary_only else rows}
@@ -99,3 +109,50 @@ def residual_clusters(args):
 
 
 residual_clusters.arguments = _clusters_args
+
+
+def _reproduce_args(p):
+    p.add_argument("result_id")
+    p.add_argument("--project", default=".")
+    p.add_argument("--database", default=".n64dk/results.sqlite")
+
+
+@command("reproduce", "Independently replay a content-addressed matching observation")
+def reproduce(args):
+    project = Path(args.project).resolve(); database = Path(args.database)
+    if not database.is_absolute(): database = project / database
+    index = ResultIndex(database)
+    try:
+        row = index.db.execute("SELECT payload,source_path,source_digest FROM observations WHERE observation_id=?",
+                               (args.result_id,)).fetchone()
+        if not row: raise ValueError("unknown result ID")
+        payload, source_path, source_digest = json.loads(row[0]), row[1], row[2]
+        replay = payload.get("replay")
+        if not replay: raise ValueError("result predates replay bundles")
+        source = Path(source_path) if source_path else Path(replay["source"])
+        if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != source_digest:
+            equivalent = index.db.execute("SELECT path FROM sources WHERE digest=?", (source_digest,)).fetchone()
+            if not equivalent or not Path(equivalent[0]).is_file(): raise ValueError("replay source digest no longer resolves")
+            source = Path(equivalent[0])
+    finally: index.close()
+    image = Path(replay["image"])
+    if not image.is_file() or hashlib.sha256(image.read_bytes()).hexdigest() != replay["image_digest"]:
+        raise ValueError("replay image digest no longer resolves")
+    argv = ["match", str(source), "--project", str(project), "--rom", str(image),
+            "--addr", f"0x{replay['address']:X}", "--size", f"0x{replay['size']:X}",
+            "--vram-delta", f"0x{replay['vram_delta']:X}", "--pipeline", replay["pipeline"],
+            "--flags", " ".join(replay["flags"])]
+    for include in replay.get("include_paths", []): argv += ["-I", include]
+    for symbols in replay.get("symbol_files", []): argv += ["--symbols", symbols]
+    environment = dict(os.environ); environment.update(replay.get("environment", {}))
+    run = subprocess.run([sys.executable, "-m", "n64dk", "--format", "json", *argv], cwd=project,
+                         env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try: result = json.loads(run.stdout)
+    except json.JSONDecodeError: result = {"output": run.stdout[-12000:]}
+    reproduced = bool(run.returncode == 0 and result.get("exact") and
+                      result.get("sha256_text") == replay.get("target_digest"))
+    return {"result_id": args.result_id, "reproduced": reproduced, "exit_code": run.returncode,
+            "replay": replay, "result": result, "stderr": run.stderr[-12000:]}
+
+
+reproduce.arguments = _reproduce_args

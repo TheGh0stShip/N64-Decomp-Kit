@@ -4,6 +4,8 @@ from __future__ import annotations
 from .. import boot, mips
 from ..cli import command
 from ..rom import Rom
+from ..match.inventory import build as build_inventory
+from ..match.layout import from_inventory, resolve_image_map
 
 
 def _rom_arg(p):
@@ -29,10 +31,17 @@ info.arguments = _rom_arg
 @command("disasm", "Disassemble a VRAM range of the main segment")
 def disasm(args):
     rom = Rom.load(args.rom)
-    b = boot.analyse(rom)
     start = int(args.vram, 16)
     size = int(args.size, 16)
-    off = b.vram_to_rom(start)
+    off = None
+    if args.project:
+        rows = [row for row in build_inventory(args.project)["functions"]
+                if int(row["vram"], 0) == start and int(row["size"]) == size]
+        if args.image_name: rows = [row for row in rows if row["image"] == args.image_name]
+        if len(rows) != 1: raise ValueError("project disassembly target must resolve to one catalogue interval")
+        off = resolve_image_map(args.rom, from_inventory(rows[0]))["selected"]["offset"]
+    if off is None:
+        b = boot.analyse(rom); off = b.vram_to_rom(start)
     return "\n".join(mips.disassemble(rom.data[off:off + size], start))
 
 
@@ -40,6 +49,8 @@ def _disasm_args(p):
     _rom_arg(p)
     p.add_argument("vram", help="start VRAM (hex)")
     p.add_argument("size", help="byte count (hex)")
+    p.add_argument("--project")
+    p.add_argument("--image-name")
 
 
 disasm.arguments = _disasm_args

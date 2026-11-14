@@ -7,6 +7,8 @@ import json
 import os
 import re
 import difflib
+import csv
+import struct
 import shutil
 import sqlite3
 import subprocess
@@ -18,7 +20,7 @@ from pathlib import Path
 
 from ..cli import command
 from ..match.inventory import build as build_inventory
-from ..match.layout import from_inventory, preflight
+from ..match.layout import from_inventory, physical_collisions, preflight, resolve_image_map
 from ..match.registry import resolve_store, standard_store
 from ..match.results import ResultIndex
 from ..match.session import MatchSession, SessionStore
@@ -36,6 +38,52 @@ def _common_project(p):
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--summary-only", action="store_true")
+
+
+def _image_map_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--image", required=True)
+    p.add_argument("--function", required=True)
+    p.add_argument("--image-file")
+
+
+@command("image-map-explain", "Explain raw, linked and catalogue address transforms and fail on ambiguity")
+def image_map_explain(args):
+    project = Path(args.project).resolve(); inventory = build_inventory(project)
+    image_key = args.image.replace("_", "")
+    rows = [row for row in inventory["functions"]
+            if row["image"].replace("_", "") == image_key and
+            (row["name"] == args.function or row["vram"].lower() == args.function.lower())]
+    if len(rows) != 1: raise ValueError(f"expected one catalogue function, found {len(rows)}")
+    row = rows[0]; number = re.search(r"(\d+)$", args.image)
+    image_path = Path(args.image_file).resolve() if args.image_file else (
+        project / "build/us/audit" / f"overlay_{number.group(1)}_composite.z64" if number else
+        project / "build/us/main_unpacked.z64")
+    if not image_path.is_file(): raise ValueError(f"canonical image is missing: {image_path}")
+    layout = from_inventory(row); mapping = resolve_image_map(image_path, layout)
+    check = preflight(image_path, layout, row.get("catalogue_status", ""))
+    collisions = physical_collisions(image_path, layout, mapping, inventory["functions"])
+    selected_collisions = [item for item in collisions
+                           if item["candidate_authority"] == mapping["selected"]["authority"]]
+    agreements = {"catalogue": True,
+                  "manifest": row.get("coverage_authority") == "manifest",
+                  "splat": any(args.image.lower().replace("_", "") in str(item).lower().replace("_", "")
+                               for item in inventory.get("splat", [])),
+                  "symbols": bool(check["entry_preflight"].get("call_target_evidence")),
+                  "raw_composite_digest": mapping["raw_target_digest"] == mapping["target_digest"]}
+    if selected_collisions:
+        raise ValueError("selected physical target collides with an existing owner: " +
+                         ", ".join(item["owner"] for item in selected_collisions))
+    return {"function": row["name"], "image": args.image, "mapping": {
+                key: value for key, value in mapping.items() if key not in {"selected", "candidates"}},
+            "selected": {key: value for key, value in mapping["selected"].items() if key != "code"},
+            "candidates": [{key: value for key, value in item.items() if key != "code"}
+                           for item in mapping["candidates"]],
+            "agreements": agreements, "competing_mapping_collisions": collisions,
+            "preflight": check, "ambiguous": False}
+
+
+image_map_explain.arguments = _image_map_args
 
 
 def _project_workbench_config(project: Path) -> dict:
@@ -114,6 +162,84 @@ def _doctor_args(p):
     p.add_argument("--profile", choices=("matching", "gpu-research", "full"), default="matching")
     p.add_argument("--fix-user", action="store_true",
                    help="print user-local remediation commands; never mutates the host")
+    p.add_argument("--skip-functional", action="store_true", help="skip functional smoke tests")
+
+
+def _doctor_functional_smokes(project: Path) -> list[dict]:
+    smokes = []
+    def record(name, ok, detail=None): smokes.append({"name": name, "ok": bool(ok), "detail": detail})
+    try:
+        with tempfile.TemporaryDirectory(prefix="n64dk-doctor-map-") as name:
+            root = Path(name); raw = root / "overlay_9.z64"; composite = root / "overlay_9_composite.z64"
+            code = struct.pack(">III", 0x24020000, 0x03E00008, 0)
+            raw_data = bytearray(0x1100); raw_data[0x1000:0x100C] = code; raw.write_bytes(raw_data)
+            composite_data = bytearray(0x400); struct.pack_into(">I", composite_data, 8, 0x80000400)
+            composite_data[0x200:0x20C] = code; composite.write_bytes(composite_data)
+            layout = __import__("n64dk.match.layout", fromlist=["Layout"]).Layout(
+                "overlay9", 0x1000, 0x80002000, 12, 0x80002000, 12)
+            mapping = resolve_image_map(composite, layout)
+            record("raw/composite mapping", mapping["selected"]["offset"] == 0x200,
+                   {"selected": f"0x{mapping['selected']['offset']:X}"})
+    except Exception as error: record("raw/composite mapping", False, str(error))
+    try:
+        parser = __import__("argparse").ArgumentParser(add_help=False); _compiler_explain_args(parser)
+        one = parser.parse_args(["session", "--candidate", "one"])
+        pair = parser.parse_args(["session", "--from", "one", "--to", "two"])
+        record("compiler-explain contract", bool(one.candidate and pair.from_candidate and pair.to_candidate))
+    except Exception as error: record("compiler-explain contract", False, str(error))
+    try:
+        with tempfile.TemporaryDirectory(prefix="n64dk-doctor-sqlite-") as name:
+            path = Path(name) / "state.sqlite"; first = sqlite3.connect(path); second = sqlite3.connect(path)
+            first.execute("PRAGMA journal_mode=WAL"); first.execute("CREATE TABLE smoke(value INTEGER)"); first.commit()
+            second.execute("INSERT INTO smoke VALUES (1)"); second.commit()
+            ok = first.execute("SELECT COUNT(*) FROM smoke").fetchone()[0] == 1
+            first.close(); second.close(); record("SQLite schema/write locking", ok)
+    except Exception as error: record("SQLite schema/write locking", False, str(error))
+    try:
+        with tempfile.TemporaryDirectory(prefix="n64dk-doctor-stale-") as name:
+            root = Path(name); source = root / "func_80002000.c"; source.write_text("int func_80002000(void){return 0;}\n")
+            index = ResultIndex(root / "results.sqlite")
+            payload = {"exact": True, "pipeline": "fixture", "flags": [], "sha256_text": "a" * 64,
+                       "replay": {"version": "fixture"}}
+            identifier = index.record_direct(payload, {"addr": 0x80002000, "size": 12,
+                "rom_sha256": "b" * 64, "target_text_sha256": "a" * 64, "vram_delta": 0x80001000}, source,
+                "func_80002000", "valid_current_target")
+            source.unlink(); rows = index.query(function="func_80002000", missing_source=True)
+            index.close(); record("stale observation invalidation", bool(rows and rows[0]["observation_id"] == identifier))
+    except Exception as error: record("stale observation invalidation", False, str(error))
+
+    # Exercise one real, already-exact project unit when a compact manifest member is available.
+    compile_smoke = None
+    inventory = build_inventory(project)
+    for manifest in sorted(project.glob("config/**/matching_overlay*_kmc_units.tsv")):
+        number = re.search(r"overlay(\d+)", manifest.name)
+        if not number: continue
+        image = project / "build/us/audit" / f"overlay_{number.group(1)}_composite.z64"
+        if not image.is_file(): continue
+        with manifest.open(newline="") as stream:
+            for values in csv.reader((line for line in stream if line.strip() and not line.startswith("#")), delimiter="\t"):
+                if len(values) < 4: continue
+                try: rom, size = int(values[0], 0), int(values[1], 0)
+                except ValueError: continue
+                if size > 0x20 or not (project / values[2]).is_file(): continue
+                rows = [row for row in inventory["functions"] if row["image"] == "overlay" + number.group(1)
+                        and int(row["rom"], 0) == rom and int(row["size"]) == size]
+                if len(rows) != 1: continue
+                pipeline = "kmc+asn64" if "--assembler=asn64" in values[3] else "kmc+builtin"
+                command_line = [sys.executable, "-m", "n64dk", "--format", "json", "match", values[2],
+                    "--project", str(project), "--rom", str(image), "--addr", rows[0]["vram"],
+                    "--size", f"0x{size:X}", "--pipeline", pipeline, "--flags", values[3]]
+                run = subprocess.run(command_line, cwd=project, text=True, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, timeout=120)
+                try: output = json.loads(run.stdout)
+                except json.JSONDecodeError: output = {}
+                compile_smoke = {"source": values[2], "exit_code": run.returncode,
+                                 "exact": bool(output.get("exact")), "stderr": run.stderr[-1000:]}
+                break
+        if compile_smoke: break
+    record("compile-and-compare fixture", compile_smoke is None or bool(compile_smoke["exact"]),
+           compile_smoke or "skipped: project has no compact exact manifest fixture")
+    return smokes
 
 
 @command("doctor", "Validate project, toolchains, host tools and optional research profiles")
@@ -181,12 +307,22 @@ def doctor(args):
     kit_venv = str((Path(__file__).resolve().parents[2] / ".venv").resolve())
     add("required matching", "canonical virtual environment", prefix == kit_venv, prefix,
         f"invoke {kit_venv}/bin/python or resolve the configured interpreter path")
+    functional = [] if args.skip_functional else _doctor_functional_smokes(project)
+    for smoke in functional:
+        add("functional smoke", smoke["name"], smoke["ok"], smoke.get("detail"),
+            "repair the failing functional subsystem before trusting matching results")
+    optional_disabled = []
+    if not shutil.which("splat"): optional_disabled.append({"capability": "Splat boundary corroboration",
+                                                             "commands": ["image-map-explain", "boundary-audit"]})
+    if not shutil.which("spimdisasm"): optional_disabled.append({"capability": "advanced disassembly metadata",
+                                                                  "commands": ["investigate", "corpus-index"]})
     required_failed = [row for row in checks if row["required"] and not row["ok"]]
     return {"profile": args.profile, "project": str(project), "ok": not required_failed,
             "checks": checks, "stale_locks": locks, "active_workers": [],
             "canonical_paths": {"python": str(Path(sys.executable).resolve()), "prefix": prefix,
                                 "project": str(project)},
             "selected_python": selected_pythons, "integration_hooks": workbench.get("hooks", {}),
+            "functional_smokes": functional, "optional_capabilities_disabled": optional_disabled,
             "remediation": [row["remediation"] for row in checks
                             if not row["ok"] and row["remediation"]] if args.fix_user else []}
 
@@ -306,31 +442,56 @@ def _prototype_args(p):
     p.add_argument("--state-root")
     p.add_argument("--jobs", type=int, default=16)
     p.add_argument("--types", default="void,s8,u8,s16,u16,s32,u32,void*")
+    p.add_argument("--budget", type=int, default=96)
+    p.add_argument("--dimensions", default="prototype,lifetime,narrowing")
 
 
 @command("prototype-matrix", "Explore evidence-bounded ABI and prototype type variants")
 def prototype_matrix(args):
+    from ..match.typed_explore import (declaration_context, lifetime_graph, lifetime_variants,
+                                       narrowing_variants, prototype_variants, source_shape)
     store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         parent = store.best(args.session_id); source = store.cache.get(parent.source_digest).decode()
-        pattern = re.compile(r"\b(?:void|s8|u8|s16|u16|s32|u32|int|unsigned|[A-Za-z_]\w*\s*\*)\s+(" + re.escape(args.symbol) + r")\s*\(")
-        match = pattern.search(source)
-        if not match: raise ValueError("symbol declaration was not found in retained source")
         evidence = parent.outcome.get("diff", {}).get("entries", [])
         hints = {"signed-halfword": any("sra" in str(row) and "0x10" in str(row) for row in evidence),
                  "unsigned-halfword": any("andi" in str(row) and "FFFF" in str(row).upper() for row in evidence),
                  "signed-byte": any("sra" in str(row) and "0x18" in str(row) for row in evidence),
                  "unsigned-byte": any("andi" in str(row) and "0xFF" in str(row) for row in evidence)}
-        variants = []
-        start = match.start(); end = match.start(1)
-        for typename in args.types.split(","):
-            variants.append({"label": f"return={typename}",
-                             "source": source[:start] + typename + " " + source[end:]})
+        dimensions = {value.strip() for value in args.dimensions.split(",")}
+        graph = lifetime_graph(parent.outcome, store.context(args.session_id)); variants = []
+        if "prototype" in dimensions:
+            variants += prototype_variants(source, args.symbol, args.types.split(","), args.budget)
+        if not variants and "prototype" in dimensions:
+            raise ValueError("symbol declaration was not found in retained source")
+        if "lifetime" in dimensions and (parent.counts.get("register") or parent.counts.get("scheduling")):
+            variants += lifetime_variants(source, graph, args.budget - len(variants))
+        if "narrowing" in dimensions and (hints["signed-halfword"] or hints["unsigned-halfword"] or
+                                            parent.counts.get("instruction")):
+            variants += narrowing_variants(source, args.budget - len(variants))
+        unique = {}; shapes = {}
+        for variant in variants:
+            digest = hashlib.sha256(variant["source"].encode()).hexdigest()
+            unique.setdefault(digest, variant)
+            shapes.setdefault(source_shape(variant["source"]), []).append(variant["label"])
+        variants = list(unique.values())[:args.budget]
         from .match import _session_evaluator
         result = MatchSession(store, _session_evaluator(store.context(args.session_id))).try_proposal(
             args.session_id, {"hypothesis": "prototype width controls normalization and carrier allocation",
                               "variants": variants}, args.jobs, False)
-        result["abi_evidence"] = hints
+        classes = result["object_classes"]
+        best = result.get("transaction_best")
+        result["abi_evidence"] = hints; result["value_lifetime_graph"] = graph
+        result["declaration_context"] = declaration_context(source, args.symbol)
+        result["adaptive_selection"] = {"requested": sorted(dimensions),
+            "selected": sorted({item.get("family") for item in variants if item.get("family")}),
+            "reason": "calls/prototypes affect return and argument registers; register/scheduling residuals select lifetime; extension residuals select narrowing"}
+        result["family_report"] = {"family": "prototype/lifetime/narrowing",
+            "trials": len(result["transaction_results"]), "unique_objects": len(classes),
+            "source_shape_classes": len(shapes), "best_score": best.get("score") if best else None,
+            "collapsed_families": [labels for labels in shapes.values() if len(labels) > 1],
+            "still_discriminating": ["call-result ownership", "post-call materialization",
+                                     "branch result versus function result"]}
         return result
     finally: store.close()
 
@@ -596,7 +757,9 @@ tu_session_try.arguments = _family_try_args
 
 def _compiler_explain_args(p):
     p.add_argument("session_id")
-    p.add_argument("--candidate", action="append", required=True)
+    p.add_argument("--candidate", action="append", help="explain one candidate (repeat twice for legacy pair mode)")
+    p.add_argument("--from", dest="from_candidate", help="pairwise baseline candidate")
+    p.add_argument("--to", dest="to_candidate", help="pairwise comparison candidate")
     p.add_argument("--project", default=".")
     p.add_argument("--state-root")
     p.add_argument("--passes", default="greg,lreg,sched")
@@ -607,8 +770,18 @@ def _compiler_explain_args(p):
 def compiler_explain(args):
     store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
-        candidates = [store.get(args.session_id, value) for value in args.candidate]
-        if any(value is None for value in candidates): raise ValueError("unknown candidate")
+        legacy = args.candidate or []
+        if args.from_candidate or args.to_candidate:
+            if not (args.from_candidate and args.to_candidate) or legacy:
+                raise ValueError("use either --candidate ID or the complete --from ID --to ID pair")
+            identifiers = [args.from_candidate, args.to_candidate]; mode = "pairwise"
+        elif len(legacy) in {1, 2}:
+            identifiers = legacy; mode = "single" if len(legacy) == 1 else "pairwise"
+        else:
+            raise ValueError("supply one --candidate ID or --from ID --to ID")
+        candidates = [store.get(args.session_id, value) for value in identifiers]
+        missing = [identifier for identifier, value in zip(identifiers, candidates) if value is None]
+        if missing: raise ValueError("unknown or stale candidate: " + ", ".join(missing))
         artifacts = []
         root = Path(args.artifact_dir).resolve() if args.artifact_dir else None
         if root: root.mkdir(parents=True, exist_ok=True)
@@ -617,7 +790,9 @@ def compiler_explain(args):
         from .match import _session_evaluator
         evaluator = _session_evaluator(dump_context) if root else None
         for candidate in candidates:
-            source = store.cache.get(candidate.source_digest)
+            try: source = store.cache.get(candidate.source_digest)
+            except (KeyError, FileNotFoundError):
+                raise ValueError(f"stale candidate {candidate.candidate_id}: retained source is unavailable")
             source_path = None
             if root:
                 source_path = root / f"{candidate.candidate_id}.c"; source_path.write_bytes(source)
@@ -627,17 +802,33 @@ def compiler_explain(args):
                                          tuple(candidate.flags) + (("-da",) if candidate.pipeline.startswith("kmc") else ()),
                                          candidate.candidate_id)
             emitted = [str(path) for path in (root / candidate.candidate_id).glob("*")] if root and (root / candidate.candidate_id).is_dir() else []
+            excerpts = {}
+            for artifact in (Path(value) for value in emitted):
+                if any(token in artifact.name for token in args.passes.split(",")):
+                    excerpts[artifact.name] = artifact.read_text(errors="replace")[-4000:]
             artifacts.append({"candidate_id": candidate.candidate_id, "source": str(source_path) if source_path else None,
                               "object_digest": candidate.outcome.get("sha256_text"),
                               "residual": candidate.counts, "passes_requested": args.passes.split(","),
                               "dump_compile_exact": dump_outcome.exact if dump_outcome else None,
-                              "artifacts": emitted})
-        left, right = candidates[:2]
-        stage = ("instruction-selection/CSE" if left.counts.get("instruction") != right.counts.get("instruction")
-                 else "allocation/reload" if left.counts.get("register") != right.counts.get("register")
-                 else "scheduling" if left.counts.get("scheduling") != right.counts.get("scheduling") else "object-equivalent")
-        return {"session_id": args.session_id, "candidates": artifacts,
-                "first_discriminating_stage": stage,
+                              "artifacts": emitted, "pass_excerpts": excerpts})
+        if mode == "pairwise":
+            left, right = candidates
+            stage = ("instruction-selection/CSE" if left.counts.get("instruction") != right.counts.get("instruction")
+                     else "allocation/reload" if left.counts.get("register") != right.counts.get("register")
+                     else "scheduling" if left.counts.get("scheduling") != right.counts.get("scheduling") else "object-equivalent")
+        else:
+            left = candidates[0]
+            stage = ("scheduling" if left.counts.get("scheduling") else
+                     "allocation/reload" if left.counts.get("register") else
+                     "instruction-selection/CSE" if left.counts.get("instruction") else "object-equivalent")
+        causal = []
+        if stage == "scheduling":
+            causal.append({"cause": "operation has no modeled dependency on the intervening call",
+                           "evidence": "residual contains scheduling motion around a call boundary",
+                           "discriminators": ["callee prototype", "genuine data dependency",
+                                              "result ownership", "declaration visibility", "scheduler pass dump"]})
+        return {"session_id": args.session_id, "mode": mode, "candidates": artifacts,
+                "first_discriminating_stage": stage, "causal_explanation": causal,
                 "note": "raw pass dumps are retained when emitted by the configured compiler recipe"}
     finally: store.close()
 
@@ -690,12 +881,16 @@ def _attribute_args(p):
 
 @command("residual-attribution", "Map residual instructions to likely controlling source values and lifetimes")
 def residual_attribution(args):
+    from ..match.typed_explore import lifetime_graph
     store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         row = store.get(args.session_id, args.candidate)
         if row is None: raise ValueError("unknown candidate")
         source = store.cache.get(row.source_digest).decode()
         calls = re.findall(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)", source)
+        declarations = re.findall(r"(?m)^\s*([\w *]+\s+(?:func_[0-9A-Fa-f]{8}|[A-Za-z_]\w*)\s*\([^;]*\)\s*;)", source)
+        expressions = [{"line": number, "text": line.strip()} for number, line in enumerate(source.splitlines(), 1)
+                       if re.search(r"\(s16\)|\(u16\)|<<\s*16|>>\s*16|func_[0-9A-Fa-f]{8}\s*\(", line)]
         entries = row.outcome.get("diff", {}).get("entries", [])
         attributed = []
         for entry in entries:
@@ -704,10 +899,19 @@ def residual_attribution(args):
                          else "carrier lifetime/register ownership" if entry.get("kind") == "register"
                          else "control-flow source form" if compiled.startswith("b") or retail.startswith("b")
                          else "instruction selection")
+            specific = []
+            if "sra" in retail + compiled:
+                specific = ["explicit (s16) cast", "declared width of the result carrier",
+                            "callee return width", "shift-pair sign extension"]
+            elif re.search(r"move\s+\$s[0-7],\s*\$v0", retail + compiled):
+                specific = ["call result remains live across a later call", "named carrier ownership",
+                            "callee-saved register pressure"]
             attributed.append({"target_offset": entry.get("target_offset"), "compiled": compiled,
                                "retail": retail, "likely_source_values": calls[-3:],
-                               "mechanism": mechanism})
+                               "likely_source_expressions": specific, "source_lines": expressions[:12],
+                               "declarations": declarations[:12], "mechanism": mechanism})
         return {"candidate_id": row.candidate_id, "attribution": attributed,
+                "value_lifetime_graph": lifetime_graph(row.outcome, store.context(args.session_id)),
                 "confidence": "heuristic-def-use", "next_discriminators":
                 ["carrier reuse", "narrow prototype", "unified return path"]}
     finally: store.close()
@@ -767,7 +971,32 @@ def integrate_winner(args):
     try:
         row = store.get(args.session, args.candidate_id)
         if row is None or not row.exact: raise ValueError("candidate is not a retained exact result")
-        context = store.context(args.session); source = store.cache.get(row.source_digest)
+        project = Path(args.project).resolve(); context = store.context(args.session); source = store.cache.get(row.source_digest)
+        inventory = build_inventory(project)
+        mapping_rows = [item for item in inventory["functions"]
+                        if int(item["vram"], 0) == context["addr"] and int(item["size"]) == context["size"]
+                        and (not context.get("inventory_image") or item["image"] == context["inventory_image"])]
+        if len(mapping_rows) != 1: raise ValueError("winner target does not resolve to one authoritative catalogue interval")
+        inventory_row = mapping_rows[0]; layout = from_inventory(inventory_row)
+        image_path = Path(context["rom"]); canonical_map = resolve_image_map(image_path, layout)
+        canonical_check = preflight(image_path, layout, inventory_row.get("catalogue_status", ""), strict_entry=True)
+        recorded_offset = context["addr"] - context["vram_delta"]
+        collisions = physical_collisions(image_path, layout, canonical_map, inventory["functions"])
+        recorded_collisions = [item for item in collisions if int(item["candidate_offset"], 0) == recorded_offset]
+        if recorded_offset != canonical_map["selected"]["offset"]:
+            detail = (f"; selected bytes are already owned by {recorded_collisions[0]['owner']} "
+                      f"at {recorded_collisions[0]['physical_interval']}"
+                      if recorded_collisions else "")
+            raise ValueError(f"winner used stale physical offset 0x{recorded_offset:X}; canonical offset is "
+                             f"0x{canonical_map['selected']['offset']:X}{detail}")
+        selected_collisions = [item for item in collisions
+                               if item["candidate_authority"] == canonical_map["selected"]["authority"]]
+        if selected_collisions:
+            raise ValueError("candidate target bytes are already owned by " +
+                             ", ".join(item["owner"] for item in selected_collisions))
+        context_digest = context.get("target_text_sha256")
+        if context_digest and context_digest != canonical_map["target_digest"]:
+            raise ValueError("winner target digest disagrees with the current canonical physical interval")
         from .match import _session_evaluator
         evaluator = _session_evaluator(context); receipts = []
         for index in range(2):
@@ -781,13 +1010,7 @@ def integrate_winner(args):
             destination = Path(args.destination)
             if not destination.is_absolute(): destination = Path(args.project).resolve() / destination
             relative = destination.relative_to(Path(args.project).resolve())
-            raw_rom = context['addr'] - context['vram_delta']
-            inventory = build_inventory(args.project)
-            mapping_rows = [item for item in inventory["functions"]
-                            if int(item["vram"], 0) == context["addr"] and int(item["size"]) == context["size"]
-                            and (not context.get("inventory_image") or item["image"] == context["inventory_image"])]
-            if len(mapping_rows) == 1:
-                raw_rom = int(mapping_rows[0]["rom"], 0)
+            raw_rom = int(inventory_row["rom"], 0)
             manifest_row = "\t".join((f"0x{raw_rom:X}",
                                       f"0x{context['size']:X}", str(relative), " ".join(row.flags),
                                       row.outcome.get("sha256_text") or context.get("target_text_sha256") or ""))
@@ -797,24 +1020,39 @@ def integrate_winner(args):
         full_gate = args.full_gate or hooks.get("full_gate")
         project_tests = args.project_tests or hooks.get("project_tests")
         regeneration = [hooks[key] for key in ("attack", "report", "progress") if hooks.get(key)]
-        transaction = {"states": ["candidate_exact", "independently_recompiled", "manifest_prepared",
-                      "affected_gate_pending", "full_gate_pending", "progress_pending", "integration_ready"],
+        transaction = {"states": ["candidate_exact", "raw_image_verified", "composite_image_verified",
+                      "physical_ownership_verified", "symbol_boundary_verified", "independently_recompiled",
+                      "manifest_simulated", "affected_gate_pending", "full_gate_pending", "not_yet_fully_verified"],
                       "candidate": str(candidate), "source_digest": row.source_digest,
                       "target": {key: context.get(key) for key in ("rom_sha256", "target_text_sha256", "addr", "size", "vram_delta")},
                       "pipeline": row.pipeline, "flags": list(row.flags), "verifications": receipts,
                       "planned_updates": ["canonical source", "manifest", "catalogue", "progress", "provenance"],
                       "manifest_row": manifest_row, "applied": False}
+        transaction["mapping_evidence"] = {"raw_rom": canonical_map["raw_rom"],
+            "composite_rom": f"0x{canonical_map['selected']['offset']:X}",
+            "linked_vram": canonical_map["linked_vram"], "catalogue_vram": canonical_map["catalogue_vram"],
+            "target_digest": canonical_map["target_digest"], "image_digest": canonical_map["image_digest"],
+            "collision_count": len(selected_collisions), "preflight": canonical_check}
         if args.destination:
             transaction["image_mapping"] = {"raw_rom": f"0x{raw_rom:X}",
-                "composite_rom": f"0x{context['addr'] - 0x80000400 + 0x1000:X}",
+                "composite_rom": f"0x{canonical_map['selected']['offset']:X}",
                 "vram": f"0x{context['addr']:08X}", "image": context.get("inventory_image")}
         transaction["project_hooks"] = {"regeneration": regeneration, "affected_gate": affected_gate,
                                          "full_gate": full_gate, "project_tests": project_tests}
+        if affected_gate:
+            gate_env = _canonical_env(); gate_env["N64DK_CANDIDATE_SOURCE"] = str(candidate)
+            if manifest_row: gate_env["N64DK_MANIFEST_ROW"] = manifest_row
+            focused = subprocess.run(affected_gate, cwd=project, shell=True, text=True, env=gate_env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            transaction["preintegration_gate"] = {"command": affected_gate,
+                "exit_code": focused.returncode, "output": focused.stdout[-12000:]}
+            if focused.returncode: raise RuntimeError("focused preintegration project gate failed")
+            transaction["states"][7] = "affected_gate_passed"
         receipt = root / "integration-transaction.json"; receipt.write_text(json.dumps(transaction, indent=2) + "\n")
         if args.apply:
             if not (args.destination and args.manifest and affected_gate and full_gate and project_tests):
                 raise ValueError("--apply requires destination/manifest and configured affected, full and project-test hooks")
-            project = Path(args.project).resolve(); destination = Path(args.destination)
+            destination = Path(args.destination)
             if not destination.is_absolute(): destination = project / destination
             manifest = Path(args.manifest)
             if not manifest.is_absolute(): manifest = project / manifest
@@ -842,6 +1080,7 @@ def integrate_winner(args):
                     gates.append({"gate": label, "exit_code": run.returncode, "output": run.stdout[-12000:]})
                     if run.returncode: raise RuntimeError(f"{label} gate failed")
                 transaction["applied"] = True; transaction["gates"] = gates
+                transaction["states"][-1] = "integration_ready"
                 transaction["tracked_diff"] = _transaction_diff(project, tracked_before, untracked_before)
             except Exception:
                 _restore_worktree_snapshot(project, tracked_before, untracked_before)
@@ -867,11 +1106,13 @@ def _integration_audit_args(p):
 def integration_audit(args):
     project = Path(args.project).resolve(); database = Path(args.database)
     if not database.is_absolute(): database = project / database
+    inventory = build_inventory(project)
     index = ResultIndex(database)
-    try: rows = index.query(exact_only=True, limit=100000)
+    try: rows = index.query(exact_only=True, limit=100000, project=project, inventory=inventory,
+                            not_in_manifest=True)
     finally: index.close()
-    inventory = build_inventory(project); by_name = {row["name"]: row for row in inventory["functions"]}
-    actionable = [row for row in rows if row.get("observation_class") == "exact_current_target"
+    by_name = {row["name"]: row for row in inventory["functions"]}
+    actionable = [row for row in rows if row.get("observation_class") == "currently_reproducible_exact"
                   and row.get("function") in by_name
                   and by_name[row["function"]]["coverage_authority"] != "manifest"
                   and row.get("source") and Path(row["source"]).is_file()]

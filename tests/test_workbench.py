@@ -3,16 +3,53 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from n64dk.commands.workbench import _load_matrix, family_session_start, scheduler_plan
-from n64dk.match.session import SessionStore
+from n64dk.commands.workbench import (_load_matrix, compiler_explain, family_session_start,
+                                      scheduler_plan)
+from n64dk.match.session import SessionCandidate, SessionStore
 from n64dk.match.controlflow import classify_branches, variants
+from n64dk.match.typed_explore import (declaration_context, lifetime_graph,
+                                        narrowing_variants, prototype_variants,
+                                        source_shape)
+from n64dk.match.corpus import CorpusIndex
 import struct
 import subprocess
+import time
 
 from n64dk.commands.workbench import _restore_worktree_snapshot, _worktree_snapshot
 
 
 class WorkbenchTests(unittest.TestCase):
+    def _compiler_session(self, root):
+        store = SessionStore(root); session = store.create({"source_name": "fixture.c"})
+        ids = []
+        for index in range(2):
+            source = f"int f(void){{return {index};}}\n".encode(); digest = store.cache.put(source)
+            candidate = SessionCandidate(f"candidate-{index}", None, digest, f"candidate-{index}",
+                "fixture", "kmc+asn64", (), "evaluated", False, index + 1,
+                {"register": index + 1}, {"sha256_text": str(index), "diff": {"entries": []}},
+                None, time.time_ns() + index)
+            store.append(session, candidate); ids.append(candidate.candidate_id)
+        store.close(); return session, ids
+
+    def test_compiler_explain_single_pair_missing_and_stale(self):
+        with tempfile.TemporaryDirectory() as name:
+            session, ids = self._compiler_session(name)
+            common = {"session_id": session, "project": name, "state_root": name,
+                      "passes": "greg,lreg,sched", "artifact_dir": None}
+            single = compiler_explain(Namespace(**common, candidate=[ids[0]],
+                from_candidate=None, to_candidate=None))
+            self.assertEqual(single["mode"], "single")
+            pair = compiler_explain(Namespace(**common, candidate=None,
+                from_candidate=ids[0], to_candidate=ids[1]))
+            self.assertEqual(pair["mode"], "pairwise")
+            with self.assertRaisesRegex(ValueError, "unknown or stale"):
+                compiler_explain(Namespace(**common, candidate=["missing"],
+                    from_candidate=None, to_candidate=None))
+            store = SessionStore(name); stale = store.get(session, ids[0]); store.cache.path(stale.source_digest).unlink(); store.close()
+            with self.assertRaisesRegex(ValueError, "stale candidate"):
+                compiler_explain(Namespace(**common, candidate=[ids[0]],
+                    from_candidate=None, to_candidate=None))
+
     def test_matrix_yaml_subset(self):
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / "matrix.yaml"
@@ -52,6 +89,43 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(classified[0]["classification"], "loop-exit")
             generated = variants("void f(void) {\nlabel:\nif (x) { call(); }\n}\n")
             self.assertTrue(any(row["form"] == "goto-shared-exit" for row in generated))
+
+    def test_typed_exploration_covers_abi_call_use_narrowing_and_lifetime(self):
+        source = ("extern s32 func_800E2480(void);\n"
+                  "s32 func_800E1E74(void) {\n"
+                  "    s32 result = func_800E2480();\n"
+                  "    if ((s16)result != 0) return result;\n"
+                  "    return 0;\n}\n")
+        prototypes = prototype_variants(source, "func_800E2480", ["void", "s16", "s32"], 96)
+        axes = [row["axes"] for row in prototypes]
+        self.assertTrue(any(row.get("style") == "implicit" for row in axes))
+        self.assertTrue(any(row.get("arguments") == "s16 arg0" for row in axes))
+        self.assertTrue(any(row.get("call_use") == "narrowed" for row in axes))
+        self.assertTrue(narrowing_variants(source))
+        self.assertEqual(declaration_context(source, "func_800E2480")[0]["return"], "s32")
+        self.assertEqual(source_shape(source), source_shape(source.replace("result", "value")))
+        outcome = {"diff": {"entries": [{"retail": "jal func_800E2480"},
+                    {"retail": "addu $s0, $v0, $zero"}, {"retail": "sll $s0, $s0, 16"},
+                    {"retail": "sra $v0, $s0, 16"}, {"retail": "bnez $v0, 0x80000040"},
+                    {"retail": "addu $v0, $zero, $zero"}]}}
+        graph = lifetime_graph(outcome)
+        self.assertIn("call result remains live across a later call", graph["constraints"])
+        self.assertIn("narrowed value controls a branch", graph["constraints"])
+
+    def test_corpus_prototype_distinguishes_declarations_from_calls(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / "project"; source = root / "src" / "unit.c"
+            source.parent.mkdir(parents=True)
+            source.write_text("void helper(void); s16 func_80001000(s32);\n"
+                              "s32 use(void) { return (s16)func_80001000(1); }\n")
+            index = CorpusIndex(Path(name) / "corpus.sqlite")
+            try:
+                index.index([root]); inferred = index.infer_prototype("func_80001000")
+            finally:
+                index.close()
+            self.assertEqual(inferred["ranked_prototypes"][0]["return_type"], "s16")
+            self.assertEqual(inferred["call_sites"], 1)
+            self.assertEqual(inferred["calls"][0]["call_arguments"], 1)
 
     def test_integration_rollback_preserves_preexisting_worktree_edits(self):
         with tempfile.TemporaryDirectory() as name:

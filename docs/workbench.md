@@ -43,11 +43,16 @@ separately and remain non-applying.
 
 ```bash
 n64dk prototype-matrix SESSION --symbol helper --jobs 16
+n64dk prototype-matrix SESSION --symbol helper --dimensions prototype,lifetime,narrowing --budget 96
 n64dk register-lifetime-explore SESSION --jobs 16
 n64dk match-matrix SESSION matrix.yaml --jobs 16
 n64dk frontier-synthesize SESSION --candidate A --candidate B --budget 32
-n64dk compiler-explain SESSION --candidate A --candidate B --passes greg,lreg,sched
+n64dk compiler-explain SESSION --candidate A --passes greg,lreg,sched
+n64dk compiler-explain SESSION --from A --to B --passes greg,lreg,sched
 n64dk residual-attribution SESSION --candidate A
+n64dk match-session-explore SESSION --target-window 0x64:0x80 \
+  --freeze-prefix 0x64 --freeze-suffix 0x80 \
+  --dimensions prototype,lifetime,narrowing,control-flow
 n64dk control-flow-explore SESSION --jobs 16 --budget 32 --stop-on-exact
 n64dk clone-family-transfer --source-session A --target-session B
 ```
@@ -57,6 +62,20 @@ variants use narrowing evidence from shifts, masks and call sites. Lifetime expl
 records whether formal reuse, carrier ownership, scope shortening or return convergence
 actually changed the object. Complementary synthesis constructs only the bounded cross-product
 of source dimensions that differ between retained frontier candidates.
+
+Prototype exploration crosses plausible return widths, argument widths, pointers, ANSI,
+old-style and implicit declarations with ignored, assigned, narrowed and reused call results.
+The value-lifetime graph records call production, preservation across calls, callee-saved
+ownership, signed narrowing, branch use and independent return values. Typed narrowing covers
+casts, narrow locals, shift pairs, signed-through-unsigned conversion and union/member forms.
+Residual windows reject candidates that disturb frozen exact regions. Adaptive selection stops
+families that collapse to known source shapes, compiler-IR fingerprints or object digests and
+returns a compact trial/unique-object/disproved/still-discriminating report.
+
+`compiler-explain` has separate single-candidate and pairwise contracts. Single mode attributes
+the retained residual to compiler stages; pairwise mode identifies where two candidates first
+diverge. Scheduling reports include causal dependency/call-barrier evidence, discriminating
+prototype or ownership experiments, and bounded excerpts from retained GCC pass artifacts.
 
 Branch residuals are decoded against retained target bytes and classified as same-block,
 loop-latch, loop-exit, function-epilogue, shared-cleanup, or call-skipping join. The explorer
@@ -84,11 +103,20 @@ n64dk code-query --project . --symbol helper --type-conflicts
 n64dk asm-query --project . --sequence jal,move,sll,sra,bnel --all-projects
 n64dk negatives-query --project . --residual branch-likely --compiler kmc
 n64dk workbench-snapshot --project . --function FUNCTION --image IMAGE
+n64dk corpus-prototype helper --database .n64dk/function-corpus.sqlite
+n64dk reproduce RESULT_ID --project .
 ```
 
 Search results distinguish manifests, catalogues, definitions, declarations, candidates and
 references. Structural assembly search indexes opcode sequences separately from register
 names. Negative experiments are checked before allocating compilation work.
+
+Corpus source indexing retains declarations, definitions, call argument counts, whether callers
+consume the return register, and immediate signed/unsigned width evidence. Investigation reports
+the declarations actually visible to the candidate, conflicting declarations in the project,
+include order, and whether historical implicit or old-style declarations remain plausible.
+Every direct `match` observation is imported immediately. Replay records pin source, compiler,
+assembler, flags, include paths, image, mapping, target bytes and compilation-relevant environment.
 
 ## Integration, gates and scheduling
 
@@ -136,6 +164,26 @@ address `0x800AEF84`, for example, maps to raw `0x246A4` and composite `0xAFB84`
 rows always use the raw project offset. Investigation tries both mappings and retains
 disassembly, source, callers and competing-layout evidence even when preflight rejects both.
 
+For overlays whose catalogue VRAM differs from the retail linked base, the resolver anchors the
+raw overlay payload inside the composite and records the complete tuple: image digest, image
+region, raw ROM, linked VRAM, catalogue VRAM and mapping transform. `image-map-explain` shows all
+competing interpretations and their target digests; equal-strength ambiguity fails closed.
+Winner preparation rejects stale physical offsets and byte ranges already owned by another
+manifest function before compilation. A winner then progresses through raw-image verification,
+composite-image verification, physical ownership, symbol/boundary validation, two clean builds,
+manifest simulation, affected gate and full gate. Until those agree it is explicitly
+`not_yet_fully_verified` rather than integrable.
+
+Historical exactness is live state, not a permanent label. Queries recheck source resolution,
+image and target digests, mapping transform, boundary, manifest membership and independent
+reproduction. Stale observations are excluded by default and exposed with `--stale-mapping`;
+only currently reproducible exact observations may enter the winner queue.
+
+Doctor performs functional smoke tests in addition to dependency checks: canonical raw/composite
+resolution, compiler-explain CLI contracts, SQLite WAL/schema writes, deliberate stale-result
+invalidation and a real project compile/compare fixture when available. Missing optional
+Splat/spimdisasm capabilities are reported with the commands they limit.
+
 `n64dk self-test` always supplies the kit root as unittest's top-level directory, so absolute
 test discovery behaves the same from every working directory.
 
@@ -182,3 +230,26 @@ source lookup; direct-match result ingestion; clone-family transfer; compact gat
 and explicit target, compiler, source, section and relocation evidence. Integration snapshots
 the pre-existing worktree and restores it on failure, including pre-existing tracked and
 untracked edits.
+
+The composite-mapping and typed-exploration follow-up is covered in full:
+
+| Area | Implemented behavior |
+|---|---|
+| 1. Composite mapping | anchored raw payload, linked/catalogue transforms, digest agreement, fail-closed ambiguity and `image-map-explain` |
+| 2. Compiler explanation | explicit single and `--from/--to` pair modes with stale/missing validation |
+| 3. Prototype transactions | bounded return, argument, style, placement and call-use crosses |
+| 4. Lifetime graphs | call production, preservation, saved carrier, narrowing, branch and return constraints |
+| 5. Residual windows | target window plus frozen prefix/suffix frontier eligibility |
+| 6. Narrowing forms | casts, locals, shift pairs, signed-through-unsigned and union/member forms |
+| 7. Causal scheduling | dependency/barrier explanation, pass stage and retained excerpts |
+| 8. TU declarations | candidate-visible declarations, include order, conflicts and historical style |
+| 9. Live history validity | source/image/mapping/boundary/manifest/reproduction checks at query time |
+| 10. Winner collision | physical interval and byte-digest collision checks against authoritative owners |
+| 11. Gate-aware integration | raw/composite/ownership/boundary/double-build/manifest/gate state machine |
+| 12. Equivalence | identifier-normalized source, compiler-IR and object equivalence classes |
+| 13. Adaptive selection | residual-qualified dimensions and family exhaustion on collapsed observations |
+| 14. Family reports | compact trials, unique shapes/objects, best, disproved and open discriminators |
+| 15. Replay bundles | direct observation import and `reproduce` with digest-pinned inputs |
+| 16. Functional doctor | mapping, explanation, SQLite, stale history and real compile smoke tests |
+| 17. Corpus ABI | indexed prototypes, calls, return use, widths, confidence and contradictions |
+| 18. Attribution | residual instructions mapped to likely expressions, declarations and lifetime constraints |

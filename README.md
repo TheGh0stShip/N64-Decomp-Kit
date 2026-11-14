@@ -105,18 +105,21 @@ export, and proof boundaries.
 | `match-session-explore ID --rounds N --jobs N` | Run bounded residual-guided source experiments over the frontier |
 | `match-session-explain ID --from A --to B` | Explain residual and source changes between two candidates |
 | `investigate FUNCTION --image IMAGE --all` | Build one verified dossier from layout, code, source, recipes, history and corpus evidence |
+| `image-map-explain --project DIR --image NAME --function NAME` | Explain raw/composite/catalogue/linked mappings, byte digests, transforms and ownership collisions |
 | `corpus-index PROJECT...` | Incrementally index local N64 assembly by exact and normalized signatures |
 | `corpus-query --image IMAGE --addr A --size N --vram-delta D` | Find exact, relocation-only, register-renamed and opcode-shape analogues |
+| `corpus-prototype SYMBOL` | Infer prototypes from indexed declarations, call arguments, return use and width evidence |
 | `result-index --roots PATH...` / `result-query` | Mine historical JSON, logs, sessions and candidates while invalidating stale targets |
+| `reproduce RESULT_ID` | Independently replay a digest-pinned source, toolchain, target and environment bundle |
 | `residual-clusters --max-score N` | Group typed, address-independent residuals across related functions |
 | `script-index PROJECT...` / `script-query` | Inventory scattered sweeps, audits, transforms, scorers and build wrappers |
 | `operation-schema` / `automation-serve` | Expose typed operations over newline-delimited JSON for local controllers |
 | `doctor --profile matching` | Validate ROM, host tools, original toolchains, paths, storage and optional research capabilities |
 | `compiler-capabilities` | Inspect or selectively invalidate per-toolchain, stage and option capability evidence |
-| `prototype-matrix` / `register-lifetime-explore` / `match-matrix` | Run bounded ABI, allocation and declarative experiment families |
+| `prototype-matrix` / `register-lifetime-explore` / `match-matrix` | Run bounded ABI, call-use, narrowing, value-lifetime and declarative experiment families |
 | `control-flow-explore` / `clone-family-transfer` | Classify branch targets, test loop-exit forms and transfer sibling CFGs |
 | `family-session-start` / `tu-session-start` | Preserve cross-function and real translation-unit experiment context |
-| `frontier-synthesize` / `compiler-explain` / `residual-attribution` | Turn complementary residual evidence into discriminating experiments |
+| `frontier-synthesize` / `compiler-explain` / `residual-attribution` | Synthesize complementary candidates and explain one candidate or a causal pairwise compiler/residual difference |
 | `code-query` / `asm-query` / `negatives-query` | Search source, manifests, historical failures and structural assembly without shell pipelines |
 | `boundary-audit` / `boundary-correct` | Audit CFG/Splat/ownership evidence and prepare denominator-safe corrections |
 | `integrate-winner` / `integration-audit` / `gate-delta` | Verify exact winners twice and prepare reviewable integration/gate transactions |

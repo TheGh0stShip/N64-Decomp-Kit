@@ -137,11 +137,12 @@ def context_bundle(args):
     row = rows[0]
     start = int(row["vram"], 0)
     layout = from_inventory(row)
-    if args.vram_delta is not None and args.vram_delta != layout.delta:
-        raise ValueError(f"--vram-delta 0x{args.vram_delta:X} conflicts with catalogue-section "
-                         f"delta 0x{layout.delta:X}")
     layout_check = preflight(args.image, layout, row.get("catalogue_status", ""))
-    offset = layout.rom
+    offset = int(layout_check["selected_image_offset"], 0)
+    canonical_delta = start - offset
+    if args.vram_delta is not None and args.vram_delta != canonical_delta:
+        raise ValueError(f"--vram-delta 0x{args.vram_delta:X} conflicts with canonical image "
+                         f"delta 0x{canonical_delta:X}")
     same = [item for item in inventory["functions"] if item["image"] == row["image"]]
     index = same.index(row)
     neighbours = [{key: item[key] for key in ("name", "vram", "size", "state")}
@@ -241,9 +242,11 @@ def _launch_one(args, project: str, row: dict, mappings: dict[str, str]):
         "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
         "include": [str(value) for value in cfg.include],
         "symbols": [str(value.resolve()) for value in symbol_files], "normalizer": cfg.normalizer,
-        "vram_delta": layout.delta, "addr": layout.function_vram, "size": layout.function_size,
+        "vram_delta": layout.function_vram - int(check["selected_image_offset"], 0),
+        "addr": layout.function_vram, "size": layout.function_size,
         "infer_externals": True, "default_pipeline": pipeline, "default_flags": flags,
         "inventory_id": function_id, "inventory_image": row["image"], "layout_preflight": check,
+        "target_text_sha256": check["mapping"].get("target_digest"),
     }
     store_root = standard_store(project)
     store = SessionStore(store_root)

@@ -8,6 +8,7 @@ from ..cli import command
 from ..match.corpus import CorpusIndex, binary_signature
 from ..match.inventory import build
 from ..match.investigate import dossier
+from ..match.layout import from_inventory, resolve_image_map
 
 
 def _index_args(p):
@@ -32,14 +33,27 @@ def _query_args(p):
     p.add_argument("--image", required=True)
     p.add_argument("--addr", required=True, type=lambda value: int(value, 0))
     p.add_argument("--size", required=True, type=lambda value: int(value, 0))
-    p.add_argument("--vram-delta", required=True, type=lambda value: int(value, 0))
+    p.add_argument("--vram-delta", type=lambda value: int(value, 0))
+    p.add_argument("--project")
+    p.add_argument("--image-name")
     p.add_argument("--limit", type=int, default=20)
 
 
 @command("corpus-query", "Find exact, relocation-only, register-renamed and opcode-shape analogues")
 def corpus_query(args):
     data = Path(args.image).read_bytes()
-    offset = args.addr - args.vram_delta
+    if args.vram_delta is None and not args.project:
+        raise ValueError("--vram-delta is required without --project")
+    offset = args.addr - args.vram_delta if args.vram_delta is not None else 0
+    if args.project:
+        rows = [row for row in build(args.project)["functions"]
+                if int(row["vram"], 0) == args.addr and int(row["size"]) == args.size]
+        if args.image_name: rows = [row for row in rows if row["image"] == args.image_name]
+        if len(rows) != 1: raise ValueError("corpus target must resolve to one catalogue interval")
+        mapping = resolve_image_map(args.image, from_inventory(rows[0])); canonical = mapping["selected"]["offset"]
+        if args.vram_delta is not None and args.addr - args.vram_delta != canonical:
+            raise ValueError(f"vram delta selects 0x{args.addr - args.vram_delta:X}; canonical mapping selects 0x{canonical:X}")
+        offset = canonical
     if offset < 0 or offset + args.size > len(data):
         raise ValueError("query interval is outside the loaded image")
     signature = binary_signature(data[offset:offset + args.size], args.addr)
@@ -54,6 +68,22 @@ def corpus_query(args):
 
 
 corpus_query.arguments = _query_args
+
+
+def _prototype_infer_args(p):
+    p.add_argument("symbol")
+    p.add_argument("--database", default=".n64dk/function-corpus.sqlite")
+    p.add_argument("--limit", type=int, default=100)
+
+
+@command("corpus-prototype", "Infer callee prototypes from declarations and call-site ABI evidence")
+def corpus_prototype(args):
+    index = CorpusIndex(args.database)
+    try: return index.infer_prototype(args.symbol, args.limit)
+    finally: index.close()
+
+
+corpus_prototype.arguments = _prototype_infer_args
 
 
 def _investigate_args(p):

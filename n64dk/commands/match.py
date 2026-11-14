@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -18,7 +19,7 @@ from ..match.engine import Target, batch, default_pipelines, manifest_row, match
 from ..match.pipeline import PIPELINES, BuildSpec, split_flags, scratch_dir
 from ..match.session import MatchSession, SessionStore
 from ..match.registry import SessionRegistry, resolve_store, standard_store
-from ..match.layout import Layout, from_inventory, preflight
+from ..match.layout import Layout, from_inventory, preflight, resolve_image_map
 from ..match.toolchain import Config, PROFILES, load_config
 from ..match import inventory as inventorymod
 from ..rom import Rom
@@ -59,7 +60,7 @@ def _exact_project_evidence(cfg, args, outcome, source, spec, target):
             compiler_hasher.update(relative_name.encode()); compiler_hasher.update(hashlib.sha256((compiler_root / relative_name).read_bytes()).digest())
     compiler_digest = compiler_hasher.hexdigest() if compiler_root else None
     return {"image_mapping": {"raw_rom": f"0x{layout.rom:X}",
-                              "composite_rom": f"0x{outcome.vram - 0x80000400 + 0x1000:X}",
+                              "composite_rom": check.get("selected_image_offset") if check else None,
                               "vram": f"0x{outcome.vram:08X}", "image": row["image"]},
             "project_manifest_row": project_row,
             "exact_evidence": {"target_text_sha256": target_digest,
@@ -69,6 +70,27 @@ def _exact_project_evidence(cfg, args, outcome, source, spec, target):
                                "source_sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
                                "relocations_checked": bool(outcome.result and outcome.result.sections),
                                "mapping_preflight": check}}
+
+
+def _replay_record(cfg, args, outcome, source: Path, spec: BuildSpec, target: Target) -> dict:
+    profile_key = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}.get(spec.pipeline, "kmc")
+    root = cfg.toolchain(profile_key); binaries = {}
+    if root:
+        for name in PROFILES[profile_key].required:
+            path = root / name
+            if path.is_file(): binaries[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    allowed_environment = {key: os.environ[key] for key in ("LANG", "LC_ALL", "TZ", "TMPDIR", "WIBO")
+                           if key in os.environ}
+    return {"version": "n64dk-replay-v1", "source": str(source),
+            "source_digest": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "toolchain_binaries": binaries, "pipeline": spec.pipeline, "flags": list(spec.flags),
+            "include_paths": [str(path) for path in cfg.include],
+            "symbol_files": [str(path) for path in (args.symbols or cfg.symbols)],
+            "image": str(Path(args.rom).resolve()), "image_digest": hashlib.sha256(target.rom).hexdigest(),
+            "address": outcome.vram, "size": outcome.size, "vram_delta": target.delta,
+            "target_digest": hashlib.sha256(target.rom[outcome.vram - target.delta:
+                outcome.vram - target.delta + outcome.size]).hexdigest(),
+            "environment": allowed_environment}
 
 
 def _common(p, rom_required: bool):
@@ -98,7 +120,29 @@ def _setup(args):
     image = Rom.load(rom_path)
     if image.checksum_ok() is False:
         raise SystemExit(f"{rom_path}: header checksum mismatch; not a clean base image")
-    target = Target.from_rom(image, args.vram_delta if args.vram_delta is not None else cfg.vram_delta)
+    selected_delta = args.vram_delta if args.vram_delta is not None else cfg.vram_delta
+    if getattr(args, "addr", None) is not None and getattr(args, "size", None) is not None:
+        try:
+            inventory = inventorymod.build(cfg.project)
+            rows = [row for row in inventory["functions"] if int(row["vram"], 0) == args.addr
+                    and int(row["size"]) == args.size]
+            image_number = re.search(r"overlay[_-]?(\d+)", Path(rom_path).name, re.I)
+            if image_number:
+                rows = [row for row in rows if row["image"].replace("_", "") == "overlay" + image_number.group(1)]
+            if len(rows) == 1:
+                resolved = resolve_image_map(rom_path, from_inventory(rows[0]))
+                canonical_delta = args.addr - resolved["selected"]["offset"]
+                if args.vram_delta is not None and args.vram_delta != canonical_delta:
+                    raise ValueError(f"explicit vram_delta 0x{args.vram_delta:X} conflicts with canonical "
+                                     f"image mapping 0x{canonical_delta:X}")
+                selected_delta = canonical_delta
+                args._resolved_mapping = resolved
+                args._resolved_inventory_row = rows[0]
+        except ValueError:
+            raise
+        except Exception:
+            pass
+    target = Target.from_rom(image, selected_delta)
     sym_files = [Path(s) for s in args.symbols] or cfg.symbols or symmod.discover(cfg.project)
     syms = symmod.load(sym_files)
     return cfg, target, syms, sym_files
@@ -166,6 +210,10 @@ def match(args):
     with scratch_dir() as tmp:
         o = match_source(source, spec, cfg, target, args.addr, args.size, syms, Path(tmp),
                          infer_externals=not args.no_infer)
+    payload = o.as_dict(); payload["replay"] = _replay_record(cfg, args, o, source, spec, target)
+    if o.exact:
+        payload["manifest_row"] = manifest_row(o, cfg.project, source, target, syms)
+        payload.update(_exact_project_evidence(cfg, args, o, source, spec, target))
     # Direct observations enter the same durable history as sessions immediately.
     try:
         from ..match.results import ResultIndex
@@ -175,7 +223,7 @@ def match(args):
                          if 0 <= target_offset <= len(target.rom) - size else None)
         history = ResultIndex(cfg.project / ".n64dk" / "results.sqlite")
         try:
-            history.record_direct(o.as_dict(), {"rom_sha256": hashlib.sha256(target.rom).hexdigest(),
+            history.record_direct(payload, {"rom_sha256": hashlib.sha256(target.rom).hexdigest(),
                 "target_text_sha256": target_digest, "vram_delta": target.delta,
                 "addr": address, "size": size}, source,
                 source.stem if re.fullmatch(r"func_[0-9A-Fa-f]{8}", source.stem) else None,
@@ -184,11 +232,7 @@ def match(args):
     except Exception:
         pass  # matching remains available when the optional history store is unavailable
     if args.format == "json":
-        d = o.as_dict()
-        if o.exact:
-            d["manifest_row"] = manifest_row(o, cfg.project, source, target, syms)
-            d.update(_exact_project_evidence(cfg, args, o, source, spec, target))
-        return d
+        return payload
     lines = [f"{'MATCH' if o.exact else 'DIFF'} {source.name} @ 0x{o.vram:08X} "
              f"[{spec.pipeline} {' '.join(spec.flags)}]"]
     if o.error:
@@ -254,8 +298,10 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
         "toolchain_digest": toolchain_hasher.hexdigest(),
     }
     if args.addr is not None and args.size is not None:
-        layout = Layout("standalone", 0, target.delta, len(target.rom), args.addr, args.size,
-                        "standalone-explicit-range")
+        layout = (from_inventory(args._resolved_inventory_row)
+                  if getattr(args, "_resolved_inventory_row", None) else
+                  Layout("standalone", 0, target.delta, len(target.rom), args.addr, args.size,
+                         "standalone-explicit-range"))
         context["layout_preflight"] = preflight(rom_path, layout, strict_entry=args.strict_entry)
         rom_offset = args.addr - target.delta
         target_bytes = target.rom[rom_offset:rom_offset + args.size]
@@ -569,6 +615,12 @@ def _session_explore_args(p):
     p.add_argument("--variants-per-round", type=int, default=12)
     p.add_argument("--stop-on-exact", action="store_true")
     p.add_argument("--best-details", action="store_true")
+    p.add_argument("--target-window", help="target residual byte window START:END")
+    p.add_argument("--freeze-prefix", type=lambda value: int(value, 0),
+                   help="freeze residual behavior before this target offset")
+    p.add_argument("--freeze-suffix", type=lambda value: int(value, 0),
+                   help="freeze residual behavior at and after this target offset")
+    p.add_argument("--dimensions", default="spelling,prototype,lifetime,narrowing,control-flow,flags")
 
 
 @command("match-session-explore", "Run bounded multi-round residual-guided source experiments")
@@ -577,8 +629,16 @@ def match_session_explore(args):
     store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         session = MatchSession(store, _session_evaluator(store.context(args.session_id)))
+        window = None
+        if args.target_window:
+            try: left, right = args.target_window.split(":", 1); window = (int(left, 0), int(right, 0))
+            except (ValueError, TypeError): raise ValueError("--target-window must be START:END")
+        elif args.freeze_prefix is not None and args.freeze_suffix is not None:
+            window = (args.freeze_prefix, args.freeze_suffix)
+        if window and not 0 <= window[0] < window[1]: raise ValueError("residual window must be increasing")
         result = explore(store, session, args.session_id, args.jobs, args.rounds,
-                         args.variants_per_round, args.stop_on_exact)
+                         args.variants_per_round, args.stop_on_exact, window,
+                         {value.strip() for value in args.dimensions.split(",") if value.strip()})
         if args.best_details:
             result["best"] = store.best(args.session_id).summary(True)
         return result

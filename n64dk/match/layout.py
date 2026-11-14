@@ -1,12 +1,138 @@
 """Image-layout derivation and mandatory target preflight."""
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from .. import mips
 
-PREFLIGHT_VERSION = "entry-delay-v2"
+PREFLIGHT_VERSION = "image-map-v3"
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _raw_sibling(path: Path) -> Path | None:
+    name = path.name
+    for marker in ("_composite", "-composite"):
+        if marker in name:
+            candidate = path.with_name(name.replace(marker, "", 1))
+            return candidate if candidate.is_file() else None
+    return None
+
+
+def resolve_image_map(path: str | Path, layout: "Layout") -> dict:
+    """Resolve physical bytes using an anchored image region, never a VRAM guess alone."""
+    image_path = Path(path).expanduser().resolve()
+    data = image_path.read_bytes()
+    relative = layout.function_vram - layout.section_vram
+    raw_offset = layout.section_rom + relative
+    header_vram = int.from_bytes(data[8:12], "big") if len(data) >= 12 else None
+    candidates: list[dict] = []
+
+    def add(authority: str, offset: int, linked_vram: int | None, transform: str,
+            agreement: list[str], canonical: bool = False) -> None:
+        if offset < 0 or offset + layout.function_size > len(data): return
+        code = data[offset:offset + layout.function_size]
+        decoded = list(mips.instructions(code, layout.function_vram))
+        valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in decoded)
+        terminal = int(any(ins.isJrRa() or ins.isJrNotRa() or ins.isJumpWithAddress()
+                           or ins.isBranch() for ins in decoded[-2:]))
+        candidates.append({"authority": authority, "offset": offset, "linked_vram": linked_vram,
+                           "catalogue_vram": layout.section_vram, "transform": transform,
+                           "agreement": agreement, "canonical": canonical, "digest": _digest(code),
+                           "score": valid + terminal * max(2, len(decoded)), "code": code})
+
+    add("raw-overlay", raw_offset, layout.section_vram,
+        "section_rom + (catalogue_vram - catalogue_base)", ["catalogue"],
+        not ("composite" in image_path.stem.lower()))
+    naive = layout.function_vram - 0x80000400 + 0x1000
+    add("catalogue-vram-composite", naive, layout.section_vram,
+        "0x1000 + catalogue_vram - resident_vram", ["catalogue"])
+
+    sibling = _raw_sibling(image_path)
+    region_offset = None
+    raw_target_digest = None
+    if sibling:
+        raw_data = sibling.read_bytes()
+        payload = raw_data[layout.section_rom:layout.section_rom + layout.section_size]
+        positions = []
+        cursor = 0
+        while payload and (found := data.find(payload, cursor)) >= 0:
+            positions.append(found); cursor = found + 1
+            if len(positions) > 2: break
+        if len(positions) == 1:
+            region_offset = positions[0]
+        elif not positions and len(payload) >= 256:
+            anchor = payload[:min(4096, len(payload))]
+            cursor = 0
+            while (found := data.find(anchor, cursor)) >= 0:
+                if data[found:found + len(payload)] == payload: positions.append(found)
+                cursor = found + 1
+            if len(positions) == 1: region_offset = positions[0]
+        if region_offset is not None:
+            linked_base = ((header_vram or 0x80000400) + region_offset - 0x1000)
+            canonical_offset = region_offset + relative
+            raw_code = raw_data[raw_offset:raw_offset + layout.function_size]
+            raw_target_digest = _digest(raw_code)
+            add("anchored-composite-region", canonical_offset, linked_base,
+                "region_offset + (catalogue_vram - catalogue_base)",
+                ["catalogue", "raw-image", "composite-payload", "image-header"], True)
+    canonical = [row for row in candidates if row["canonical"]]
+    if canonical:
+        selected = canonical[0]
+        if raw_target_digest and selected["digest"] != raw_target_digest:
+            raise ValueError("anchored composite bytes disagree with the raw overlay image")
+    else:
+        ranked = sorted(candidates, key=lambda row: row["score"], reverse=True)
+        if not ranked:
+            raise ValueError("target interval is outside every image mapping")
+        selected = ranked[0]
+        if len(ranked) > 1 and ranked[0]["score"] == ranked[1]["score"] and ranked[0]["digest"] != ranked[1]["digest"]:
+            raise ValueError("ambiguous image mapping: equally plausible offsets contain different bytes")
+    competing = [row for row in candidates if row["offset"] != selected["offset"]
+                 and row["digest"] == selected["digest"]]
+    return {"image": str(image_path), "image_digest": _digest(data), "image_size": len(data),
+            "image_region": {"offset": f"0x{region_offset:X}" if region_offset is not None else None,
+                             "size": layout.section_size, "raw_sibling": str(sibling) if sibling else None},
+            "raw_rom": f"0x{raw_offset:X}", "catalogue_vram": f"0x{layout.function_vram:X}",
+            "catalogue_base": f"0x{layout.section_vram:X}",
+            "linked_vram": (f"0x{selected['linked_vram'] + relative:X}"
+                            if selected["linked_vram"] is not None else None),
+            "linked_base": (f"0x{selected['linked_vram']:X}" if selected["linked_vram"] is not None else None),
+            "selected": selected, "target_digest": selected["digest"],
+            "raw_target_digest": raw_target_digest, "duplicate_byte_candidates": len(competing),
+            "candidates": candidates}
+
+
+def physical_collisions(path: str | Path, layout: "Layout", mapping: dict,
+                        inventory_rows: list[dict]) -> list[dict]:
+    """Identify candidate offsets/digests already owned by another catalogue member."""
+    data = Path(path).read_bytes(); region = mapping["image_region"].get("offset")
+    if not region: return []
+    region_offset = int(region, 0)
+    result = []
+    for candidate in mapping["candidates"]:
+        for row in inventory_rows:
+            if row.get("image") != layout.image or int(row["vram"], 0) == layout.function_vram:
+                continue
+            physical = region_offset + int(row["vram"], 0) - int(row["section_vram"], 0)
+            size = int(row["size"])
+            digest = _digest(data[physical:physical + size]) if 0 <= physical <= len(data) - size else None
+            same_interval = candidate["offset"] == physical and layout.function_size == size
+            same_digest = candidate["digest"] == digest and layout.function_size == size
+            if not (same_interval or same_digest): continue
+            result.append({"candidate_authority": candidate["authority"],
+                           "candidate_offset": f"0x{candidate['offset']:X}",
+                           "owner": row["name"], "owner_path": row.get("owner"),
+                           "ownership_state": row.get("ownership_state"),
+                           "physical_interval": f"0x{physical:X}:0x{physical + size:X}",
+                           "target_digest": digest, "same_interval": same_interval,
+                           "same_digest": same_digest,
+                           "mapping_error_delta": f"{candidate['offset'] - mapping['selected']['offset']:+#x}"})
+    return result
 
 
 def _entry_evidence(data: bytes, layout: Layout, function_offset: int | None = None) -> dict:
@@ -126,7 +252,7 @@ class Layout:
         value["vram_delta"] = f"0x{self.delta:X}"
         value["function_rom"] = f"0x{self.rom:X}"
         value["raw_rom"] = f"0x{self.rom:X}"
-        value["composite_rom"] = f"0x{self.function_vram - 0x80000400 + 0x1000:X}"
+        value["catalogue_composite_rom"] = f"0x{self.function_vram - 0x80000400 + 0x1000:X}"
         return value
 
 
@@ -150,24 +276,14 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
         errors.append("target VRAM interval is outside its catalogue section")
     if layout.rom < layout.section_rom or layout.rom + layout.function_size > layout.section_rom + layout.section_size:
         errors.append("target ROM interval is outside its catalogue section")
-    raw_offset = layout.rom
-    composite_offset = layout.function_vram - 0x80000400 + 0x1000
-    candidates = []
-    for authority, offset in (("raw-overlay", raw_offset), ("resident-composite", composite_offset)):
-        if offset < 0 or offset + layout.function_size > len(data):
-            continue
-        candidate_code = data[offset:offset + layout.function_size]
-        candidate_decoded = list(mips.instructions(candidate_code, layout.function_vram))
-        candidate_valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in candidate_decoded)
-        terminal_score = int(any(ins.isJrRa() or ins.isJrNotRa() or ins.isJumpWithAddress()
-                                 or ins.isBranch() for ins in candidate_decoded[-2:]))
-        candidates.append((candidate_valid + terminal_score * max(2, len(candidate_decoded)),
-                           authority, offset, candidate_code))
-    if not candidates:
-        errors.append("target interval is outside every canonical image mapping")
-        selected_authority, selected_offset, code = "none", raw_offset, b""
-    else:
-        _score, selected_authority, selected_offset, code = max(candidates, key=lambda item: item[0])
+    try:
+        mapping = resolve_image_map(path, layout)
+        selected = mapping["selected"]
+        selected_authority, selected_offset, code = selected["authority"], selected["offset"], selected["code"]
+        candidates = mapping["candidates"]
+    except ValueError as error:
+        errors.append(str(error)); mapping = None
+        selected_authority, selected_offset, code, candidates = "none", layout.rom, b"", []
     decoded = list(mips.instructions(code, layout.function_vram))
     valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in decoded)
     ratio = valid / len(decoded) if decoded else 0.0
@@ -207,11 +323,17 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
     if errors:
         raise ValueError("image-layout preflight failed: " + "; ".join(errors))
     return {"ok": True, "preflight_version": PREFLIGHT_VERSION,
-            "mapping": layout.as_dict(), "mapping_authority": layout.authority,
+            "mapping": {**layout.as_dict(), **({
+                "composite_rom": f"0x{selected_offset:X}",
+                "linked_vram": mapping["linked_vram"], "linked_base": mapping["linked_base"],
+                "image_region": mapping["image_region"], "target_digest": mapping["target_digest"],
+                "image_digest": mapping["image_digest"]} if mapping else {})},
+            "mapping_authority": layout.authority,
             "selected_image_mapping": selected_authority,
             "selected_image_offset": f"0x{selected_offset:X}",
-            "mapping_candidates": [{"authority": authority, "offset": f"0x{offset:X}", "score": score}
-                                   for score, authority, offset, _code in candidates],
+            "mapping_candidates": [{key: (f"0x{value:X}" if key == "offset" else value)
+                                    for key, value in candidate.items() if key != "code"}
+                                   for candidate in candidates],
             "image": str(Path(path).resolve()), "image_size": len(data),
             "first_instruction": first, "last_instruction": last,
             "valid_words": valid, "total_words": len(decoded), "valid_ratio": ratio,

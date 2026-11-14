@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from n64dk.match import context, inventory
-from n64dk.match.layout import Layout, preflight
+from n64dk.match.layout import Layout, physical_collisions, preflight, resolve_image_map
 from n64dk.match.registry import SessionRegistry, resolve_store
 from n64dk.match.session import MatchSession, SessionStore
 
@@ -123,8 +123,35 @@ functions = [
             composite_path = Path(name) / "composite.bin"; composite_path.write_bytes(composite)
             self.assertEqual(preflight(raw_path, layout)["selected_image_mapping"], "raw-overlay")
             report = preflight(composite_path, layout)
-            self.assertEqual(report["selected_image_mapping"], "resident-composite")
+            self.assertEqual(report["selected_image_mapping"], "catalogue-vram-composite")
             self.assertEqual(report["mapping"]["composite_rom"], "0xAFB84")
+
+    def test_composite_payload_anchor_overrides_catalogue_vram_guess(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); raw_path = root / "overlay_4.z64"
+            composite_path = root / "overlay_4_composite.z64"
+            layout = Layout("overlay4", 0x1000, 0x800C77E8, 0x100,
+                            0x800C77F8, 12)
+            code = struct.pack(">III", 0x24020001, 0x03E00008, 0)
+            raw = bytearray(0x1100); raw[0x1010:0x101C] = code; raw_path.write_bytes(raw)
+            composite = bytearray(0x4000); struct.pack_into(">I", composite, 8, 0x80000400)
+            composite[0x2000:0x2100] = raw[0x1000:0x1100]
+            naive = layout.function_vram - 0x80000400 + 0x1000
+            if naive + 12 <= len(composite): composite[naive:naive + 12] = struct.pack(">III", 0, 0x03E00008, 0)
+            composite_path.write_bytes(composite)
+            report = preflight(composite_path, layout)
+            self.assertEqual(report["selected_image_mapping"], "anchored-composite-region")
+            self.assertEqual(report["selected_image_offset"], "0x2010")
+            self.assertEqual(report["mapping"]["linked_base"], "0x80001400")
+            mapping = resolve_image_map(composite_path, layout)
+            rows = [{"name": "linked_duplicate", "image": "overlay4", "vram": "0x80003010",
+                     "section_vram": "0x80003000", "size": 12, "owner": "src/duplicate.c",
+                     "ownership_state": "manifest_exact_unit"}]
+            # Point a competing mapping at the duplicate's canonical physical interval.
+            mapping["candidates"].append({**mapping["selected"], "authority": "wrong-map",
+                                           "offset": 0x2010})
+            collisions = physical_collisions(composite_path, layout, mapping, rows)
+            self.assertEqual(collisions[0]["owner"], "linked_duplicate")
 
     def test_splat_metadata_and_context_bundle(self):
         with tempfile.TemporaryDirectory() as name:

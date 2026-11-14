@@ -466,6 +466,10 @@ class MatchSession:
                     label += f"/flags-{flag_index + 1}"
                 work.append((source.encode(), label, pipeline, base_flags + extra_flags))
 
+        from .typed_explore import source_shape
+        precompile_shapes = {}
+        for source_bytes, label, pipeline, flags in work:
+            precompile_shapes.setdefault(source_shape(source_bytes.decode("utf-8", "replace")), []).append(label)
         unique_work = {}
         for item in work:
             source, _label, pipeline, flags = item
@@ -525,9 +529,17 @@ class MatchSession:
                             row.score if row.score is not None else 2**63)).summary(details)
                             if transaction_viable else None)
         object_classes = {}
+        ir_classes = {}
         for candidate in evaluated:
             digest = candidate.outcome.get("sha256_text") if candidate.outcome else None
             object_classes.setdefault(digest or "no-object", []).append(candidate.candidate_id)
+            opcode = lambda value: (str(value or "").split(None, 1) or ["missing"])[0]
+            ir_value = {"counts": candidate.counts,
+                        "transitions": [(item.get("kind"), opcode(item.get("compiled")),
+                                         opcode(item.get("retail")))
+                                        for item in candidate.outcome.get("diff", {}).get("entries", [])]}
+            ir_digest = hashlib.sha256(_canonical(ir_value).encode()).hexdigest()
+            ir_classes.setdefault(ir_digest, []).append(candidate.candidate_id)
         session_best = self.store.best(session_id)
         return {
             "session_id": session_id,
@@ -541,6 +553,12 @@ class MatchSession:
             "object_classes": [{"object_digest": digest, "candidate_ids": ids,
                                 "equivalent_sources": len(ids)}
                                for digest, ids in object_classes.items()],
+            "source_shape_classes": [{"shape_digest": digest, "labels": labels,
+                                      "equivalent_forms": len(labels)}
+                                     for digest, labels in precompile_shapes.items()],
+            "compiler_ir_classes": [{"ir_fingerprint": digest, "candidate_ids": ids,
+                                     "equivalent_candidates": len(ids)}
+                                    for digest, ids in ir_classes.items()],
             "why_not_better": ("transaction did not improve the retained session frontier"
                                if transaction_best and transaction_best.get("score") is not None
                                and session_best.score is not None

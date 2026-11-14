@@ -9,6 +9,8 @@ import re
 from .hypotheses import suggest
 from .provenance import Verdict, scan_c
 from .session import MatchSession, SessionCandidate, SessionStore, frontier, residual_delta
+from .typed_explore import (lifetime_graph, lifetime_variants, narrowing_variants,
+                            prototype_variants, residual_offsets, source_shape)
 
 
 _DECL = re.compile(r"(?m)^(\s*)(s8|u8|s16|u16|s32|u32|int|unsigned int|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);$")
@@ -58,7 +60,9 @@ def _signature(session_id: str, parent: SessionCandidate, family: str, candidate
 
 
 def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: int = 4,
-            rounds: int = 4, variants_per_round: int = 12, stop_on_exact: bool = True) -> dict:
+            rounds: int = 4, variants_per_round: int = 12, stop_on_exact: bool = True,
+            target_window: tuple[int, int] | None = None,
+            dimensions: set[str] | None = None) -> dict:
     context = store.context(session_id)
     preflight = context.get("layout_preflight")
     if not preflight or not preflight.get("ok"):
@@ -72,6 +76,8 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
     stagnant_rounds = 0
     round_reports = []
     disproved = set()
+    window_rejected = 0
+    dimensions = dimensions or {"spelling", "prototype", "lifetime", "narrowing", "control-flow", "flags"}
     previous_frontier = {item.candidate_id for item in frontier(store.candidates(session_id))}
 
     for round_number in range(1, max(0, rounds) + 1):
@@ -85,12 +91,30 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
             if remaining <= 0:
                 break
             source = store.cache.get(parent.source_digest).decode()
-            generated = variants(source, parent.counts, remaining)
+            generated = variants(source, parent.counts, remaining) if "spelling" in dimensions else []
+            graph = lifetime_graph(parent.outcome, context)
+            if "lifetime" in dimensions and (parent.counts.get("register") or parent.counts.get("scheduling")):
+                generated += lifetime_variants(source, graph, remaining - len(generated))
+            if "narrowing" in dimensions and parent.counts.get("instruction"):
+                generated += narrowing_variants(source, remaining - len(generated))
+            if "prototype" in dimensions:
+                declarations = re.findall(r"(?m)^\s*(?:extern\s+)?[\w *]+\s+(func_[0-9A-Fa-f]{8})\s*\([^;]*\)\s*;", source)
+                for symbol in declarations[:2]:
+                    generated += prototype_variants(source, symbol, ["void", "s16", "u16", "s32"],
+                                                    max(0, remaining - len(generated)))
+            if "control-flow" in dimensions and (parent.counts.get("branch") or parent.counts.get("instruction")):
+                from .controlflow import variants as control_variants
+                generated += control_variants(source, max(0, remaining - len(generated)))
+            unique_generated = {}
+            for item in generated:
+                item.setdefault("family", "control-flow" if "form" in item else "typed")
+                unique_generated.setdefault(hashlib.sha256(item["source"].encode()).hexdigest(), item)
+            generated = list(unique_generated.values())[:remaining]
             by_family: dict[str, list[dict]] = {}
             for item in generated:
                 by_family.setdefault(item.pop("family"), []).append(item)
             # Compiler flags are a bounded residual discriminator, not an open-ended sweep.
-            if round_number == 1 and (parent.counts.get("instruction") or parent.counts.get("scheduling")):
+            if "flags" in dimensions and round_number == 1 and (parent.counts.get("instruction") or parent.counts.get("scheduling")):
                 by_family["optimization-pressure"] = []
             for family, items in by_family.items():
                 signature = _signature(session_id, parent, family, items)
@@ -103,6 +127,23 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
                     proposal["flag_variants"] = [["-fno-gcse"], ["-fno-expensive-optimizations"]]
                 result = session.try_proposal(session_id, proposal, jobs, False)
                 results = result["results"]
+                if target_window:
+                    low, high = target_window
+                    parent_outside = {value for value in residual_offsets(parent.outcome)
+                                      if not low <= value < high}
+                    for item in results:
+                        retained = store.get(session_id, item["candidate_id"])
+                        child_outside = {value for value in residual_offsets(retained.outcome)
+                                         if not low <= value < high} if retained else set()
+                        if child_outside != parent_outside:
+                            store.db.execute("UPDATE session_candidates SET status='rejected-window' "
+                                             "WHERE session_id=? AND candidate_id=?",
+                                             (session_id, item["candidate_id"]))
+                            item["window_status"] = "rejected: disturbed frozen residual region"
+                            window_rejected += 1
+                        else:
+                            item["window_status"] = "preserved"
+                    store.db.commit()
                 for item in results:
                     unique_sources.add(item["source_digest"])
                     digest = item.get("outcome", {}).get("sha256_text")
@@ -152,15 +193,26 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
     next_steps = [item["try"] for item in suggest(best.counts)]
     if invariant:
         next_steps += ["translation-unit context", "compiler recipe", "original typedef or macro expansion"]
+    family_reports = []
+    for family in sorted({item["family"] for report in round_reports for item in report["experiments"]}):
+        items = [item for report in round_reports for item in report["experiments"] if item["family"] == family]
+        family_reports.append({"family": family, "trials": sum(item["variants"] for item in items),
+            "unique_objects": sum(item["unique_objects"] for item in items),
+            "best_delta": min((item["best_delta"] for item in items if item["best_delta"] is not None), default=None),
+            "conclusions": sorted({item["conclusion"] for item in items}),
+            "disproved": family in disproved})
     return {"session_id": session_id, "rounds": executed_rounds,
             "source_variants": len(unique_sources), "unique_objects": len(unique_objects),
             "cache_reused": cache_reused, "exact": best.exact,
             "baseline_score": baseline_score, "best_score": best.score,
             "stagnated": bool(invariant), "invariant_residual": invariant,
             "disproved_hypothesis_classes": sorted(disproved),
+            "target_window": ({"start": target_window[0], "end": target_window[1],
+                               "rejected": window_rejected} if target_window else None),
+            "dimensions": sorted(dimensions),
             "next_discriminators": list(dict.fromkeys(next_steps)),
             "frontier": [item.summary(False) for item in frontier(store.candidates(session_id))],
-            "round_reports": round_reports}
+            "family_reports": family_reports, "round_reports": round_reports}
 
 
 def explain(store: SessionStore, session_id: str, from_id: str, to_id: str) -> dict:
