@@ -215,6 +215,69 @@ Use `match-session-explain` to compare two retained candidates. It reports impro
 worsened residual classes, whether the sources compiled identically, a compact source diff,
 and whether the stated hypothesis was supported or refuted.
 
+## Investigation dossiers and local corpus
+
+Build a durable index from local N64 projects once, then refresh it incrementally:
+
+```bash
+n64dk corpus-index ../GameA ../GameB ../GameC \
+  --database .n64dk/function-corpus.sqlite
+```
+
+Assembly is indexed by textual instruction sequence, relocation-normalized sequence,
+register-and-relocation-neutral sequence, opcode sequence, calls, globals and source digest.
+The index uses path, size and modification time to avoid rereading unchanged files.
+
+`investigate` replaces separate catalogue, disassembly, context, source, manifest, session and
+corpus lookups:
+
+```bash
+n64dk --format json investigate func_800BD998 --project . \
+  --image-name overlay1 --image .tmp/overlay1.z64 \
+  --corpus .n64dk/function-corpus.sqlite --all
+```
+
+The dossier includes the mandatory layout preflight, boundary confidence, callers, callees,
+globals and access widths, likely argument use and frame size, candidate digest/prototype and
+provenance, neighboring manifest recipes, project-wide best session, corpus analogues, and
+ranked next actions. `--bundle DIR` additionally writes a self-contained `target.s`, the
+selected `candidate.c`, and `dossier.json`; this removes the manual function extraction and
+scratch-directory preparation needed by external permutation or comparison tools.
+
+## Consolidating project scripts
+
+Long-running projects often accumulate targeted Python programs for compilation, scoring,
+source transforms, audits, and variant sweeps. Index them without executing their contents:
+
+```bash
+n64dk script-index ../ProjectA ../ProjectB ../ProjectC
+n64dk --format json script-query --kind sweep --limit 50
+n64dk --format json script-query --text function_name
+```
+
+The incremental index records content identity, declared arguments, imports, entry-point
+shape, and inferred purposes. It supplies a concrete migration list for promoting generally
+useful behavior into native operations. Arbitrary indexed scripts are intentionally not
+executed automatically.
+
+## Machine-operated workflow
+
+`operation-schema` describes every operation and its arguments. `automation-serve` accepts
+one JSON request per input line and emits one response per line, allowing a local scheduler
+or self-hosted controller to operate the kit without scraping terminal output:
+
+```bash
+printf '%s\n' \
+  '{"id":1,"method":"invoke","argv":["match-inventory","--project","."]}' \
+  '{"id":2,"method":"invoke","argv":["quickwin-sweep-status","SWEEP_ID","--summary-only"]}' \
+  | n64dk automation-serve
+```
+
+Requests are argument arrays and never pass through a shell. Responses contain success,
+exit status, elapsed time, structured results, and bounded diagnostics. Controllers should
+start with `{"method":"schema"}`, require layout preflight before matching, and use sessions
+so experiments and negative results remain durable.
+
 All accept `--format json`. Manifests: source rows `ROM_START SIZE SOURCE FLAGS [SHA256]`
 (pipeline from the header comment: IDO / SN / KMC) or unit rows `UNIT VRAM SIZE [STATUS]`
 (source `src/code/{unit}.c` etc., flags from the profile or `--flags`).

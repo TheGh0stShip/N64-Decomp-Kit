@@ -38,9 +38,17 @@ and Mario Kart 64 (NKTE), located through `n64dk.fixtures` (roms.toml / N64DK_RO
 | `n64dk.match.registry` | project-wide session resolution and historical target frontier |
 | `n64dk.match.source_index` | incremental content-addressed candidate-source discovery |
 | `n64dk.match.explore` | bounded residual-guided multi-round experiment loop and explanations |
+| `n64dk.match.corpus` | incremental cross-project instruction and normalized-shape index |
+| `n64dk.match.investigate` | verified function dossier, recipe evidence and candidate selection |
+| `n64dk.operations` | project-script discovery, typed operation schema and shell-free invocation gateway |
 | `n64dk.match.provenance` | genuine-C and positive handwritten-assembly credit policy |
 | `n64dk.research` | source/finding quality audit before research is automated |
 | `n64dk.commands.*` | CLI subcommands (one module per area), registered with `@command` |
+
+The operations layer classifies project-local Python tools without executing them and exposes
+the kit through a provider-neutral newline-delimited JSON protocol. External schedulers call
+the same validated commands as interactive users instead of constructing shell fragments or
+parsing terminal prose.
 
 ## Conventions
 * Pure functions over `bytes` + addresses; I/O only in commands. Every analysis returns

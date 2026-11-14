@@ -104,6 +104,11 @@ export, and proof boundaries.
 | `quickwin-sweep-status ID [--status active]` | Filter tranche rows and inspect current versus historical best results |
 | `match-session-explore ID --rounds N --jobs N` | Run bounded residual-guided source experiments over the frontier |
 | `match-session-explain ID --from A --to B` | Explain residual and source changes between two candidates |
+| `investigate FUNCTION --image IMAGE --all` | Build one verified dossier from layout, code, source, recipes, history and corpus evidence |
+| `corpus-index PROJECT...` | Incrementally index local N64 assembly by exact and normalized signatures |
+| `corpus-query --image IMAGE --addr A --size N --vram-delta D` | Find exact, relocation-only, register-renamed and opcode-shape analogues |
+| `script-index PROJECT...` / `script-query` | Inventory scattered sweeps, audits, transforms, scorers and build wrappers |
+| `operation-schema` / `automation-serve` | Expose typed operations over newline-delimited JSON for local controllers |
 | `match-session-prepare-winner SESSION_ID DIR` | Independently recompile an exact winner and prepare an auditable export queue |
 | `match-job-run PROJECT.toml --unit UNIT` | Create or resume a bounded, persistent candidate/compile/diagnose search job |
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |
@@ -143,6 +148,8 @@ report = survey.run(rom)["report"]
   usage, evidence, verification boundary and limitations
 * [docs/autonomous-tranches.md](docs/autonomous-tranches.md): interval inventories, context
   bundles, cross-function scheduling, compact session output and exact-winner preparation
+* [docs/tooling-research.md](docs/tooling-research.md): upstream workflow concepts and the
+  first-class operations that replace repeated searches, extraction and comparison calls
 * [docs/AUTOMATION_HANDOFF.md](docs/AUTOMATION_HANDOFF.md): operating and reporting
   instructions for automated matching workers
 * [docs/BRIEF.md](docs/BRIEF.md): rules for adding an analysis module
