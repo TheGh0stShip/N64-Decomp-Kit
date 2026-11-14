@@ -1,6 +1,9 @@
-# n64dk
+# N64 Decomp Kit
 
-Game-agnostic analysis, matching and asset tooling for Nintendo 64 decompilation projects.
+`n64dk` is a game-agnostic command-line and Python toolkit for analysing Nintendo 64 ROMs,
+recovering program structure and assets, identifying SDK code, and reproducing functions with
+historical N64 toolchains.
+
 Everything is derived from a retail ROM image plus optional project inputs (symbol lists,
 manifests, sources); nothing is hard-coded to one game.
 
