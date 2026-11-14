@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+out/
+roms.toml
+*.z64
+*.n64
+*.v64
+.n64dk/
+.n64dk-transform-list.json
+docs/research/
+*.sqlite-wal
+*.sqlite-shm

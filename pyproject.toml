@@ -1,0 +1,21 @@
+[project]
+name = "n64dk"
+version = "0.1.0"
+description = "Analysis, matching and asset tooling for N64 decompilation projects"
+readme = "README.md"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.11"
+dependencies = ["rabbitizer>=1.16"]
+
+[project.scripts]
+n64dk = "n64dk.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["n64dk*"]
+
+[tool.setuptools.package-data]
+"n64dk.sdk" = ["data/*.json.gz"]
