@@ -27,7 +27,10 @@ class SessionRegistry:
         self.project = project_root(project)
         root = self.project / ".n64dk"
         root.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(root / "session-registry.sqlite")
+        # ProjectContext serializes access to this connection while sharing its read
+        # snapshot with compile workers. Standalone callers remain single-threaded.
+        self.db = sqlite3.connect(root / "session-registry.sqlite", timeout=30, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("""CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY, store_root TEXT NOT NULL, target_signature TEXT NOT NULL,
             image_digest TEXT, image TEXT, vram INTEGER, size INTEGER, source_digest TEXT,
@@ -106,8 +109,9 @@ class SessionRegistry:
                 store.close()
         return imported
 
-    def same_target(self, context: dict) -> list[dict]:
-        self.refresh()
+    def same_target(self, context: dict, refresh: bool = True) -> list[dict]:
+        if refresh:
+            self.refresh()
         signature = target_signature(context)
         rows = self.db.execute("""SELECT session_id, store_root, source_digest, producer
                                   FROM sessions WHERE target_signature = ?""", (signature,)).fetchall()

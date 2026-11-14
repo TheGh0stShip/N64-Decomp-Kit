@@ -37,7 +37,8 @@ class ResultIndexTests(unittest.TestCase):
             finally: index.close()
             self.assertEqual(current, [])
             self.assertEqual(rows[0]["observation_class"], "exact_stale_target")
-            self.assertFalse(rows[0]["live_validity"]["source_digest_resolves"])
+            self.assertFalse(rows[0]["live_validity"]["source_exists"])
+            self.assertTrue(rows[0]["live_validity"]["source_digest_resolves"])
             self.assertFalse(rows[0]["live_validity"]["mapping_transform_current"])
             self.assertEqual(absent, [])
 

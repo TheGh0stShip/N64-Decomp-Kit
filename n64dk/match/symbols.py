@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+from functools import lru_cache
 import re
 import tomllib
 from pathlib import Path
@@ -107,20 +108,36 @@ def from_source(text: str, known: SymbolMap) -> dict[str, int]:
 
 def discover(project: Path) -> list[Path]:
     """Conventional symbol files inside a project (splat symbol_addrs and function catalogues)."""
+    return list(_discover_cached(project.resolve()))
+
+
+@lru_cache(maxsize=32)
+def _discover_cached(project: Path) -> tuple[Path, ...]:
+    """Cache immutable discovery results shared by parallel matching workers."""
     found: list[Path] = []
+    canonical_build = project / "build" / "us"
+    survey_symbols = canonical_build / "survey" / "symbol_addrs.txt"
+    if survey_symbols.is_file():
+        found.append(survey_symbols)
+    audit = canonical_build / "audit"
+    if audit.is_dir():
+        found.extend(sorted(audit.glob("*_functions/symbol_addrs.txt")))
     for pattern in ("symbol_addrs*.txt", "*function_boundaries*.toml", "*symbols*.toml"):
         for root in (project, project / "config"):
             if root.is_dir():
                 found += sorted(p for p in _walk(root, pattern)
                                 if not {".toolchain", "build"} & set(p.relative_to(project).parts))
-    return list(dict.fromkeys(found))
+    return tuple(dict.fromkeys(found))
 
 
 def _walk(root: Path, pattern: str):
     """Files under ``root`` matching ``pattern``, following linked directories (a pinned
     ground-truth snapshot links the project's ignored directories)."""
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        dirnames[:] = [d for d in dirnames if d not in (".git", ".toolchain", "build", "__pycache__")]
+        dirnames[:] = [d for d in dirnames if d not in (
+            ".git", ".git-data", ".toolchain", ".venv", ".n64dk", ".tmp",
+            "build", "node_modules", "results", "__pycache__",
+        )]
         for name in filenames:
             if fnmatch.fnmatch(name, pattern):
                 yield Path(dirpath, name)

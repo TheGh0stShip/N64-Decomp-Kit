@@ -576,7 +576,9 @@ def match_session_prepare_winner(args):
             raise RuntimeError("independent recompilation did not reproduce the exact match")
         root = Path(args.output_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
-        source_path = root / context.get("source_name", "winner.c")
+        canonical_name = (f"{context.get('inventory_name')}.c" if context.get("inventory_name") else
+                          f"func_{int(context['addr']):08X}.c" if context.get("addr") is not None else "winner.c")
+        source_path = root / canonical_name
         source_path.write_bytes(source)
         receipt = {
             "proof": "independent exact recompilation",
@@ -589,6 +591,8 @@ def match_session_prepare_winner(args):
                        ("rom_sha256", "vram_delta", "addr", "size", "inventory_id", "inventory_image")},
             "outcome": verified.as_dict(),
             "project_edits_applied": False,
+            "historical_source_name": context.get("source_name"),
+            "canonical_source_name": canonical_name,
         }
         evidence = root / "winner.evidence.json"
         evidence.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")

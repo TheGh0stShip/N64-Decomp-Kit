@@ -10,10 +10,14 @@ from n64dk.match.controlflow import classify_branches, variants
 from n64dk.match.typed_explore import (declaration_context, lifetime_graph,
                                         narrowing_variants, prototype_variants,
                                         source_shape)
+from n64dk.match.typed_explore import call_chain_variants, call_result_ownership
+from n64dk.match.project_context import ProjectContext
+from n64dk.match.reconstruct import scaffold, shared_layout, prototype_constraints
 from n64dk.match.corpus import CorpusIndex
 import struct
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from n64dk.commands.workbench import _restore_worktree_snapshot, _worktree_snapshot
@@ -138,6 +142,91 @@ class WorkbenchTests(unittest.TestCase):
                 result = code_query(args)
             self.assertEqual(result["count"], 1)
             self.assertEqual(result["results"][0]["kind"], "declaration")
+
+    def test_project_context_scans_once_and_hashes_each_image_once(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); image = root / "image.z64"; image.write_bytes(b"\0" * 64)
+            snapshot = {"project": str(root), "functions": [], "images": [],
+                        "source_index": {"elapsed_seconds": 0.0}}
+            with mock.patch("n64dk.match.project_context.invmod.build", return_value=snapshot) as build:
+                context = ProjectContext(root, {"resident": str(image)})
+                first = context.image("resident"); second = context.image("resident")
+                context.close()
+            self.assertIs(first, second)
+            self.assertEqual(build.call_count, 1)
+            self.assertEqual(context.metrics["project_scans"], 1)
+            self.assertEqual(context.metrics["image_hashes"], 1)
+
+    def test_project_context_keeps_strict_preflights_separate_and_infers_tu_recipe(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); config = root / "config"; config.mkdir()
+            manifest = config / "matching_resident_units.tsv"
+            manifest.write_text("0x1000\t0x40\tsrc/libultra/unit.c\t-O2 -G0\n")
+            image = root / "resident.bin"; image.write_bytes(b"\0" * 0x2000)
+            row = {"id": "resident:func_80001010:80001010", "image": "resident",
+                   "name": "func_80001010", "vram": "0x80001010", "size": 16,
+                   "section_vram": "0x80001000", "section_rom": "0x1000",
+                   "section_size": 0x100, "catalogue_status": "complete"}
+            snapshot = {"project": str(root), "functions": [row],
+                        "images": [{"name": "resident"}], "source_index": {}}
+            context = ProjectContext(root, {"resident": str(image)}, inventory_snapshot=snapshot)
+            try:
+                with mock.patch("n64dk.match.project_context.preflight",
+                                side_effect=lambda *_a, strict_entry=True, **_k: {"ok": strict_entry}):
+                    self.assertFalse(context.preflight(row, False)["ok"])
+                    self.assertTrue(context.preflight(row, True)["ok"])
+                recipe = context.infer_recipe(row)
+                self.assertEqual(recipe["evidence"], "same verified translation-unit interval")
+                self.assertEqual(recipe["source"], "src/libultra/unit.c")
+                self.assertEqual(recipe["pipeline"], "kmc+as")
+                overridden = context.infer_recipe(row, override_flags="-O1 -G0")
+                self.assertEqual(overridden["pipeline"], "kmc+as")
+                candidate = root / "caller.c"
+                candidate.write_text("void caller(void) { func_80001010(); }\n")
+                source_row = {**row, "candidate_source": "caller.c"}
+                self.assertEqual(context.validate_source(source_row)["state"], "source_wrong_function")
+            finally:
+                context.close()
+
+    def test_project_context_history_snapshot_is_worker_safe(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); snapshot = {"project": str(root), "functions": [], "images": [],
+                                            "source_index": {}}
+            context = ProjectContext(root, inventory_snapshot=snapshot)
+            target = {"rom_sha256": "0" * 64, "vram_delta": 0x80000000,
+                      "addr": 0x80001000, "size": 16}
+            try:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    rows = list(pool.map(lambda _value: context.history(target), range(8)))
+                self.assertTrue(all(row == [] for row in rows))
+                self.assertEqual(context.metrics["history_scans"], 1)
+            finally:
+                context.close()
+
+    def test_reconstruction_scaffold_layout_and_prototype_constraints(self):
+        code = struct.pack(">III", 0x8C880014, 0x03E00008, 0)
+        source, evidence = scaffold("func_80001000", code, 0x80001000)
+        self.assertIn("func_80001000", source)
+        layout = shared_layout([evidence])
+        self.assertEqual(layout["fields"][0]["offset"], 0x14)
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); (root / "src").mkdir(); (root / "include").mkdir()
+            (root / "src" / "a.c").write_text("extern s16 func_80002000(s32 value);\n")
+            (root / "include" / "a.h").write_text("extern s32 func_80002000(s32 value);\n")
+            solved = prototype_constraints(root)
+            self.assertEqual(len(solved["conflicts"]), 1)
+
+    def test_call_result_ownership_drives_nested_call_decomposition(self):
+        outcome = {"diff": {"entries": [
+            {"retail": "jal func_800E25D0"}, {"retail": "nop"},
+            {"retail": "jal func_800E2480"}, {"retail": "addu $s0, $v0, $zero"},
+            {"retail": "sll $s0, $s0, 16"}, {"retail": "bnez $s0, 0x80000040"}]}}
+        ownership = call_result_ownership(outcome)
+        self.assertEqual(ownership["transfers"][0]["producer"], "func_800E25D0")
+        source = "s32 f(void) {\n    status = func_800E2480(func_800E25D0(value));\n    return status;\n}\n"
+        generated = call_chain_variants(source, ownership)
+        self.assertIn("status = func_800E25D0(value);", generated[0]["source"])
+        self.assertIn("func_800E2480();", generated[0]["source"])
 
     def test_integration_rollback_preserves_preexisting_worktree_edits(self):
         with tempfile.TemporaryDirectory() as name:

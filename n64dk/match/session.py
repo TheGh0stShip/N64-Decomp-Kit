@@ -240,6 +240,10 @@ class SessionStore:
                                   WHERE session_id = ? AND signature = ?""",
                                (session_id, signature)).fetchone() is not None
 
+    def experiment_seen_global(self, signature: str) -> bool:
+        return self.db.execute("SELECT 1 FROM session_experiments WHERE signature=? LIMIT 1",
+                               (signature,)).fetchone() is not None
+
     def record_experiment(self, session_id: str, signature: str, round_number: int,
                           family: str, parent_id: str, variants: int, unique_objects: int,
                           best_delta: int | None, conclusion: str, payload: dict) -> None:

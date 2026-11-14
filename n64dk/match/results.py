@@ -93,8 +93,13 @@ class ResultIndex:
         source = Path(source_path)
         raw = source.read_bytes()
         source_digest = hashlib.sha256(raw).hexdigest()
+        archive = self.path.parent / "source-archive" / source_digest[:2] / source_digest
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        if not archive.exists(): archive.write_bytes(raw)
         self.db.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?,?)",
                         (source_digest, str(source.resolve()), _source_digest(raw), len(raw)))
+        self.db.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?,?)",
+                        (source_digest, str(archive.resolve()), _source_digest(raw), len(raw)))
         address = _integer(context.get("addr")); size = _integer(context.get("size"))
         score = _integer(payload.get("diff", {}).get("score"))
         exact = bool(payload.get("exact"))

@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import difflib
 import csv
 import struct
@@ -20,7 +21,8 @@ from pathlib import Path
 
 from ..cli import command
 from ..match.inventory import build as build_inventory
-from ..match.layout import from_inventory, physical_collisions, preflight, resolve_image_map
+from ..match.layout import (boundary_proposals, from_inventory, physical_collisions, preflight,
+                            resolve_image_map)
 from ..match.registry import resolve_store, standard_store
 from ..match.results import ResultIndex
 from ..match.session import MatchSession, SessionStore
@@ -287,6 +289,28 @@ def doctor(args):
     selected_pythons = {"matching": _python_path(python_profiles.get("matching")),
                         "project-test": _python_path(python_profiles.get("project_test")),
                         "gpu": _python_path(python_profiles.get("gpu"))}
+    import_probes = ("elftools", "capstone", "PIL", "networkx", "zstandard", "lz4",
+                     "numpy", "scipy", "sklearn")
+    interpreter_probes = []
+    for label, executable in (("qualified", selected_pythons["matching"]),
+                              ("system", shutil.which("python3"))):
+        if not executable: continue
+        for package in import_probes:
+            probe = subprocess.run([executable, "-c", f"import {package}; print(getattr({package}, '__version__', 'ok'))"],
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            interpreter_probes.append({"interpreter": label, "python": str(Path(executable).resolve()),
+                "package": package, "ok": probe.returncode == 0,
+                "output": (probe.stdout or probe.stderr)[-500:]})
+    for name in ("jq", "rg", "cmake", "ninja", "meson", "ccache", "dot"):
+        add("optional corpus research", name, shutil.which(name), shutil.which(name),
+            f"install {name} for accelerated research workflows", required=False)
+    sqlite_features = {"json": False, "wal": False}
+    try:
+        probe_db = sqlite3.connect(":memory:")
+        sqlite_features["json"] = probe_db.execute("SELECT json_valid('{}')").fetchone()[0] == 1
+        sqlite_features["wal"] = sqlite3.sqlite_version_info >= (3, 7, 0)
+        probe_db.close()
+    except sqlite3.DatabaseError: pass
     for group, packages in dependency_groups.items():
         python_key = "project-test" if group == "project_test" else "gpu" if "gpu" in group else "matching"
         executable = selected_pythons[python_key]
@@ -322,6 +346,7 @@ def doctor(args):
             "canonical_paths": {"python": str(Path(sys.executable).resolve()), "prefix": prefix,
                                 "project": str(project)},
             "selected_python": selected_pythons, "integration_hooks": workbench.get("hooks", {}),
+            "interpreter_import_probes": interpreter_probes, "sqlite_features": sqlite_features,
             "functional_smokes": functional, "optional_capabilities_disabled": optional_disabled,
             "remediation": [row["remediation"] for row in checks
                             if not row["ok"] and row["remediation"]] if args.fix_user else []}
@@ -642,9 +667,14 @@ def _boundary_args(p):
 def boundary_audit(args):
     inventory = build_inventory(args.project); rows = [x for x in inventory["functions"] if x["name"] == args.function]
     if len(rows) != 1: raise ValueError(f"function resolved to {len(rows)} rows")
-    report = preflight(args.image, from_inventory(rows[0]), rows[0]["catalogue_status"], args.strict)
+    layout = from_inventory(rows[0]); error = None
+    try: report = preflight(args.image, layout, rows[0]["catalogue_status"], args.strict)
+    except ValueError as caught:
+        error = str(caught); report = {"ok": False, "error": error,
+            "entry_preflight": {"entry_status": "reject"}, "preflight_version": "image-map-v3"}
     return {"function": rows[0], "preflight": report, "splat": inventory["splat"],
-            "decision": report["entry_preflight"]["entry_status"], "rule_version": report["preflight_version"]}
+            "decision": report["entry_preflight"]["entry_status"], "rule_version": report["preflight_version"],
+            "correction_proposals": boundary_proposals(args.image, layout) if error else []}
 
 
 boundary_audit.arguments = _boundary_args
@@ -852,8 +882,12 @@ compiler_explain.arguments = _compiler_explain_args
 
 
 def _synthesize_args(p):
-    p.add_argument("session_id")
-    p.add_argument("--candidate", action="append", required=True)
+    p.add_argument("session_id", nargs="?")
+    p.add_argument("--candidate", action="append")
+    p.add_argument("--function")
+    p.add_argument("--candidate-a")
+    p.add_argument("--candidate-b")
+    p.add_argument("--database", default=".n64dk/results.sqlite")
     p.add_argument("--project", default=".")
     p.add_argument("--state-root")
     p.add_argument("--jobs", type=int, default=16)
@@ -862,9 +896,49 @@ def _synthesize_args(p):
 
 @command("frontier-synthesize", "Compile a minimal cross-product from complementary retained frontiers")
 def frontier_synthesize(args):
+    if not args.session_id:
+        if not (args.function and args.candidate_a and args.candidate_b):
+            raise ValueError("supply SESSION and two --candidate values, or --function with --candidate-a/--candidate-b")
+        project = Path(args.project).resolve(); inventory = build_inventory(project)
+        database = Path(args.database); database = database if database.is_absolute() else project / database
+        index = ResultIndex(database)
+        try:
+            observations = index.query(function=args.function, limit=100000, project=project, inventory=inventory)
+        finally: index.close()
+        selected = [next((row for row in observations if row["observation_id"] == identifier), None)
+                    for identifier in (args.candidate_a, args.candidate_b)]
+        if any(row is None for row in selected): raise ValueError("observation is stale, invalid, or not current-target reproducible")
+        if any(not row.get("live_validity", {}).get("source_digest_resolves") for row in selected):
+            raise ValueError("both observations require recoverable content-addressed source")
+        replay = selected[0]["payload"].get("replay") or {}; image = Path(replay.get("image", ""))
+        rows = [row for row in inventory["functions"] if row["name"] == args.function]
+        if len(rows) != 1 or not image.is_file(): raise ValueError("cannot reconstruct a unique current target session")
+        cfg = load_config(project); layout = from_inventory(rows[0]); check = preflight(image, layout, rows[0].get("catalogue_status", ""), True)
+        context = {"source_name": f"{args.function}.c", "source_suffix": ".c", "rom": str(image),
+            "rom_sha256": hashlib.sha256(image.read_bytes()).hexdigest(), "project": str(project),
+            "toolchain_root": str(cfg.toolchain_root) if cfg.toolchain_root else None,
+            "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
+            "include": [str(value) for value in cfg.include], "symbols": [str(value) for value in cfg.symbols],
+            "normalizer": cfg.normalizer, "vram_delta": layout.function_vram - int(check["selected_image_offset"], 0),
+            "addr": layout.function_vram, "size": layout.function_size, "infer_externals": True,
+            "inventory_name": args.function, "inventory_image": rows[0]["image"], "layout_preflight": check,
+            "target_text_sha256": check["mapping"].get("target_digest")}
+        sources = [Path(row["live_validity"]["resolved_source"]).read_bytes() for row in selected]
+        pipeline = selected[0]["payload"].get("pipeline") or replay.get("pipeline") or "kmc+asn64"
+        flags = selected[0]["payload"].get("flags") or replay.get("flags") or []
+        if isinstance(flags, str): flags = shlex.split(flags)
+        store = SessionStore(standard_store(project))
+        try:
+            session = MatchSession(store, __import__("n64dk.commands.match", fromlist=["_session_evaluator"])._session_evaluator(context))
+            session_id, first = session.create(context, sources[0], pipeline, tuple(flags))
+            transaction = session.try_proposal(session_id, {"hypothesis": "import complementary historical frontier",
+                "variants": [{"label": "observation-b", "source": sources[1].decode()}]}, args.jobs, False)
+            args.session_id = session_id; args.candidate = [first.candidate_id,
+                transaction["transaction_results"][0]["candidate_id"]]
+        finally: store.close()
     store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
-        rows = [store.get(args.session_id, value) for value in args.candidate]
+        rows = [store.get(args.session_id, value) for value in (args.candidate or [])]
         if len(rows) < 2 or any(row is None for row in rows): raise ValueError("two retained candidates are required")
         sources = [store.cache.get(row.source_digest).decode().splitlines(keepends=True) for row in rows]
         base = sources[0]; differing = [i for i in range(min(map(len, sources))) if len({s[i] for s in sources}) > 1]
@@ -896,7 +970,7 @@ def _attribute_args(p):
 
 @command("residual-attribution", "Map residual instructions to likely controlling source values and lifetimes")
 def residual_attribution(args):
-    from ..match.typed_explore import lifetime_graph
+    from ..match.typed_explore import call_result_ownership, lifetime_graph
     store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         row = store.get(args.session_id, args.candidate)
@@ -925,8 +999,16 @@ def residual_attribution(args):
                                "retail": retail, "likely_source_values": calls[-3:],
                                "likely_source_expressions": specific, "source_lines": expressions[:12],
                                "declarations": declarations[:12], "mechanism": mechanism})
+        ownership = call_result_ownership(row.outcome, store.context(args.session_id))
+        if ownership.get("transfers"):
+            attributed = [{**item, "ranked_data_flow": ownership["transfers"],
+                           "controlling_source_span": next((line for line in expressions
+                               if sum(call in line["text"] for call in calls) >= 2), None),
+                           "semantic_or_allocation": "different call-result ownership"}
+                          for item in attributed]
         return {"candidate_id": row.candidate_id, "attribution": attributed,
                 "value_lifetime_graph": lifetime_graph(row.outcome, store.context(args.session_id)),
+                "call_result_ownership": ownership,
                 "confidence": "heuristic-def-use", "next_discriminators":
                 ["carrier reuse", "narrow prototype", "unified return path"]}
     finally: store.close()
@@ -1097,6 +1179,20 @@ def integrate_winner(args):
                 transaction["applied"] = True; transaction["gates"] = gates
                 transaction["states"][-1] = "integration_ready"
                 transaction["tracked_diff"] = _transaction_diff(project, tracked_before, untracked_before)
+                from ..match.source_index import SourceIndex
+                index = SourceIndex(project)
+                try: transaction["cache_invalidation"] = {"source_index": index.refresh()}
+                finally: index.close()
+                invalidated = 0
+                for sweep in project.glob(".n64dk/**/sweeps.sqlite"):
+                    try:
+                        sweep_db = sqlite3.connect(sweep)
+                        changed = sweep_db.execute("""UPDATE tranche_items SET status='already_owned',
+                            phase='invalidated-after-integration',updated_ns=? WHERE name=?""",
+                            (time.time_ns(), inventory_row["name"])).rowcount
+                        sweep_db.commit(); sweep_db.close(); invalidated += changed
+                    except sqlite3.DatabaseError: pass
+                transaction["cache_invalidation"]["tranche_rows"] = invalidated
             except Exception:
                 _restore_worktree_snapshot(project, tracked_before, untracked_before)
                 transaction["rolled_back"] = True
@@ -1243,6 +1339,95 @@ def scheduler_status(args):
 
 
 scheduler_status.arguments = _scheduler_status_args
+
+
+def _scaffold_args(p):
+    p.add_argument("function")
+    p.add_argument("--project", default=".")
+    p.add_argument("--image", required=True)
+    p.add_argument("--image-name")
+    p.add_argument("--output")
+
+
+@command("source-scaffold", "Generate an immediately compilable ordinary-C starter from target evidence")
+def source_scaffold(args):
+    from ..match.reconstruct import scaffold
+    inventory = build_inventory(args.project); rows = [row for row in inventory["functions"]
+        if row["name"] == args.function and (not args.image_name or row["image"] == args.image_name)]
+    if len(rows) != 1: raise ValueError(f"function resolved to {len(rows)} catalogue intervals")
+    row = rows[0]; mapping = resolve_image_map(args.image, from_inventory(row)); data = Path(args.image).read_bytes()
+    offset = mapping["selected"]["offset"]; source, evidence = scaffold(
+        row["name"], data[offset:offset + int(row["size"])], int(row["vram"], 0))
+    output = Path(args.output).resolve() if args.output else None
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True); output.write_text(source)
+        output.with_suffix(output.suffix + ".evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    return {"source": source if not output else str(output), "evidence": evidence,
+            "ordinary_c": True, "compile_ready": True}
+
+
+source_scaffold.arguments = _scaffold_args
+
+
+def _layout_infer_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--image", required=True)
+    p.add_argument("--image-name", required=True)
+    p.add_argument("--function", action="append", required=True)
+
+
+@command("structure-layout-infer", "Aggregate typed structure-offset evidence across related functions")
+def structure_layout_infer(args):
+    from ..match.reconstruct import scaffold, shared_layout
+    inventory = build_inventory(args.project); data = Path(args.image).read_bytes(); observations = []
+    for name in args.function:
+        rows = [row for row in inventory["functions"] if row["name"] == name and row["image"] == args.image_name]
+        if len(rows) != 1: continue
+        row = rows[0]; mapping = resolve_image_map(args.image, from_inventory(row)); offset = mapping["selected"]["offset"]
+        _source, evidence = scaffold(name, data[offset:offset + int(row["size"])], int(row["vram"], 0))
+        observations.append(evidence)
+    return {"functions": [row["function"] for row in observations], **shared_layout(observations)}
+
+
+structure_layout_infer.arguments = _layout_infer_args
+
+
+def _prototype_solve_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--conflicts-only", action="store_true")
+
+
+@command("prototype-solve", "Solve and report project-wide declaration constraints before matching")
+def prototype_solve(args):
+    from ..match.reconstruct import prototype_constraints
+    result = prototype_constraints(Path(args.project).resolve())
+    if args.conflicts_only: result.pop("results", None)
+    return result
+
+
+prototype_solve.arguments = _prototype_solve_args
+
+
+def _tu_reconstruct_args(p):
+    p.add_argument("unit")
+    p.add_argument("--project", default=".")
+    p.add_argument("--manifest-row")
+
+
+@command("tu-reconstruct", "Prepare a first-class translation-unit reconstruction and whole-unit comparison plan")
+def tu_reconstruct(args):
+    project = Path(args.project).resolve(); unit = (project / args.unit).resolve(); text = unit.read_text(errors="replace")
+    functions = re.findall(r"(?m)^\s*[A-Za-z_]\w*(?:\s*\*)?\s+(func_[0-9A-Fa-f]{8})\s*\(", text)
+    declarations = re.findall(r"(?m)^\s*(?:extern\s+|static\s+)?[^;{}]+;", text)
+    return {"unit": str(unit), "digest": hashlib.sha256(unit.read_bytes()).hexdigest(),
+            "functions": functions, "declaration_order": declarations,
+            "manifest_row": args.manifest_row, "dimensions": ["declaration order", "visibility",
+                "typedefs", "macros", "inlining", "literal pools", "function order"],
+            "comparison_scope": ["every owned function", "data sections", "relocations"],
+            "apply": False}
+
+
+tu_reconstruct.arguments = _tu_reconstruct_args
 
 
 def _snapshot_args(p):

@@ -227,6 +227,11 @@ class Result:
 
     def as_dict(self) -> dict:
         out = {"exact": self.exact, "text": vars(self.text), "compiled_text_size": self.compiled_size,
+               "owned_text_size": self.text.size, "object_text_size": self.compiled_size,
+               "trailing_alignment_bytes": max(0, self.compiled_size - self.text.size),
+               "compared_range": [0, self.text.size],
+               "unowned_bytes_verified_as_alignment": bool(
+                   self.exact and self.compiled_size >= self.text.size and not self.text.note),
                "sections": [vars(s) for s in self.sections],
                "bases": {k: f"0x{v:08X}" for k, v in self.bases.items()}}
         if self.inferred_symbols:

@@ -57,6 +57,7 @@ class InventoryFunction:
     candidate_source: str | None
     mapping_evidence: tuple[str, ...]
     rank: float | None
+    library_identity: str | None = None
 
     def as_dict(self) -> dict:
         value = asdict(self)
@@ -278,7 +279,10 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             item = InventoryFunction(identity, image, name, start, end, size, rom,
                                      section[1], section[0], section[2], status,
                                      state, reason, owner, ownership_state, coverage_authority,
-                                     candidate, tuple(evidence), rank)
+                                     candidate, tuple(evidence), rank,
+                                     ("libultra" if any("libultra" in value.lower() for value in
+                                        ([owner] if owner else []) + [claim.source for claim in owners])
+                                      else None))
             functions.append(item)
             image_rows.append(item)
         images.append({"name": image, "catalogue": str(catalogue.relative_to(root)),
@@ -301,6 +305,26 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             continue
     denominator_delta = (len(functions) - declared_functions
                          if declared_functions is not None else None)
+    def count(state): return sum(row.ownership_state == state for row in functions)
+    def bytes_for(predicate): return sum(row.size for row in functions if predicate(row))
+    reconciliation = [
+        {"source": "catalogue_intervals", "functions": len(functions),
+         "bytes": sum(row.size for row in functions), "explanation": "parsed catalogue boundaries"},
+        {"source": "declared_denominator", "functions": declared_functions, "bytes": None,
+         "explanation": "project progress declaration"},
+        {"source": "individually_owned_c", "functions": count("manifest_exact_unit"),
+         "bytes": bytes_for(lambda row: row.ownership_state == "manifest_exact_unit"),
+         "explanation": "manifest unit equals catalogue interval"},
+        {"source": "aggregate_owned_c", "functions": count("manifest_exact_member"),
+         "bytes": bytes_for(lambda row: row.ownership_state == "manifest_exact_member"),
+         "explanation": "catalogue intervals expanded from aggregate translation units"},
+        {"source": "assembly_owned", "functions": sum(row.state == "assembly" for row in functions),
+         "bytes": bytes_for(lambda row: row.state == "assembly"), "explanation": "authoritative assembly ownership"},
+        {"source": "fragments_padding_data", "functions": sum(row.state == "excluded" for row in functions),
+         "bytes": bytes_for(lambda row: row.state == "excluded"), "explanation": "excluded non-functions"},
+        {"source": "truly_remaining", "functions": sum(row.state == "remaining" for row in functions),
+         "bytes": bytes_for(lambda row: row.state == "remaining"), "explanation": "complete unowned intervals"},
+    ]
     return {
         "project": str(root),
         "model": "interval-v2-authoritative-coverage",
@@ -322,6 +346,7 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                                                    "declared_functions": declared_functions,
                                                    "delta": denominator_delta}
                                                   if denominator_delta not in (None, 0) else None)},
+        "reconciliation": reconciliation,
         "functions": [row.as_dict() for row in functions],
     }
 

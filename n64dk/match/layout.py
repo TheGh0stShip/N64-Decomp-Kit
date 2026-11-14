@@ -23,13 +23,16 @@ def _raw_sibling(path: Path) -> Path | None:
     return None
 
 
-def resolve_image_map(path: str | Path, layout: "Layout") -> dict:
+def resolve_image_map(path: str | Path, layout: "Layout", data: bytes | None = None,
+                      raw_data: bytes | None = None) -> dict:
     """Resolve physical bytes using an anchored image region, never a VRAM guess alone."""
     image_path = Path(path).expanduser().resolve()
-    data = image_path.read_bytes()
+    data = image_path.read_bytes() if data is None else data
     relative = layout.function_vram - layout.section_vram
     raw_offset = layout.section_rom + relative
     header_vram = int.from_bytes(data[8:12], "big") if len(data) >= 12 else None
+    composite_image = any(marker in image_path.stem.lower()
+                          for marker in ("composite", "with_resident", "resident_rodata"))
     candidates: list[dict] = []
 
     def add(authority: str, offset: int, linked_vram: int | None, transform: str,
@@ -47,7 +50,7 @@ def resolve_image_map(path: str | Path, layout: "Layout") -> dict:
 
     add("raw-overlay", raw_offset, layout.section_vram,
         "section_rom + (catalogue_vram - catalogue_base)", ["catalogue"],
-        not ("composite" in image_path.stem.lower()))
+        not composite_image)
     naive = layout.function_vram - 0x80000400 + 0x1000
     add("catalogue-vram-composite", naive, layout.section_vram,
         "0x1000 + catalogue_vram - resident_vram", ["catalogue"])
@@ -56,7 +59,7 @@ def resolve_image_map(path: str | Path, layout: "Layout") -> dict:
     region_offset = None
     raw_target_digest = None
     if sibling:
-        raw_data = sibling.read_bytes()
+        raw_data = sibling.read_bytes() if raw_data is None else raw_data
         payload = raw_data[layout.section_rom:layout.section_rom + layout.section_size]
         positions = []
         cursor = 0
@@ -89,6 +92,8 @@ def resolve_image_map(path: str | Path, layout: "Layout") -> dict:
         ranked = sorted(candidates, key=lambda row: row["score"], reverse=True)
         if not ranked:
             raise ValueError("target interval is outside every image mapping")
+        if composite_image and len({row["digest"] for row in ranked}) > 1:
+            raise ValueError("ambiguous composite image mapping: no unique raw-image anchor")
         selected = ranked[0]
         if len(ranked) > 1 and ranked[0]["score"] == ranked[1]["score"] and ranked[0]["digest"] != ranked[1]["digest"]:
             raise ValueError("ambiguous image mapping: equally plausible offsets contain different bytes")
@@ -97,7 +102,17 @@ def resolve_image_map(path: str | Path, layout: "Layout") -> dict:
     return {"image": str(image_path), "image_digest": _digest(data), "image_size": len(data),
             "image_region": {"offset": f"0x{region_offset:X}" if region_offset is not None else None,
                              "size": layout.section_size, "raw_sibling": str(sibling) if sibling else None},
-            "raw_rom": f"0x{raw_offset:X}", "catalogue_vram": f"0x{layout.function_vram:X}",
+            "raw_rom": f"0x{raw_offset:X}",
+            "coordinates": {"loaded_image_offset": f"0x{relative:X}",
+                "manifest_rom_offset": f"0x{raw_offset:X}", "physical_rom_offset": None,
+                "selected_image_offset": f"0x{selected['offset']:X}",
+                "linked_vram": (f"0x{selected['linked_vram'] + relative:X}"
+                                if selected["linked_vram"] is not None else None),
+                "image_vram_delta": (f"0x{layout.function_vram - selected['offset']:X}"),
+                "section_vram": f"0x{layout.section_vram:X}",
+                "section_rom": f"0x{layout.section_rom:X}",
+                "coordinate_space": "catalogue-section+loaded-image"},
+            "catalogue_vram": f"0x{layout.function_vram:X}",
             "catalogue_base": f"0x{layout.section_vram:X}",
             "linked_vram": (f"0x{selected['linked_vram'] + relative:X}"
                             if selected["linked_vram"] is not None else None),
@@ -140,6 +155,11 @@ def _entry_evidence(data: bytes, layout: Layout, function_offset: int | None = N
     reasons: list[str] = []
     start_off = layout.rom if function_offset is None else function_offset
     section_lo = start_off - (layout.function_vram - layout.section_vram)
+    if section_lo < 0:
+        return {"entry_status": "reject", "reason_codes": ["section_mapping_before_image"],
+                "confidence": 0.99, "incoming_edges": [], "call_target_evidence": [],
+                "predecessor_fallthrough": False, "saved_register_live_ins": [],
+                "saved_register_diagnostics": [], "saved_register_restores": []}
     section_hi = min(len(data), section_lo + layout.section_size)
     entry = layout.function_vram
     incoming = []
@@ -161,7 +181,17 @@ def _entry_evidence(data: bytes, layout: Layout, function_offset: int | None = N
         previous = mips.decode(int.from_bytes(data[start_off - 4:start_off], "big"), entry - 4)
         label_in_delay_slot = previous.hasDelaySlot()
     if start_off >= section_lo + 8:
-        control = mips.decode(int.from_bytes(data[start_off - 8:start_off - 4], "big"), entry - 8)
+        control_off = start_off - 8
+        # Alignment padding can follow a completed return. Walk over extra zero words,
+        # preserving the ordinary control+delay-slot interpretation otherwise.
+        if int.from_bytes(data[start_off - 4:start_off], "big") == 0:
+            cursor = start_off - 8
+            while cursor >= section_lo and int.from_bytes(data[cursor:cursor + 4], "big") == 0:
+                cursor -= 4
+            if cursor >= section_lo:
+                control_off = cursor
+        control = mips.decode(int.from_bytes(data[control_off:control_off + 4], "big"),
+                              entry - (start_off - control_off))
         # The immediately preceding word is this instruction's delay slot. Conditional
         # branches can still flow into the proposed entry; jumps and returns cannot.
         predecessor_fallthrough = not (control.hasDelaySlot() and
@@ -266,8 +296,9 @@ def from_inventory(row: dict) -> Layout:
 
 
 def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
-              strict_entry: bool = False) -> dict:
-    data = Path(path).read_bytes()
+              strict_entry: bool = False, data: bytes | None = None,
+              raw_data: bytes | None = None) -> dict:
+    data = Path(path).read_bytes() if data is None else data
     errors: list[str] = []
     warnings: list[str] = []
     section_end = layout.section_vram + layout.section_size
@@ -277,7 +308,7 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
     if layout.rom < layout.section_rom or layout.rom + layout.function_size > layout.section_rom + layout.section_size:
         errors.append("target ROM interval is outside its catalogue section")
     try:
-        mapping = resolve_image_map(path, layout)
+        mapping = resolve_image_map(path, layout, data, raw_data)
         selected = mapping["selected"]
         selected_authority, selected_offset, code = selected["authority"], selected["offset"], selected["code"]
         candidates = mapping["candidates"]
@@ -340,3 +371,32 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
             "returns": [f"0x{value:08X}" for value in returns],
             "boundary": "fall-through" if falls else "return-or-tail", "entry_preflight": entry,
             "delay_slot_ownership": delay, "warnings": warnings}
+
+
+def boundary_proposals(path: str | Path, layout: Layout, radius: int = 0x40,
+                       data: bytes | None = None) -> list[dict]:
+    """Suggest bounded aligned intervals with a plausible entry and owned terminator slot."""
+    image = Path(path).read_bytes() if data is None else data
+    try: mapping = resolve_image_map(path, layout, image)
+    except ValueError: return []
+    current = mapping["selected"]["offset"]; proposals = []
+    lower = max(0, current - radius); upper = min(len(image) - 8, current + layout.function_size + radius)
+    starts = []
+    for offset in range(lower - lower % 4, min(current + 1, upper), 4):
+        ins = mips.decode(int.from_bytes(image[offset:offset + 4], "big"),
+                          layout.function_vram + offset - current)
+        if (ins.getOpcodeName() in {"addiu", "daddiu"} and mips.reg(ins.rs) == 29 and mips.reg(ins.rt) == 29) or offset == current:
+            starts.append(offset)
+    for start in starts[-4:]:
+        body = list(mips.instructions(image[start:upper + 8], layout.function_vram + start - current))
+        for index, ins in enumerate(body[:-1]):
+            if ins.isJrRa() or ins.isJrNotRa() or (ins.isJumpWithAddress() and not ins.doesLink()):
+                end = start + (index + 2) * 4
+                if end <= upper + 8:
+                    proposals.append({"start": f"0x{layout.function_vram + start - current:08X}",
+                        "end": f"0x{layout.function_vram + end - current:08X}",
+                        "size": end - start, "evidence": ["aligned entry/prologue",
+                            "terminator plus owned delay slot", "bounded local CFG search"]})
+                break
+    unique = {(row["start"], row["end"]): row for row in proposals}
+    return sorted(unique.values(), key=lambda row: (abs(int(row["start"], 0) - layout.function_vram), row["size"]))[:8]

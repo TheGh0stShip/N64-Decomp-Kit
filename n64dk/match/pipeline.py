@@ -17,9 +17,13 @@ Pseudo flags understood in flag lists (manifest conventions):
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,6 +32,21 @@ from .toolchain import Config
 
 PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "ido5.3", "ido7.1", "sn", "as")
 TOOLCHAIN_OF = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}
+_CACHE_LOCK = threading.RLock()
+_CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
+_PIPELINE_STATS = {"compiler_seconds": 0.0, "assembler_seconds": 0.0,
+                   "object_conversion_seconds": 0.0, "tool_invocations": 0}
+
+
+def object_cache_stats() -> dict[str, int]:
+    with _CACHE_LOCK:
+        return dict(_CACHE_STATS)
+
+
+def pipeline_stats() -> dict:
+    with _CACHE_LOCK:
+        return {key: round(value, 6) if isinstance(value, float) else value
+                for key, value in _PIPELINE_STATS.items()}
 
 
 class BuildError(RuntimeError):
@@ -81,6 +100,7 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0):
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
+    started = time.monotonic()
     for _attempt in range(retries + 1):
         proc = subprocess.run([str(a) for a in argv], cwd=cwd, env=full_env, input=stdin,
                               capture_output=True, text=True)
@@ -89,6 +109,12 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0):
             break
     if proc.returncode:
         raise BuildError(f"{Path(str(argv[0])).name} failed: {(proc.stderr or proc.stdout).strip()[-600:]}")
+    executable = Path(str(argv[0])).name.lower()
+    bucket = ("assembler_seconds" if executable in {"as", "asn64.exe"} or executable.endswith("-as") else
+              "object_conversion_seconds" if "obj-parser" in executable else "compiler_seconds")
+    with _CACHE_LOCK:
+        _PIPELINE_STATS[bucket] += time.monotonic() - started
+        _PIPELINE_STATS["tool_invocations"] += 1
     return proc
 
 
@@ -96,6 +122,34 @@ def _as_flags(flags: list[str]) -> list[str]:
     # The assembler always runs at -G0: small-data placement is decided by the compiler's -G
     # (assembler -G would turn absolute %hi/%lo accesses into $gp-relative ones).
     return ["-mips3", "-G0"]
+
+
+def _include_closure_digest(paths: tuple[str, ...]) -> str:
+    digest = hashlib.sha256()
+    for value in paths:
+        root = Path(value)
+        if not root.is_dir(): continue
+        digest.update(str(root).encode())
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix.lower() in {".h", ".inc", ".def", ".c"}:
+                stat = path.stat()
+                digest.update(str(path.relative_to(root)).encode())
+                digest.update(str(stat.st_mtime_ns).encode()); digest.update(str(stat.st_size).encode())
+                digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _compiler_digest(cfg: Config, pipeline: str) -> str:
+    key = TOOLCHAIN_OF.get(pipeline, "kmc"); root = cfg.toolchain(key); digest = hashlib.sha256()
+    if root:
+        from .toolchain import PROFILES
+        for name in PROFILES[key].required:
+            path = root / name
+            if path.is_file(): digest.update(path.read_bytes())
+    if pipeline == "kmc+asn64":
+        gas = cfg.gnu_as()
+        if gas and Path(gas[0]).is_file(): digest.update(Path(gas[0]).read_bytes())
+    return digest.hexdigest()
 
 
 def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
@@ -112,6 +166,43 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
     stem = unit_dir / source.stem
     obj = Path(f"{stem}.o")
     pipe = spec.pipeline
+    include_roots = [Path(value).resolve() for value in (includes if includes is not None else cfg.include)]
+    for index, flag in enumerate(spec.flags):
+        value = flag[2:] if flag.startswith("-I") and len(flag) > 2 else (
+            spec.flags[index + 1] if flag == "-I" and index + 1 < len(spec.flags) else None)
+        if value:
+            path = Path(value); include_roots.append((cfg.project / path).resolve() if not path.is_absolute() else path)
+    include_roots.append(source.parent)
+    include_paths = tuple(str(value) for value in include_roots)
+    normalizer_digest = None
+    if cfg.normalizer and Path(cfg.normalizer).is_file():
+        normalizer_digest = hashlib.sha256(Path(cfg.normalizer).read_bytes()).hexdigest()
+    pipeline_code = hashlib.sha256(Path(__file__).read_bytes() +
+        Path(asn64.__file__).read_bytes() + Path(normalize.__file__).read_bytes()).hexdigest()
+    identity = json.dumps({"source": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "pipeline": pipe, "flags": spec.flags, "normalizer": spec.normalizer_args,
+        "section_bases": spec.section_bases, "defines": defines or [],
+        "includes": _include_closure_digest(include_paths), "compiler": _compiler_digest(cfg, pipe),
+        "normalizer_hook": normalizer_digest, "pipeline_code": pipeline_code},
+        sort_keys=True)
+    cache_key = hashlib.sha256(identity.encode()).hexdigest()
+    cache = cfg.project / ".n64dk" / "object-cache" / cache_key[:2] / f"{cache_key}.o"
+    with _CACHE_LOCK:
+        if cache.is_file():
+            _CACHE_STATS["hits"] += 1
+            shutil.copy2(cache, obj)
+            return obj
+        _CACHE_STATS["misses"] += 1
+
+    def retain() -> Path:
+        with _CACHE_LOCK:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            if not cache.is_file():
+                temporary = cache.with_name(f".{cache.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                shutil.copy2(obj, temporary)
+                os.replace(temporary, cache)
+                _CACHE_STATS["stores"] += 1
+        return obj
     if pipe.startswith("kmc"):
         kmc = cfg.toolchain("kmc")
         if kmc is None:
@@ -135,7 +226,7 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
             text = asn64.convert(raw.read_text(errors="replace"), disabled, enabled,
                                  spec.section_bases)
             _run([gas[0], *asn64.GNU_AS_FLAGS, "-", "-o", obj], cwd, env=gas[1], stdin=text)
-            return obj
+            return retain()
         asm = raw
         if pipe == "kmc+hook":
             if not cfg.normalizer:
@@ -146,13 +237,13 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
             asm = Path(f"{stem}.s")
             asm.write_text(normalize.builtin(raw.read_text(errors="replace")))
         _run([kmc / "as", *_as_flags(spec.flags), "-o", obj, asm], cwd)
-        return obj
+        return retain()
     if pipe == "as":
         kmc = cfg.toolchain("kmc")
         if kmc is None:
             raise BuildError("KMC GNU as not found")
         _run([kmc / "as", *_as_flags(spec.flags), *inc, "-o", obj, source], cwd)
-        return obj
+        return retain()
     if pipe in ("ido5.3", "ido7.1"):
         ido = cfg.toolchain(TOOLCHAIN_OF[pipe])
         if ido is None:
@@ -163,7 +254,7 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
                  else f for f in spec.flags]
         _run([ido / "cc", "-c", *flags, *inc, "-o", obj, source], unit_dir,
              env={"TMPDIR": str(unit_dir)}, retries=4)
-        return obj
+        return retain()
     if pipe == "sn":
         sn = cfg.toolchain("sn")
         if sn is None:
@@ -173,7 +264,7 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
         _run([sn / "wibo", sn / "cc1n64.exe", "-quiet", *spec.flags, pre, "-o", asm], cwd)
         _run([sn / "wibo", sn / "asn64.exe", "-o", psyq, asm], cwd)
         _run([sn / "psyq-obj-parser", psyq, "-b", "-n", "-o", obj], cwd)
-        return obj
+        return retain()
     raise BuildError(f"unknown pipeline {pipe!r}")
 
 

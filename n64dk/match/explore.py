@@ -9,8 +9,8 @@ import re
 from .hypotheses import suggest
 from .provenance import Verdict, scan_c
 from .session import MatchSession, SessionCandidate, SessionStore, frontier, residual_delta
-from .typed_explore import (lifetime_graph, lifetime_variants, narrowing_variants,
-                            prototype_variants, residual_offsets, source_shape)
+from .typed_explore import (call_chain_variants, lifetime_graph, lifetime_variants,
+                            narrowing_variants, prototype_variants, residual_offsets, source_shape)
 
 
 _DECL = re.compile(r"(?m)^(\s*)(s8|u8|s16|u16|s32|u32|int|unsigned int|float|double)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);$")
@@ -53,9 +53,14 @@ def variants(source: str, counts: dict[str, int], limit: int) -> list[dict]:
 
 
 def _signature(session_id: str, parent: SessionCandidate, family: str, candidates: list[dict]) -> str:
-    value = {"session": session_id, "parent_source": parent.source_digest,
-             "pipeline": parent.pipeline, "flags": parent.flags, "family": family,
-             "variants": sorted(hashlib.sha256(item["source"].encode()).hexdigest() for item in candidates)}
+    def opcode(value):
+        parts = str(value or "").split(None, 1)
+        return parts[0] if parts else "missing"
+    value = {"pipeline": parent.pipeline, "flags": parent.flags, "family": family,
+             "residual": parent.counts,
+             "transitions": [(row.get("kind"), opcode(row.get("compiled")), opcode(row.get("retail")))
+                             for row in parent.outcome.get("diff", {}).get("entries", [])],
+             "source_shapes": sorted(source_shape(item["source"]) for item in candidates)}
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -93,6 +98,9 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
             source = store.cache.get(parent.source_digest).decode()
             generated = variants(source, parent.counts, remaining) if "spelling" in dimensions else []
             graph = lifetime_graph(parent.outcome, context)
+            ownership = graph.get("call_result_ownership", {})
+            if "lifetime" in dimensions and ownership.get("transfers"):
+                generated = call_chain_variants(source, ownership, remaining) + generated
             if "lifetime" in dimensions and (parent.counts.get("register") or parent.counts.get("scheduling")):
                 generated += lifetime_variants(source, graph, remaining - len(generated))
             if "narrowing" in dimensions and parent.counts.get("instruction"):
@@ -118,7 +126,7 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
                 by_family["optimization-pressure"] = []
             for family, items in by_family.items():
                 signature = _signature(session_id, parent, family, items)
-                if store.experiment_seen(session_id, signature):
+                if store.experiment_seen_global(signature):
                     continue
                 proposal = {"parent": parent.candidate_id,
                             "hypothesis": f"residual-guided {family}",
@@ -210,6 +218,11 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
             "target_window": ({"start": target_window[0], "end": target_window[1],
                                "rejected": window_rejected} if target_window else None),
             "dimensions": sorted(dimensions),
+            "routing": {"observed": {"register_only": bool(best.counts.get("register") and
+                not best.counts.get("instruction")), "call_barrier": lifetime_graph(best.outcome, context)["call_barrier"],
+                "signed_narrowing": lifetime_graph(best.outcome, context)["signed_narrowing"]},
+                "priority": ["call-result ownership", "prototype", "carrier lifetime",
+                             "declaration scope", "translation-unit context"]},
             "next_discriminators": list(dict.fromkeys(next_steps)),
             "frontier": [item.summary(False) for item in frontier(store.candidates(session_id))],
             "family_reports": family_reports, "round_reports": round_reports}

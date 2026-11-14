@@ -142,8 +142,79 @@ def lifetime_graph(outcome: dict, context: dict | None = None) -> dict:
         constraints.append("narrow after ownership transfer and materialize a distinct value")
     if re.search(r"\bbnez?\b|\bbeqz?\b", instructions): constraints.append("narrowed value controls a branch")
     if re.search(r"\b(?:addu|ori)\s+\$v0,\s*\$zero", instructions): constraints.append("function result is independent")
+    ownership = call_result_ownership(outcome, context)
+    constraints += [item for item in ownership.get("constraints", []) if item not in constraints]
     return {"nodes": nodes, "constraints": constraints,
-            "call_barrier": "jal" in instructions, "signed_narrowing": "sra" in instructions}
+            "call_barrier": "jal" in instructions, "signed_narrowing": "sra" in instructions,
+            "call_result_ownership": ownership}
+
+
+def _target_disassembly(outcome: dict, context: dict | None) -> list[str]:
+    if context and context.get("rom") and context.get("addr") is not None:
+        path = Path(context["rom"]); offset = int(context["addr"]) - int(context.get("vram_delta", 0))
+        if path.is_file() and 0 <= offset <= path.stat().st_size - int(context.get("size", 0)):
+            data = path.read_bytes()[offset:offset + int(context["size"])]
+            return [ins.disassemble() for ins in mips.instructions(data, int(context["addr"]))]
+    return [str(row.get("retail") or "") for row in outcome.get("diff", {}).get("entries", [])]
+
+
+def call_result_ownership(outcome: dict, context: dict | None = None) -> dict:
+    """Track call results captured in a following call's delay slot."""
+    lines = _target_disassembly(outcome, context); calls = []; last_call = None; transfers = []
+    for index, line in enumerate(lines):
+        found = re.search(r"\bjal\s+([^\s,]+)", line)
+        if not found: continue
+        callee = found.group(1); delay = lines[index + 1] if index + 1 < len(lines) else ""
+        capture = re.search(r"\b(?:move|addu|or)\s+\$(s[0-7]|fp)\s*,\s*\$v0(?:\s*,\s*\$zero)?", delay)
+        item = {"callee": callee, "instruction_index": index, "delay_slot": delay,
+                "arguments_observed": sorted(set(re.findall(r"\$a([0-3])", "\n".join(lines[max(0,index-4):index+1])))),
+                "return_consumed": False}
+        if capture and last_call is not None:
+            carrier = "$" + capture.group(1); last_call["return_consumed"] = True
+            transfer = {"producer": last_call["callee"], "carrier": carrier,
+                        "crossed_call": callee, "capture_site": delay,
+                        "later_call_return": "overwritten-or-unused"}
+            for later in lines[index + 2:]:
+                if carrier in later and re.search(r"\b(?:sll|sra|beq|bne|move|addu|or)\b", later):
+                    transfer.setdefault("consumers", []).append(later)
+            transfers.append(transfer)
+        calls.append(item); last_call = item
+    constraints = []
+    proposals = []
+    for transfer in transfers:
+        constraints.append(f"result of {transfer['producer']} is preserved across {transfer['crossed_call']}")
+        proposals += ["split nested calls", f"treat {transfer['crossed_call']} as a side-effect-only call",
+                      f"store {transfer['producer']} result in a named carrier"]
+    return {"calls": calls, "transfers": transfers, "constraints": constraints,
+            "semantic_rewrites": list(dict.fromkeys(proposals)),
+            "confidence": 0.98 if transfers else 0.35}
+
+
+def call_chain_variants(source: str, ownership: dict, budget: int = 24) -> list[dict]:
+    """Decompose only nested calls supported by target def-use evidence."""
+    if not ownership.get("transfers"): return []
+    result = []
+    pattern = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\s*=\s*(func_[0-9A-Fa-f]{8})\s*\(\s*"
+                         r"(func_[0-9A-Fa-f]{8})\s*\(([^;]*)\)\s*\)\s*;")
+    for index, found in enumerate(pattern.finditer(source)):
+        indent, carrier, outer, inner, arguments = found.groups()
+        evidence = next((item for item in ownership["transfers"]
+                         if inner in item["producer"] and outer in item["crossed_call"]), None)
+        if evidence is None: continue
+        forms = {
+            "preserve-inner-ignore-outer": (f"{indent}{carrier} = {inner}({arguments});\n"
+                                             f"{indent}{outer}();"),
+            "preserve-inner-pass-outer": (f"{indent}{carrier} = {inner}({arguments});\n"
+                                           f"{indent}{outer}({carrier});"),
+            "separate-outer-result": (f"{indent}{carrier} = {inner}({arguments});\n"
+                                      f"{indent}{{ s32 outer_result = {outer}({carrier}); (void)outer_result; }}"),
+        }
+        for label, replacement in forms.items():
+            result.append({"label": f"{label}-{index + 1}", "family": "call-result-ownership",
+                           "source": source[:found.start()] + replacement + source[found.end():],
+                           "evidence": evidence})
+            if len(result) >= budget: return result
+    return result
 
 
 def lifetime_variants(source: str, graph: dict, budget: int = 48) -> list[dict]:

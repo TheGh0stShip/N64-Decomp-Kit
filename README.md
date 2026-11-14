@@ -102,6 +102,9 @@ export, and proof boundaries.
 | `context-bundle --project DIR --image IMAGE --function NAME` | Collect target code, callers, callees, globals and access patterns |
 | `quickwin-sweep --project DIR --all-images --limit N --jobs N` | Create/resume a persistent ranked cross-function tranche |
 | `quickwin-sweep-status ID [--status active]` | Filter tranche rows and inspect current versus historical best results |
+| `tranche-run --project DIR --all-images --limit N --jobs N` | Run cached preflight, per-function recipes, durable matching, bounded exploration and winner queuing |
+| `source-scaffold FUNCTION --image FILE` | Emit compilable ordinary C and a separate evidence receipt for a source-less interval |
+| `structure-layout-infer` / `prototype-solve` / `tu-reconstruct` | Aggregate shared types, solve ABI declarations and prepare whole-unit reconstruction |
 | `match-session-explore ID --rounds N --jobs N` | Run bounded residual-guided source experiments over the frontier |
 | `match-session-explain ID --from A --to B` | Explain residual and source changes between two candidates |
 | `investigate FUNCTION --image IMAGE --all` | Build one verified dossier from layout, code, source, recipes, history and corpus evidence |

@@ -40,6 +40,7 @@ functions = [
             candidate.parent.mkdir()
             candidate.write_text("int remaining(void) { return 0; }\n")
             result = inventory.build(root)
+            self.assertTrue(any(row["source"] == "aggregate_owned_c" for row in result["reconciliation"]))
             rows = {row["name"]: row for row in result["functions"]}
             self.assertEqual(rows["first"]["state"], "covered")
             self.assertEqual(rows["second"]["state"], "covered")
@@ -112,7 +113,7 @@ functions = [
             report = preflight(path, layout, strict_entry=True)
             self.assertEqual(report["entry_preflight"]["entry_status"], "accept")
 
-    def test_canonical_raw_and_composite_offsets(self):
+    def test_raw_offset_is_canonical_and_unanchored_composite_fails_closed(self):
         with tempfile.TemporaryDirectory() as name:
             layout = Layout("overlay2", 0x1000, 0x8008B8E0, 0x40000, 0x800AEF84, 12)
             code = struct.pack(">III", 0x24020001, 0x03E00008, 0)
@@ -122,9 +123,8 @@ functions = [
             composite[composite_offset:composite_offset + 12] = code
             composite_path = Path(name) / "composite.bin"; composite_path.write_bytes(composite)
             self.assertEqual(preflight(raw_path, layout)["selected_image_mapping"], "raw-overlay")
-            report = preflight(composite_path, layout)
-            self.assertEqual(report["selected_image_mapping"], "catalogue-vram-composite")
-            self.assertEqual(report["mapping"]["composite_rom"], "0xAFB84")
+            with self.assertRaisesRegex(ValueError, "ambiguous composite image mapping"):
+                preflight(composite_path, layout)
 
     def test_composite_payload_anchor_overrides_catalogue_vram_guess(self):
         with tempfile.TemporaryDirectory() as name:
