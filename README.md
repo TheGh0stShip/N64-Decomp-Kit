@@ -20,6 +20,9 @@ manifests, sources); nothing is hard-coded to one game.
   compare it relocated against the ROM with classified diffs, sweep pipelines and flags,
   re-verify whole manifests, diagnose the residual mechanism, explain GCC 2.7.x allocator
   dumps, enforce provenance, and use permutation only for the appropriate residual stage.
+* **Autonomous tranches**: build interval-correct progress inventories, rank complete remaining
+  functions, collect one-call context bundles, and distribute persistent matching sessions
+  across functions while stopping exact winners independently.
 * **Survey**: one command that runs everything and classifies every ROM byte in one interval
   ledger.
 
@@ -95,6 +98,10 @@ export, and proof boundaries.
 | `match-session-try SESSION_ID` | Apply in-memory edits and compile a batch of source/flag variants |
 | `match-session-status SESSION_ID` | Show the best result and nondominated residual frontier |
 | `match-session-export SESSION_ID OUTPUT` | Export a retained candidate only when explicitly requested |
+| `match-inventory --project DIR` | Reconcile catalogues and manifest intervals, including aggregate translation units |
+| `context-bundle --project DIR --image IMAGE --function NAME` | Collect target code, callers, callees, globals and access patterns |
+| `quickwin-sweep --project DIR --all-images --limit N --jobs N` | Create/resume a persistent ranked cross-function tranche |
+| `match-session-prepare-winner SESSION_ID DIR` | Independently recompile an exact winner and prepare an auditable export queue |
 | `match-job-run PROJECT.toml --unit UNIT` | Create or resume a bounded, persistent candidate/compile/diagnose search job |
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |
 | `match-job-export JOB_ID OUTPUT` | Export a candidate and non-proof-grade evidence without editing project source |
@@ -131,6 +138,8 @@ report = survey.run(rom)["report"]
 * [docs/matching.md](docs/matching.md): toolchains, pipelines and matching
 * [docs/autonomous-matching.md](docs/autonomous-matching.md): persistent matching jobs,
   usage, evidence, verification boundary and limitations
+* [docs/autonomous-tranches.md](docs/autonomous-tranches.md): interval inventories, context
+  bundles, cross-function scheduling, compact session output and exact-winner preparation
 * [docs/AUTOMATION_HANDOFF.md](docs/AUTOMATION_HANDOFF.md): operating and reporting
   instructions for automated matching workers
 * [docs/BRIEF.md](docs/BRIEF.md): rules for adding an analysis module

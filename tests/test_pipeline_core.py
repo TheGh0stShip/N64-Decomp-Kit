@@ -560,7 +560,7 @@ class MatchSessionTests(unittest.TestCase):
             calls.append((text, pipeline, flags, label))
             if "return 2" not in text:
                 return self.FakeOutcome(8, {"register": 4, "scheduling": 2})
-            if "-fno-cse" in flags:
+            if "-fno-gcse" in flags:
                 return self.FakeOutcome(3, {"register": 3})
             return self.FakeOutcome(5, {"register": 1, "scheduling": 2})
 
@@ -574,7 +574,7 @@ class MatchSessionTests(unittest.TestCase):
                 result = session.try_proposal(session_id, {
                     "hypothesis": "change the expression and test CSE pressure",
                     "edits": [{"old": "return 1", "new": "return 2"}],
-                    "flag_variants": [[], ["-fno-cse"]],
+                    "flag_variants": [[], ["-fno-gcse"]],
                 }, jobs=2)
                 self.assertEqual(result["attempts"], 3)
                 self.assertEqual(result["best"]["score"], 3)
@@ -589,10 +589,17 @@ class MatchSessionTests(unittest.TestCase):
                     "parent": baseline.candidate_id,
                     "hypothesis": "repeat should reuse retained observations",
                     "edits": [{"old": "return 1", "new": "return 2"}],
-                    "flag_variants": [[], ["-fno-cse"]],
+                    "flag_variants": [[], ["-fno-gcse"]],
                 }, jobs=2)
                 self.assertEqual(repeated["attempts"], 3)
                 self.assertTrue(all(row["cache_hit"] for row in repeated["results"]))
+                self.assertEqual(len(calls), 3)
+
+                rejected = session.try_proposal(session_id, {
+                    "hypothesis": "unsupported flags should be rejected before compilation",
+                    "flag_variants": [["-fno-cse"], ["-fno-cse2"]],
+                }, jobs=2)
+                self.assertEqual(len(rejected["rejected"]), 2)
                 self.assertEqual(len(calls), 3)
             finally:
                 store.close()

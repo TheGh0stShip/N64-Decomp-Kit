@@ -110,6 +110,7 @@ n64dk match-session-start SRC --rom ROM --addr VRAM [--size N] [--pipeline P] [-
 n64dk match-session-try SESSION_ID [--proposal JSON_OR_FILE] [--jobs N]
 n64dk match-session-status SESSION_ID [--candidates]
 n64dk match-session-export SESSION_ID OUTPUT [--candidate-id ID]
+n64dk match-session-prepare-winner SESSION_ID OUTPUT_DIR [--candidate-id ID]
 ```
 
 ## Transactional matching sessions
@@ -122,6 +123,12 @@ n64dk --format json match-session-start .tmp/func_800BD998_candidate.c \
   --rom baserom.z64 --addr 800BD998 --size 84 \
   --pipeline kmc+as --flags '-O2 -G0 -mips2 -Wa,-r4300_mul -Iinclude'
 ```
+
+Use `-` as the source to start directly from stdin; `--source-name` selects its logical
+suffix. Session start, try, and status support `--summary-only`, `--best-only`,
+`--best-details`, `--candidate ID`, and `--exact-only`. Known unsupported compiler flags are
+rejected before worker allocation and failed option probes are retained by compiler family.
+Residual reports include bounded, evidence-triggered source-form suggestions.
 
 The returned session ID retains the baseline source, score, target configuration and every
 subsequent candidate. A single proposal can change source and fan out compiler flags without
@@ -139,8 +146,6 @@ n64dk --format json match-session-try SESSION_ID --jobs 4 --proposal - <<'JSON'
   ],
   "flag_variants": [
     [],
-    ["-fno-cse"],
-    ["-fno-cse", "-fno-cse2"],
     ["-fno-gcse"],
     ["-fno-expensive-optimizations"]
   ]
@@ -172,6 +177,8 @@ n64dk match-session-export SESSION_ID .tmp/best.c
 
 Session state defaults to `.n64dk/match-sessions`, which is ignored by Git. Source candidates
 remain content-addressed there and are never written into the project tree during evaluation.
+`match-session-prepare-winner` accepts only an exact candidate, recompiles it independently,
+and writes source, a proof receipt, and an exact-winner queue row without editing the project.
 
 All accept `--format json`. Manifests: source rows `ROM_START SIZE SOURCE FLAGS [SHA256]`
 (pipeline from the header comment: IDO / SN / KMC) or unit rows `UNIT VRAM SIZE [STATUS]`

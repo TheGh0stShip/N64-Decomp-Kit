@@ -208,7 +208,9 @@ def _session_evaluator(context: dict):
 
 
 def _session_start_args(p):
-    p.add_argument("source", help="baseline C or assembly source file")
+    p.add_argument("source", help="baseline C/assembly source file, or - for stdin")
+    p.add_argument("--source-name", default="stdin.c",
+                   help="logical filename when source is stdin (default: stdin.c)")
     _common(p, rom_required=True)
     p.add_argument("--addr", type=lambda value: int(value, 16),
                    help="VRAM of the unit's .text (hex)")
@@ -218,25 +220,60 @@ def _session_start_args(p):
     p.add_argument("--no-infer", action="store_true")
     p.add_argument("--state-root", default=".n64dk/match-sessions")
     p.add_argument("--details", action="store_true", help="include the full instruction diff")
+    _session_output_args(p)
+
+
+def _session_output_args(p):
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--summary-only", action="store_true", help="omit candidate collections")
+    group.add_argument("--best-only", action="store_true", help="return only the best candidate")
+    group.add_argument("--best-details", action="store_true", help="return only the best candidate with its outcome")
+    group.add_argument("--candidate", help="return one candidate ID with full details")
+    group.add_argument("--exact-only", action="store_true", help="return exact candidates only")
+
+
+def _project_session_output(value: dict, args, store: SessionStore | None = None) -> dict:
+    if getattr(args, "best_only", False) or getattr(args, "best_details", False):
+        return {"session_id": value["session_id"], "best": value.get("best") or value.get("baseline")}
+    candidate_id = getattr(args, "candidate", None)
+    if candidate_id:
+        if store is None:
+            raise ValueError("candidate selection is unavailable")
+        candidate = store.get(value["session_id"], candidate_id)
+        if candidate is None:
+            raise ValueError(f"unknown candidate {candidate_id}")
+        return {"session_id": value["session_id"], "candidate": candidate.summary(True)}
+    if getattr(args, "summary_only", False):
+        return {key: item for key, item in value.items()
+                if key not in {"frontier", "results", "candidates", "context"}}
+    if getattr(args, "exact_only", False):
+        result = dict(value)
+        for key in ("frontier", "results", "candidates"):
+            if key in result:
+                result[key] = [row for row in result[key] if row.get("exact")]
+        return result
+    return value
 
 
 @command("match-session-start", "Start a persistent standalone matching session")
 def match_session_start(args):
     cfg, target, syms, sym_files = _setup(args)
-    source = Path(args.source).resolve()
+    source = Path(args.source).resolve() if args.source != "-" else Path(args.source_name)
+    source_bytes = source.read_bytes() if args.source != "-" else sys.stdin.buffer.read()
     spec = _spec(args, cfg)
     context = _session_context(args, cfg, target, sym_files, source, spec)
     store = SessionStore(args.state_root)
     try:
         session = MatchSession(store, _session_evaluator(context))
-        session_id, baseline = session.create(context, source.read_bytes(),
+        session_id, baseline = session.create(context, source_bytes,
                                               spec.pipeline, tuple(spec.flags))
-        return {
+        result = {
             "session_id": session_id,
             "state_root": str(Path(args.state_root).resolve()),
-            "baseline": baseline.summary(args.details),
-            "frontier": [baseline.summary(args.details)] if baseline.status == "evaluated" else [],
+            "baseline": baseline.summary(args.details or args.best_details),
+            "frontier": [baseline.summary(args.details or args.best_details)] if baseline.status == "evaluated" else [],
         }
+        return _project_session_output(result, args, store)
     finally:
         store.close()
 
@@ -259,6 +296,7 @@ def _session_try_args(p):
                    help="JSON object, JSON file, or - for stdin (default)")
     p.add_argument("--jobs", type=int, default=4)
     p.add_argument("--details", action="store_true", help="include full outcome and diff entries")
+    _session_output_args(p)
 
 
 @command("match-session-try", "Apply in-memory edits and evaluate source/flag variants as one transaction")
@@ -267,8 +305,9 @@ def match_session_try(args):
     try:
         context = store.context(args.session_id)
         session = MatchSession(store, _session_evaluator(context))
-        return session.try_proposal(args.session_id, _read_proposal(args.proposal),
-                                    args.jobs, args.details)
+        value = session.try_proposal(args.session_id, _read_proposal(args.proposal),
+                                     args.jobs, args.details or args.best_details)
+        return _project_session_output(value, args, store)
     finally:
         store.close()
 
@@ -281,6 +320,7 @@ def _session_status_args(p):
     p.add_argument("--state-root", default=".n64dk/match-sessions")
     p.add_argument("--candidates", action="store_true")
     p.add_argument("--details", action="store_true", help="include full outcome and diff entries")
+    _session_output_args(p)
 
 
 @command("match-session-status", "Inspect a standalone matching session and its residual frontier")
@@ -288,7 +328,9 @@ def match_session_status(args):
     store = SessionStore(args.state_root)
     try:
         session = MatchSession(store, lambda *_args: None)
-        return session.status(args.session_id, args.candidates, args.details)
+        value = session.status(args.session_id, args.candidates or args.exact_only,
+                               args.details or args.best_details)
+        return _project_session_output(value, args, store)
     finally:
         store.close()
 
@@ -323,6 +365,58 @@ def match_session_export(args):
 
 
 match_session_export.arguments = _session_export_args
+
+
+def _winner_prepare_args(p):
+    p.add_argument("session_id")
+    p.add_argument("output_dir")
+    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--candidate-id", help="default: exact best candidate")
+
+
+@command("match-session-prepare-winner", "Independently recompile an exact candidate and prepare an integration transaction")
+def match_session_prepare_winner(args):
+    store = SessionStore(args.state_root)
+    try:
+        candidate = (store.get(args.session_id, args.candidate_id)
+                     if args.candidate_id else store.best(args.session_id))
+        if candidate is None or not candidate.exact:
+            raise ValueError("integration preparation requires an exact retained candidate")
+        context = store.context(args.session_id)
+        source = store.cache.get(candidate.source_digest)
+        verified = _session_evaluator(context)(source, candidate.pipeline, candidate.flags,
+                                               "independent-winner-verification")
+        if not verified.exact:
+            raise RuntimeError("independent recompilation did not reproduce the exact match")
+        root = Path(args.output_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        source_path = root / context.get("source_name", "winner.c")
+        source_path.write_bytes(source)
+        receipt = {
+            "proof": "independent exact recompilation",
+            "session_id": args.session_id,
+            "candidate_id": candidate.candidate_id,
+            "source_sha256": candidate.source_digest,
+            "pipeline": candidate.pipeline,
+            "flags": list(candidate.flags),
+            "target": {key: context.get(key) for key in
+                       ("rom_sha256", "vram_delta", "addr", "size", "inventory_id", "inventory_image")},
+            "outcome": verified.as_dict(),
+            "project_edits_applied": False,
+        }
+        evidence = root / "winner.evidence.json"
+        evidence.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        queue = root / "exact-winner.jsonl"
+        queue.write_text(json.dumps({key: receipt[key] for key in
+                                    ("session_id", "candidate_id", "source_sha256", "pipeline", "flags")},
+                                    sort_keys=True) + "\n")
+        return {"source": str(source_path), "evidence": str(evidence), "export_queue": str(queue),
+                "exact": True, "project_edits_applied": False}
+    finally:
+        store.close()
+
+
+match_session_prepare_winner.arguments = _winner_prepare_args
 
 
 def _batch_args(p):

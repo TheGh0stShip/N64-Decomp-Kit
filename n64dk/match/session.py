@@ -20,6 +20,7 @@ from typing import Callable
 
 from .cache import ContentCache
 from .engine import Outcome
+from .hypotheses import suggest
 
 
 def _canonical(value) -> str:
@@ -96,6 +97,14 @@ class SessionStore:
             );
             CREATE INDEX IF NOT EXISTS session_candidates_rank
                 ON session_candidates(session_id, exact DESC, score, created_ns);
+            CREATE TABLE IF NOT EXISTS flag_capabilities (
+                pipeline_family TEXT NOT NULL,
+                flag TEXT NOT NULL,
+                supported INTEGER NOT NULL,
+                evidence TEXT NOT NULL,
+                updated_ns INTEGER NOT NULL,
+                PRIMARY KEY (pipeline_family, flag)
+            );
         """)
         self.db.commit()
 
@@ -169,6 +178,27 @@ class SessionStore:
         return min(rows, key=lambda row: (not row.exact,
                                           row.score if row.score is not None else 2**63,
                                           row.created_ns))
+
+    @staticmethod
+    def _family(pipeline: str) -> str:
+        return pipeline.split("+", 1)[0]
+
+    def flag_supported(self, pipeline: str, flag: str) -> bool | None:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT supported FROM flag_capabilities WHERE pipeline_family = ? AND flag = ?",
+                (self._family(pipeline), flag)).fetchone()
+        return bool(row[0]) if row else None
+
+    def record_flag(self, pipeline: str, flag: str, supported: bool, evidence: str) -> None:
+        with self._lock:
+            self.db.execute("""
+                INSERT INTO flag_capabilities VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(pipeline_family, flag) DO UPDATE SET
+                    supported=excluded.supported, evidence=excluded.evidence,
+                    updated_ns=excluded.updated_ns
+            """, (self._family(pipeline), flag, int(supported), evidence[-2000:], time.time_ns()))
+            self.db.commit()
 
 
 def _flags(value) -> tuple[str, ...]:
@@ -296,6 +326,12 @@ class MatchSession:
             status, error = "evaluated", outcome.error
             if outcome.error and outcome.result is None:
                 status = "failed"
+                lowered = outcome.error.lower()
+                if "invalid option" in lowered or "unrecognized option" in lowered \
+                        or "unknown option" in lowered:
+                    for flag in flags:
+                        if flag.startswith("-"):
+                            self.store.record_flag(pipeline, flag, False, outcome.error)
             return SessionCandidate(candidate_id, parent_id, source_digest, label,
                                     hypothesis, pipeline, flags, status, outcome.exact,
                                     score, counts, payload, error, time.time_ns())
@@ -367,6 +403,25 @@ class MatchSession:
             unique_work.setdefault((hashlib.sha256(source).hexdigest(), pipeline, flags), item)
         work = list(unique_work.values())
 
+        # Reject previously disproved compiler flags before allocating a worker.  Two options
+        # frequently proposed for KMC GCC are known absent and seed the cache immediately.
+        known_absent = {"kmc": {"-fno-cse", "-fno-cse2"}}
+        rejected = []
+        supported_work = []
+        for item in work:
+            source, label, pipeline, flags = item
+            bad = [flag for flag in flags if (flag in known_absent.get(pipeline.split("+", 1)[0], set())
+                   or self.store.flag_supported(pipeline, flag) is False)]
+            if bad:
+                rejected.append({"label": label, "pipeline": pipeline, "flags": list(flags),
+                                 "status": "unsupported", "unsupported_flags": bad,
+                                 "reason": "compiler capability preflight"})
+                for flag in bad:
+                    self.store.record_flag(pipeline, flag, False, "compiler capability preflight")
+            else:
+                supported_work.append(item)
+        work = supported_work
+
         def evaluate(item):
             source, label, pipeline, flags = item
             return self._evaluate(session_id, parent.candidate_id, source, label,
@@ -389,16 +444,19 @@ class MatchSession:
             retained = by_id.get(candidate.candidate_id, candidate)
             results.append({**retained.summary(details),
                             "delta": residual_delta(parent, retained),
+                            "suggestions": suggest(retained.counts),
                             "cache_hit": retained.candidate_id not in inserted})
         current_frontier = frontier(rows)
         return {
             "session_id": session_id,
             "parent": parent.summary(details),
             "results": results,
+            "rejected": rejected,
             "best": self.store.best(session_id).summary(details),
             "frontier": [row.summary(details) for row in current_frontier],
             "attempts": len(rows),
         }
+        result["suggestions"] = suggest(self.store.best(session_id).counts)
 
     def status(self, session_id: str, include_candidates: bool = False,
                details: bool = False) -> dict:
