@@ -33,6 +33,7 @@ and Mario Kart 64 (NKTE), located through `n64dk.fixtures` (roms.toml / N64DK_RO
 | `n64dk.match.gcc27dump` | diagnostic-only GCC 2.7.x allocator dump explainer |
 | `n64dk.match.experiments` | append-only causal experiment ledger |
 | `n64dk.match.jobs` | persistent candidate lineage, bounded generation, beam search, resume and export |
+| `n64dk.match.session` | transactional standalone edits, batched flag/source trials and residual frontier |
 | `n64dk.match.provenance` | genuine-C and positive handwritten-assembly credit policy |
 | `n64dk.research` | source/finding quality audit before research is automated |
 | `n64dk.commands.*` | CLI subcommands (one module per area), registered with `@command` |

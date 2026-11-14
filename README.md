@@ -91,6 +91,10 @@ export, and proof boundaries.
 | `match SRC --rom ROM [--addr VRAM] [--sweep]` | Build one source and compare it relocated against the ROM; sweep pipelines and flags |
 | `match-batch MANIFEST... --project DIR` | Rebuild and verify every unit of matching manifests in parallel |
 | `match-permute SRC --rom ROM --addr VRAM` | Permutation search scored by the relocated diff |
+| `match-session-start SRC --rom ROM ...` | Start a persistent standalone source-matching session |
+| `match-session-try SESSION_ID` | Apply in-memory edits and compile a batch of source/flag variants |
+| `match-session-status SESSION_ID` | Show the best result and nondominated residual frontier |
+| `match-session-export SESSION_ID OUTPUT` | Export a retained candidate only when explicitly requested |
 | `match-job-run PROJECT.toml --unit UNIT` | Create or resume a bounded, persistent candidate/compile/diagnose search job |
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |
 | `match-job-export JOB_ID OUTPUT` | Export a candidate and non-proof-grade evidence without editing project source |

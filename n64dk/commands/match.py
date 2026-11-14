@@ -2,8 +2,11 @@
 the permuter driver."""
 from __future__ import annotations
 
+import hashlib
+import json
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 
 from ..cli import command
@@ -11,7 +14,8 @@ from ..match import manifest as manmod
 from ..match import symbols as symmod
 from ..match.engine import Target, batch, default_pipelines, manifest_row, match_source, sweep
 from ..match.pipeline import PIPELINES, BuildSpec, split_flags, scratch_dir
-from ..match.toolchain import PROFILES, load_config
+from ..match.session import MatchSession, SessionStore
+from ..match.toolchain import Config, PROFILES, load_config
 from ..rom import Rom
 
 
@@ -139,6 +143,186 @@ def match(args):
 
 
 match.arguments = _match_args
+
+
+def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec) -> dict:
+    rom_path = Path(args.rom).expanduser().resolve()
+    return {
+        "source_name": source.name,
+        "source_suffix": source.suffix or ".c",
+        "rom": str(rom_path),
+        "rom_sha256": hashlib.sha256(target.rom).hexdigest(),
+        "project": str(cfg.project),
+        "toolchain_root": str(cfg.toolchain_root) if cfg.toolchain_root else None,
+        "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
+        "include": [str(value) for value in cfg.include],
+        "symbols": [str(Path(value).resolve()) for value in sym_files],
+        "normalizer": cfg.normalizer,
+        "vram_delta": target.delta,
+        "addr": args.addr,
+        "size": args.size,
+        "infer_externals": not args.no_infer,
+        "default_pipeline": spec.pipeline,
+        "default_flags": list(spec.flags),
+    }
+
+
+def _session_runtime(context: dict):
+    rom_path = Path(context["rom"])
+    image = Rom.load(rom_path)
+    if hashlib.sha256(image.data).hexdigest() != context["rom_sha256"]:
+        raise RuntimeError("session ROM changed; start a new matching session")
+    cfg = Config(
+        project=Path(context["project"]),
+        toolchain_root=(Path(context["toolchain_root"])
+                        if context.get("toolchain_root") else None),
+        toolchains={key: Path(value) for key, value in context.get("toolchains", {}).items()},
+        include=[Path(value) for value in context.get("include", [])],
+        symbols=[Path(value) for value in context.get("symbols", [])],
+        normalizer=context.get("normalizer"),
+        vram_delta=context["vram_delta"],
+        rom=rom_path,
+    )
+    target = Target.from_rom(image, context["vram_delta"])
+    syms = symmod.load([Path(value) for value in context.get("symbols", [])])
+    return cfg, target, syms
+
+
+def _session_evaluator(context: dict):
+    cfg, target, syms = _session_runtime(context)
+
+    def evaluate(source: bytes, pipeline: str, flags: tuple[str, ...], label: str):
+        spec = split_flags(list(flags), pipeline)
+        with tempfile.TemporaryDirectory(prefix="n64dk-session-") as name:
+            root = Path(name)
+            source_path = root / ("candidate" + context.get("source_suffix", ".c"))
+            source_path.write_bytes(source)
+            workdir = root / "build"
+            workdir.mkdir()
+            return match_source(
+                source_path, spec, cfg, target, context.get("addr"), context.get("size"),
+                syms, workdir, infer_externals=context.get("infer_externals", True),
+                name=label,
+            )
+    return evaluate
+
+
+def _session_start_args(p):
+    p.add_argument("source", help="baseline C or assembly source file")
+    _common(p, rom_required=True)
+    p.add_argument("--addr", type=lambda value: int(value, 16),
+                   help="VRAM of the unit's .text (hex)")
+    p.add_argument("--size", type=lambda value: int(value, 16), help="text size in bytes (hex)")
+    p.add_argument("--pipeline", choices=PIPELINES)
+    p.add_argument("--flags")
+    p.add_argument("--no-infer", action="store_true")
+    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--details", action="store_true", help="include the full instruction diff")
+
+
+@command("match-session-start", "Start a persistent standalone matching session")
+def match_session_start(args):
+    cfg, target, syms, sym_files = _setup(args)
+    source = Path(args.source).resolve()
+    spec = _spec(args, cfg)
+    context = _session_context(args, cfg, target, sym_files, source, spec)
+    store = SessionStore(args.state_root)
+    try:
+        session = MatchSession(store, _session_evaluator(context))
+        session_id, baseline = session.create(context, source.read_bytes(),
+                                              spec.pipeline, tuple(spec.flags))
+        return {
+            "session_id": session_id,
+            "state_root": str(Path(args.state_root).resolve()),
+            "baseline": baseline.summary(args.details),
+            "frontier": [baseline.summary(args.details)] if baseline.status == "evaluated" else [],
+        }
+    finally:
+        store.close()
+
+
+match_session_start.arguments = _session_start_args
+
+
+def _read_proposal(value: str) -> dict:
+    if value == "-":
+        return json.load(sys.stdin)
+    if value.lstrip().startswith("{"):
+        return json.loads(value)
+    return json.loads(Path(value).read_text())
+
+
+def _session_try_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--proposal", default="-",
+                   help="JSON object, JSON file, or - for stdin (default)")
+    p.add_argument("--jobs", type=int, default=4)
+    p.add_argument("--details", action="store_true", help="include full outcome and diff entries")
+
+
+@command("match-session-try", "Apply in-memory edits and evaluate source/flag variants as one transaction")
+def match_session_try(args):
+    store = SessionStore(args.state_root)
+    try:
+        context = store.context(args.session_id)
+        session = MatchSession(store, _session_evaluator(context))
+        return session.try_proposal(args.session_id, _read_proposal(args.proposal),
+                                    args.jobs, args.details)
+    finally:
+        store.close()
+
+
+match_session_try.arguments = _session_try_args
+
+
+def _session_status_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--candidates", action="store_true")
+    p.add_argument("--details", action="store_true", help="include full outcome and diff entries")
+
+
+@command("match-session-status", "Inspect a standalone matching session and its residual frontier")
+def match_session_status(args):
+    store = SessionStore(args.state_root)
+    try:
+        session = MatchSession(store, lambda *_args: None)
+        return session.status(args.session_id, args.candidates, args.details)
+    finally:
+        store.close()
+
+
+match_session_status.arguments = _session_status_args
+
+
+def _session_export_args(p):
+    p.add_argument("session_id")
+    p.add_argument("output")
+    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--candidate-id", help="default: current best candidate")
+
+
+@command("match-session-export", "Export a retained session candidate without editing project source")
+def match_session_export(args):
+    store = SessionStore(args.state_root)
+    try:
+        candidate = (store.get(args.session_id, args.candidate_id)
+                     if args.candidate_id else store.best(args.session_id))
+        if candidate is None:
+            raise ValueError("candidate does not exist in this session")
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(store.cache.get(candidate.source_digest))
+        evidence = output.with_suffix(output.suffix + ".evidence.json")
+        evidence.write_text(json.dumps(candidate.as_dict(), indent=2, sort_keys=True) + "\n")
+        return {"output": str(output), "evidence": str(evidence),
+                "candidate": candidate.as_dict()}
+    finally:
+        store.close()
+
+
+match_session_export.arguments = _session_export_args
 
 
 def _batch_args(p):

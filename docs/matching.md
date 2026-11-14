@@ -106,7 +106,72 @@ n64dk match SRC --rom ROM [--addr VRAM] [--size N] [--symbols FILE] [--pipeline 
 n64dk match-batch MANIFEST[=PIPELINE]... --project DIR [--normalizer CMD] [-I DIR] [--rodata-map TSV]
                   [--status-flags STATUS=FLAGS] [--source-template T] [--infer-externals] [--jobs N]
 n64dk match-permute SRC --rom ROM --addr VRAM [--function NAME] [--iterations N] [--jobs N] [--out DIR]
+n64dk match-session-start SRC --rom ROM --addr VRAM [--size N] [--pipeline P] [--flags F]
+n64dk match-session-try SESSION_ID [--proposal JSON_OR_FILE] [--jobs N]
+n64dk match-session-status SESSION_ID [--candidates]
+n64dk match-session-export SESSION_ID OUTPUT [--candidate-id ID]
 ```
+
+## Transactional matching sessions
+
+Standalone sessions remove the temporary-file edit between matching attempts. Start once
+with the same target and toolchain arguments accepted by `match`:
+
+```bash
+n64dk --format json match-session-start .tmp/func_800BD998_candidate.c \
+  --rom baserom.z64 --addr 800BD998 --size 84 \
+  --pipeline kmc+as --flags '-O2 -G0 -mips2 -Wa,-r4300_mul -Iinclude'
+```
+
+The returned session ID retains the baseline source, score, target configuration and every
+subsequent candidate. A single proposal can change source and fan out compiler flags without
+writing another candidate file:
+
+```bash
+n64dk --format json match-session-try SESSION_ID --jobs 4 --proposal - <<'JSON'
+{
+  "hypothesis": "separate shifted operands and test CSE pressure",
+  "edits": [
+    {
+      "old": "output[0] = (scale.value >> 8) * (func_8002E848(angle) >> 8);",
+      "new": "first = scale.value >> 8;\n    second = func_8002E848(angle) >> 8;\n    output[0] = first * second;"
+    }
+  ],
+  "flag_variants": [
+    [],
+    ["-fno-cse"],
+    ["-fno-cse", "-fno-cse2"],
+    ["-fno-gcse"],
+    ["-fno-expensive-optimizations"]
+  ]
+}
+JSON
+```
+
+`edits` are ordered and may use `old`/`new` with an optional one-based `occurrence`, `all`,
+or character offsets `start`/`end` plus `replacement`. `variants` can add independent source
+forms with their own `label`, `edits`, `source`, `pipeline`, `flags`, `add_flags`, and
+`remove_flags`. Top-level `flag_variants` are crossed with every source variant and evaluated
+concurrently.
+
+Results report each candidate's exact status, score, residual counts, parent-relative score
+and count deltas, cache reuse, and candidate ID. The `frontier` contains every candidate not
+strictly dominated across instruction, size, immediate, branch, register, scheduling,
+hazard-nop, operand-order and total-score dimensions. This retains useful register/scheduling
+tradeoffs instead of discarding everything except the lowest scalar score.
+
+By default a proposal starts from the current best candidate and inherits that candidate's
+pipeline and flags. Set `"parent": "CANDIDATE_ID"` to branch from any retained form, or set
+`pipeline`/`flags` in the proposal to replace the inherited configuration. Inspect or export
+explicitly:
+
+```bash
+n64dk --format json match-session-status SESSION_ID --candidates
+n64dk match-session-export SESSION_ID .tmp/best.c
+```
+
+Session state defaults to `.n64dk/match-sessions`, which is ignored by Git. Source candidates
+remain content-addressed there and are never written into the project tree during evaluation.
 
 All accept `--format json`. Manifests: source rows `ROM_START SIZE SOURCE FLAGS [SHA256]`
 (pipeline from the header comment: IDO / SN / KMC) or unit rows `UNIT VRAM SIZE [STATUS]`

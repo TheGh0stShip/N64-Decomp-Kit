@@ -8,6 +8,11 @@ This facility is an experiment runner, not an automatic proof of original source
 candidate still needs an independent rebuild, provenance review, complete ownership, and the
 project's normal verification process.
 
+For ad hoc sources that are currently driven through `n64dk match`, use the complementary
+`match-session-*` commands documented in [matching.md](matching.md). A session accepts source
+edits and flag matrices as one JSON transaction, so exploratory candidates remain in memory
+and in the content cache rather than requiring a temporary-file edit before every build.
+
 ## What is implemented
 
 The job engine provides:

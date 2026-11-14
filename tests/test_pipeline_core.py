@@ -20,6 +20,8 @@ from n64dk.match.workbench import Workbench, WorkbenchError
 from n64dk.match.transforms import Edit, Proposal, TransformationError, default_registry
 from n64dk.match.runner import ExecutionLimits, RunnerError, UnitRunner
 from n64dk.match.jobs import JobConfig, JobStore, MatchJob, generate_candidates
+from n64dk.match.session import (MatchSession, SessionCandidate, SessionStore,
+                                 apply_edits, frontier)
 from n64dk.match.profiles import ProfileRegistry
 from n64dk.project import OwnedSpan, WorkUnit
 from n64dk.research import audit as audit_research
@@ -526,6 +528,86 @@ class MatchJobTests(unittest.TestCase):
             finally:
                 store.close()
                 runner.close()
+
+
+class MatchSessionTests(unittest.TestCase):
+    class FakeOutcome:
+        def __init__(self, score, counts, exact=False, error=None):
+            from types import SimpleNamespace
+            report = SimpleNamespace(score=score, counts=counts)
+            self.result = SimpleNamespace(diff=report) if score is not None else None
+            self.exact = exact
+            self.error = error
+
+        def as_dict(self):
+            return {"exact": self.exact, "error": self.error}
+
+    def test_ordered_in_memory_edits_support_occurrences_and_ranges(self):
+        source = "x = 1; x = 1;"
+        changed = apply_edits(source, [
+            {"old": "x = 1", "new": "y = 2", "occurrence": 2},
+            {"start": 0, "end": 1, "replacement": "z"},
+        ])
+        self.assertEqual(changed, "z = 1; y = 2;")
+        with self.assertRaisesRegex(ValueError, "was not found"):
+            apply_edits(source, [{"old": "missing", "new": "value"}])
+
+    def test_transaction_evaluates_source_and_flag_variants_without_files(self):
+        calls = []
+
+        def evaluate(source, pipeline, flags, label):
+            text = source.decode()
+            calls.append((text, pipeline, flags, label))
+            if "return 2" not in text:
+                return self.FakeOutcome(8, {"register": 4, "scheduling": 2})
+            if "-fno-cse" in flags:
+                return self.FakeOutcome(3, {"register": 3})
+            return self.FakeOutcome(5, {"register": 1, "scheduling": 2})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(tmp)
+            try:
+                session = MatchSession(store, evaluate)
+                session_id, baseline = session.create(
+                    {"target": "fixture"}, b"int f(void) { return 1; }\n",
+                    "kmc+as", ("-O2", "-G0"))
+                result = session.try_proposal(session_id, {
+                    "hypothesis": "change the expression and test CSE pressure",
+                    "edits": [{"old": "return 1", "new": "return 2"}],
+                    "flag_variants": [[], ["-fno-cse"]],
+                }, jobs=2)
+                self.assertEqual(result["attempts"], 3)
+                self.assertEqual(result["best"]["score"], 3)
+                self.assertEqual(result["results"][0]["delta"]["score"], -3)
+                self.assertEqual(result["results"][1]["delta"]["score"], -5)
+                self.assertTrue(all(row["parent_id"] == baseline.candidate_id
+                                    for row in result["results"]))
+                best_source = store.cache.get(result["best"]["source_digest"])
+                self.assertIn(b"return 2", best_source)
+
+                repeated = session.try_proposal(session_id, {
+                    "parent": baseline.candidate_id,
+                    "hypothesis": "repeat should reuse retained observations",
+                    "edits": [{"old": "return 1", "new": "return 2"}],
+                    "flag_variants": [[], ["-fno-cse"]],
+                }, jobs=2)
+                self.assertEqual(repeated["attempts"], 3)
+                self.assertTrue(all(row["cache_hit"] for row in repeated["results"]))
+                self.assertEqual(len(calls), 3)
+            finally:
+                store.close()
+
+    def test_frontier_keeps_tradeoffs_instead_of_only_lowest_score(self):
+        def row(identity, score, counts):
+            return SessionCandidate(identity, None, "0" * 64, identity, "test",
+                                    "kmc+as", (), "evaluated", False, score,
+                                    counts, {}, None, 1)
+
+        register_shape = row("register", 5, {"register": 1, "scheduling": 2})
+        schedule_shape = row("schedule", 4, {"register": 4})
+        dominated = row("dominated", 9, {"register": 5, "scheduling": 2})
+        self.assertEqual({item.candidate_id for item in frontier(
+            [register_shape, schedule_shape, dominated])}, {"register", "schedule"})
 
 
 class ProfileTests(unittest.TestCase):
