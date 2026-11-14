@@ -3,8 +3,8 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-from n64dk.commands.workbench import (_load_matrix, compiler_explain, family_session_start,
-                                      scheduler_plan)
+from n64dk.commands.workbench import (_load_matrix, code_query, compiler_explain,
+                                      family_session_start, scheduler_plan)
 from n64dk.match.session import SessionCandidate, SessionStore
 from n64dk.match.controlflow import classify_branches, variants
 from n64dk.match.typed_explore import (declaration_context, lifetime_graph,
@@ -14,6 +14,7 @@ from n64dk.match.corpus import CorpusIndex
 import struct
 import subprocess
 import time
+from unittest import mock
 
 from n64dk.commands.workbench import _restore_worktree_snapshot, _worktree_snapshot
 
@@ -126,6 +127,17 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(inferred["ranked_prototypes"][0]["return_type"], "s16")
             self.assertEqual(inferred["call_sites"], 1)
             self.assertEqual(inferred["calls"][0]["call_arguments"], 1)
+
+    def test_code_query_uses_standard_library_when_ripgrep_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); source = root / "src" / "unit.c"
+            source.parent.mkdir(); source.write_text("extern void func_80001000(void);\n")
+            args = Namespace(project=name, symbol="func_80001000", address=None,
+                             type_conflicts=False, all_projects=False, limit=10)
+            with mock.patch("n64dk.commands.workbench.shutil.which", return_value=None):
+                result = code_query(args)
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(result["results"][0]["kind"], "declaration")
 
     def test_integration_rollback_preserves_preexisting_worktree_edits(self):
         with tempfile.TemporaryDirectory() as name:

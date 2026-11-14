@@ -4,7 +4,6 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
-import subprocess
 from pathlib import Path
 
 from .. import mips
@@ -59,10 +58,9 @@ def _candidate(project: Path, row: dict) -> dict | None:
     known = {item["path"] for item in found}
     scratch = project / ".tmp"
     if scratch.is_dir():
-        scan = subprocess.run(["rg", "--files", str(scratch), "-g", f"*{row['name']}*.c"],
-                              text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        for value in scan.stdout.splitlines():
-            path = Path(value)
+        for path in sorted(scratch.rglob(f"*{row['name']}*.c")):
+            if not path.is_file():
+                continue
             relative = str(path.relative_to(project))
             if relative not in known:
                 raw = path.read_bytes()
@@ -90,10 +88,6 @@ def _declarations(project: Path, candidate: dict | None) -> dict:
     if not candidate: return {"callees": [], "conflicts": [], "historical_style": "unknown"}
     symbols = candidate.get("callees", [])
     if not symbols: return {"callees": [], "conflicts": [], "historical_style": "unknown"}
-    expression = "|".join(re.escape(symbol) for symbol in symbols)
-    scan = subprocess.run(["rg", "-n", "--glob", "*.c", "--glob", "*.h", expression,
-                           str(project / "src"), str(project / "include")], text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     grouped = {symbol: [] for symbol in symbols}
     candidate_text = (project / candidate["path"]).read_text(errors="replace")
     def declaration_for(text: str, symbol: str):
@@ -107,17 +101,21 @@ def _declarations(project: Path, candidate: dict | None) -> dict:
             grouped[symbol].append({"path": candidate["path"], "line": number, "text": text.strip(),
                                     "kind": "definition" if declaration_form and "{" in text else
                                             "declaration" if declaration_form and ";" in text else "call"})
-    for line in scan.stdout.splitlines():
-        match = re.match(r"([^:]+):(\d+):(.*)", line)
-        if not match: continue
-        path, line_number, text = match.groups()
-        for symbol in symbols:
-            if re.search(rf"\b{re.escape(symbol)}\s*\(", text):
-                declaration_form = declaration_for(text, symbol)
-                grouped[symbol].append({"path": str(Path(path).relative_to(project)),
-                                        "line": int(line_number), "text": text.strip(),
-                                        "kind": "definition" if declaration_form and "{" in text else
-                                                "declaration" if declaration_form and ";" in text else "call"})
+    search_paths = []
+    for root in (project / "src", project / "include"):
+        if root.is_dir():
+            search_paths.extend(path for suffix in ("*.c", "*.h") for path in root.rglob(suffix))
+    for path in sorted(set(search_paths)):
+        if not path.is_file():
+            continue
+        for line_number, text in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            for symbol in symbols:
+                if re.search(rf"\b{re.escape(symbol)}\s*\(", text):
+                    declaration_form = declaration_for(text, symbol)
+                    grouped[symbol].append({"path": str(path.relative_to(project)),
+                                            "line": line_number, "text": text.strip(),
+                                            "kind": "definition" if declaration_form and "{" in text else
+                                                    "declaration" if declaration_form and ";" in text else "call"})
     conflicts = []
     for symbol, rows in grouped.items():
         forms = sorted({row["text"] for row in rows if row["kind"] == "declaration"})

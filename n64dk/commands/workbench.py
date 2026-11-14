@@ -561,20 +561,35 @@ def code_query(args):
     if not query: raise ValueError("--symbol or --address is required")
     roots = [Path(args.project).resolve()]
     if args.all_projects: roots = [path for path in Path(args.project).resolve().parent.iterdir() if path.is_dir()]
-    cmd = [shutil.which("rg") or "rg", "--json", "-n", "--glob", "!build/**", "--glob", "!.git/**", query,
-           *map(str, roots)]
-    run = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     hits = []
-    for line in run.stdout.splitlines():
-        try: value = json.loads(line)
-        except json.JSONDecodeError: continue
-        if value.get("type") != "match": continue
-        data = value["data"]; path = data["path"]["text"]; text = data["lines"]["text"].strip()
+    matches = []
+    rg = shutil.which("rg")
+    if rg:
+        cmd = [rg, "--json", "-n", "--glob", "!build/**", "--glob", "!.git/**", query,
+               *map(str, roots)]
+        run = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for line in run.stdout.splitlines():
+            try: value = json.loads(line)
+            except json.JSONDecodeError: continue
+            if value.get("type") != "match": continue
+            data = value["data"]
+            matches.append((data["path"]["text"], data["line_number"], data["lines"]["text"].strip()))
+    else:
+        ignored = {"build", ".git", ".venv", ".n64dk", "__pycache__"}
+        for root in roots:
+            for path in root.rglob("*"):
+                if not path.is_file() or any(part in ignored for part in path.relative_to(root).parts):
+                    continue
+                try: lines = path.read_text(errors="strict").splitlines()
+                except (UnicodeError, OSError): continue
+                matches.extend((str(path), number, text.strip())
+                               for number, text in enumerate(lines, 1) if query in text)
+    for path, line_number, text in matches:
         kind = ("manifest" if "matching_" in path else "catalogue" if "functions_" in path
                 else "candidate" if ".tmp" in path else "declaration" if re.search(r"\bextern\b|;\s*$", text)
                 else "definition" if "{" in text else "call-or-reference")
         hits.append({"authority": {"manifest": 0, "catalogue": 1, "definition": 2}.get(kind, 3),
-                     "kind": kind, "path": path, "line": data["line_number"], "text": text})
+                     "kind": kind, "path": path, "line": line_number, "text": text})
     hits.sort(key=lambda row: (row["authority"], row["path"], row["line"]))
     conflicts = sorted({re.sub(r"\s+", " ", row["text"]) for row in hits if row["kind"] == "declaration"})
     return {"query": query, "count": len(hits), "results": hits[:args.limit],

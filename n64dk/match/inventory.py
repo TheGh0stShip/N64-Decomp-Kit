@@ -9,7 +9,6 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
-import subprocess
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -145,10 +144,11 @@ def _splat(project: Path) -> list[dict]:
     result = []
     scalar = re.compile(r"^\s*(target_path|symbol_addrs_path|compiler)\s*:\s*['\"]?([^#'\"]+)")
     segment = re.compile(r"^\s*-\s*\[\s*(0x[0-9a-fA-F]+|\d+)\s*,\s*([^,\]]+)(?:,\s*([^\]]+))?\]")
-    scan = subprocess.run(["rg", "--files", str(project), "-g", "splat*.yml", "-g", "splat*.yaml",
-                           "-g", "!build/**", "-g", "!.tmp/**"], text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    for path in sorted(Path(value) for value in scan.stdout.splitlines()):
+    paths = set(project.rglob("splat*.yml")) | set(project.rglob("splat*.yaml"))
+    paths = {path for path in paths
+             if path.is_file() and not any(part in {"build", ".tmp", ".git", ".n64dk", ".venv"}
+                                           for part in path.relative_to(project).parts)}
+    for path in sorted(paths):
         values: dict[str, str] = {}
         subsegments = []
         for line in path.read_text().splitlines():
