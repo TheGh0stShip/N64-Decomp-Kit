@@ -16,6 +16,7 @@ from ..match.engine import Target, batch, default_pipelines, manifest_row, match
 from ..match.pipeline import PIPELINES, BuildSpec, split_flags, scratch_dir
 from ..match.session import MatchSession, SessionStore
 from ..match.registry import SessionRegistry, resolve_store, standard_store
+from ..match.layout import Layout, preflight
 from ..match.toolchain import Config, PROFILES, load_config
 from ..rom import Rom
 
@@ -146,9 +147,10 @@ def match(args):
 match.arguments = _match_args
 
 
-def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec) -> dict:
+def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec,
+                     source_bytes: bytes) -> dict:
     rom_path = Path(args.rom).expanduser().resolve()
-    return {
+    context = {
         "source_name": source.name,
         "source_suffix": source.suffix or ".c",
         "rom": str(rom_path),
@@ -165,7 +167,19 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
         "infer_externals": not args.no_infer,
         "default_pipeline": spec.pipeline,
         "default_flags": list(spec.flags),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "compiler_recipe": {"pipeline": spec.pipeline, "flags": list(spec.flags)},
     }
+    if args.addr is not None and args.size is not None:
+        layout = Layout("standalone", 0, target.delta, len(target.rom), args.addr, args.size,
+                        "standalone-explicit-range")
+        context["layout_preflight"] = preflight(rom_path, layout, strict_entry=args.strict_entry)
+        rom_offset = args.addr - target.delta
+        target_bytes = target.rom[rom_offset:rom_offset + args.size]
+        context["target_text_sha256"] = hashlib.sha256(target_bytes).hexdigest()
+        context["image_identity"] = rom_path.name
+        context["catalogue_boundary_revision"] = None
+    return context
 
 
 def _session_runtime(context: dict):
@@ -221,6 +235,8 @@ def _session_start_args(p):
     p.add_argument("--no-infer", action="store_true")
     p.add_argument("--state-root", help="session store (default: <project>/.n64dk/match-sessions)")
     p.add_argument("--details", action="store_true", help="include the full instruction diff")
+    p.add_argument("--strict-entry", action="store_true",
+                   help="reject likely internal fragments using entry and delay-slot evidence")
     _session_output_args(p)
 
 
@@ -262,7 +278,7 @@ def match_session_start(args):
     source = Path(args.source).resolve() if args.source != "-" else Path(args.source_name)
     source_bytes = source.read_bytes() if args.source != "-" else sys.stdin.buffer.read()
     spec = _spec(args, cfg)
-    context = _session_context(args, cfg, target, sym_files, source, spec)
+    context = _session_context(args, cfg, target, sym_files, source, spec, source_bytes)
     store_root = Path(args.state_root).resolve() if args.state_root else standard_store(cfg.project)
     store = SessionStore(store_root)
     try:

@@ -107,6 +107,8 @@ export, and proof boundaries.
 | `investigate FUNCTION --image IMAGE --all` | Build one verified dossier from layout, code, source, recipes, history and corpus evidence |
 | `corpus-index PROJECT...` | Incrementally index local N64 assembly by exact and normalized signatures |
 | `corpus-query --image IMAGE --addr A --size N --vram-delta D` | Find exact, relocation-only, register-renamed and opcode-shape analogues |
+| `result-index --roots PATH...` / `result-query` | Mine historical JSON, logs, sessions and candidates while invalidating stale targets |
+| `residual-clusters --max-score N` | Group typed, address-independent residuals across related functions |
 | `script-index PROJECT...` / `script-query` | Inventory scattered sweeps, audits, transforms, scorers and build wrappers |
 | `operation-schema` / `automation-serve` | Expose typed operations over newline-delimited JSON for local controllers |
 | `match-session-prepare-winner SESSION_ID DIR` | Independently recompile an exact winner and prepare an auditable export queue |

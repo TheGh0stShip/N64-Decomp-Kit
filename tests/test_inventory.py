@@ -46,6 +46,28 @@ functions = [
             self.assertEqual(rows["shared_tail"]["state"], "excluded")
             self.assertEqual(rows["remaining"]["state"], "remaining")
             self.assertEqual(rows["remaining"]["candidate_source"], ".tmp/remaining_candidate.c")
+            self.assertEqual(rows["remaining"]["ownership_state"], "assembly_owned")
+            self.assertEqual(rows["first"]["ownership_state"], "manifest_exact")
+
+    def test_scratch_candidate_never_claims_coverage(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config = root / "config/us"
+            config.mkdir(parents=True)
+            (config / "functions_main.toml").write_text('''
+[[section]]
+rom = 0
+vram = 0x80000000
+size = 0x20
+functions = [{ name = "func_80000000", vram = 0x80000000, size = 0x10 }] # c candidate
+''')
+            scratch = root / ".tmp/func_80000000_candidate.c"
+            scratch.parent.mkdir()
+            scratch.write_text("int func_80000000(void) { return 0; }\n")
+            row = inventory.build(root)["functions"][0]
+            self.assertEqual(row["state"], "remaining")
+            self.assertEqual(row["ownership_state"], "scratch_candidate")
+            self.assertIsNone(row["coverage_authority"])
 
     def test_splat_metadata_and_context_bundle(self):
         with tempfile.TemporaryDirectory() as name:
@@ -79,6 +101,26 @@ segments:
             bad.write_bytes(b"\0" * 0x100 + struct.pack(">III", 0x70000000, 0x70000000, 0x70000000))
             with self.assertRaisesRegex(ValueError, "data-like"):
                 preflight(bad, layout)
+
+    def test_delay_slot_and_entry_fragment_are_explicit(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            missing_slot = root / "missing.bin"
+            missing_slot.write_bytes(struct.pack(">II", 0x27BDFFF0, 0x03E00008))
+            layout = Layout("main", 0, 0x80000000, 8, 0x80000000, 8)
+            with self.assertRaisesRegex(ValueError, "delay slot"):
+                preflight(missing_slot, layout)
+            # lw s0, 0x10(sp) before any definition is characteristic of an
+            # epilogue/internal fragment, even when it owns its return slot.
+            fragment = root / "fragment.bin"
+            fragment.write_bytes(struct.pack(">III", 0x8FB00010, 0x03E00008, 0x27BD0018))
+            layout = Layout("main", 0, 0x80000000, 12, 0x80000000, 12)
+            report = preflight(fragment, layout)
+            self.assertEqual(report["entry_preflight"]["entry_status"], "reject")
+            self.assertIn("saved_register_restore_without_save",
+                          report["entry_preflight"]["reason_codes"])
+            with self.assertRaisesRegex(ValueError, "entry preflight"):
+                preflight(fragment, layout, strict_entry=True)
 
     def test_registry_resolves_legacy_tranche_store(self):
         class Outcome:

@@ -21,16 +21,30 @@ def _inventory_args(p):
     p.add_argument("--output", help="write the complete JSON inventory")
     p.add_argument("--remaining", action="store_true", help="include ranked remaining functions")
     p.add_argument("--refresh-sources", action="store_true")
+    p.add_argument("--coverage-authority", choices=("manifest",), default="manifest")
+    p.add_argument("--show-suspect-coverage", action="store_true")
+    p.add_argument("--explain", help="explain classification for a function name or VRAM")
 
 
 @command("match-inventory", "Build an interval-correct function and translation-unit inventory")
 def match_inventory(args):
     result = invmod.build(args.project, args.refresh_sources)
+    if args.explain:
+        try:
+            address = int(args.explain, 0)
+        except ValueError:
+            rows = [row for row in result["functions"] if row["name"] == args.explain]
+        else:
+            rows = [row for row in result["functions"] if int(row["vram"], 0) == address]
+        result = {"coverage_authority": args.coverage_authority, "matches": rows}
+    elif args.show_suspect_coverage:
+        result["suspect_coverage"] = [row for row in result["functions"]
+                                      if row["candidate_source"] and row["state"] != "covered"]
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    if not args.remaining:
+    if not args.remaining and not args.explain and not args.show_suspect_coverage:
         result = {key: value for key, value in result.items() if key != "functions"}
     return result
 
@@ -154,7 +168,7 @@ def _launch_one(args, project: str, row: dict, mappings: dict[str, str]):
         return function_id, "needs-source", None, None, {}, None, None, "blocked", \
             "candidate source disappeared"
     layout = from_inventory(row)
-    check = preflight(image_path, layout, row.get("catalogue_status", ""))
+    check = preflight(image_path, layout, row.get("catalogue_status", ""), strict_entry=True)
     check["cross_checks"] = row.get("mapping_evidence", [])
     cfg = load_config(project, None, None)
     pipeline = args.pipeline or ((default_pipelines(cfg) or ["kmc+builtin"])[0])

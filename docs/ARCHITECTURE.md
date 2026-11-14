@@ -40,6 +40,7 @@ and Mario Kart 64 (NKTE), located through `n64dk.fixtures` (roms.toml / N64DK_RO
 | `n64dk.match.explore` | bounded residual-guided multi-round experiment loop and explanations |
 | `n64dk.match.corpus` | incremental cross-project instruction and normalized-shape index |
 | `n64dk.match.investigate` | verified function dossier, recipe evidence and candidate selection |
+| `n64dk.match.results` | content-addressed historical observations, target validity and residual families |
 | `n64dk.operations` | project-script discovery, typed operation schema and shell-free invocation gateway |
 | `n64dk.match.provenance` | genuine-C and positive handwritten-assembly credit policy |
 | `n64dk.research` | source/finding quality audit before research is automated |

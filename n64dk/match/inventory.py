@@ -51,6 +51,8 @@ class InventoryFunction:
     state: str
     reason: str
     owner: str | None
+    ownership_state: str
+    coverage_authority: str | None
     candidate_source: str | None
     mapping_evidence: tuple[str, ...]
     rank: float | None
@@ -180,25 +182,39 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             if size < 12:
                 structural.add("undersized")
             candidate = _candidate_source(root, name, start, source_index)
-            if source_owners or status.startswith("c"):
+            # A catalogue comment and a discovered source file are evidence, not proof of
+            # coverage.  Only an exact matching manifest may remove an interval from work.
+            if source_owners:
                 state, reason = "covered", "covered by a C translation-unit interval"
                 owner = source_owners[0].source if source_owners else None
+                ownership_state, coverage_authority = "manifest_exact", "manifest"
                 rank = None
             elif structural and not candidate:
                 state, reason = "excluded", "non-independent interval: " + ", ".join(sorted(structural))
                 owner, rank = asm_owners[0].source if asm_owners else None, None
+                ownership_state = ("data" if "data" in structural else "padding" if "padding" in structural
+                                   else "fragment")
+                coverage_authority = None
             elif asm_owners:
                 state, reason, owner = "remaining", "assembly-backed complete function", asm_owners[0].source
+                ownership_state, coverage_authority = "assembly_owned", None
                 rank = round(1000.0 / max(size, 4), 6)
             else:
                 state, reason, owner = "remaining", "uncovered complete catalogue interval", candidate
+                if candidate:
+                    ownership_state = ("scratch_candidate" if ".tmp" in Path(candidate).parts
+                                       else "tracked_source_unverified")
+                else:
+                    ownership_state = "unowned"
+                coverage_authority = None
                 rank = round(1000.0 / max(size, 4) + (25 if candidate else 0), 6)
             identity = hashlib.sha256(f"{root.name}:{image}:{start:x}:{end:x}".encode()).hexdigest()[:20]
             evidence = [f"catalogue:{catalogue.relative_to(root)}:{section[1]:#x}->{section[0]:#x}"]
             evidence += [f"manifest:{claim.source}:{claim.start:#x}-{claim.end:#x}" for claim in owners]
             item = InventoryFunction(identity, image, name, start, end, size, rom,
                                      section[1], section[0], section[2], status,
-                                     state, reason, owner, candidate, tuple(evidence), rank)
+                                     state, reason, owner, ownership_state, coverage_authority,
+                                     candidate, tuple(evidence), rank)
             functions.append(item)
             image_rows.append(item)
         images.append({"name": image, "catalogue": str(catalogue.relative_to(root)),
@@ -210,7 +226,7 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
     source_index.close()
     return {
         "project": str(root),
-        "model": "interval-v1",
+        "model": "interval-v2-authoritative-coverage",
         "images": images,
         "splat": _splat(root),
         "source_index": source_stats,

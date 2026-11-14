@@ -278,6 +278,55 @@ exit status, elapsed time, structured results, and bounded diagnostics. Controll
 start with `{"method":"schema"}`, require layout preflight before matching, and use sessions
 so experiments and negative results remain durable.
 
+## Coverage authority and boundary truth
+
+Inventory coverage is authoritative only when an exact matching manifest owns the complete
+interval. Catalogue comments, tracked source, indexed candidates, and `.tmp` candidates are
+discovery evidence and never increase matched coverage:
+
+```bash
+n64dk match-inventory --project . --coverage-authority manifest
+n64dk match-inventory --project . --show-suspect-coverage
+n64dk match-inventory --project . --explain func_800ABA74
+```
+
+Every row reports an `ownership_state` such as `manifest_exact`, `scratch_candidate`,
+`tracked_source_unverified`, `assembly_owned`, `fragment`, or `unowned`, together with the
+evidence that produced it. Preflight models a control-transfer instruction and its delay slot
+as one owned boundary. It also reports incoming edges, predecessor fallthrough, suspicious
+saved-register live-ins, epilogue-without-prologue evidence, call targets, and an entry
+confidence. `match-session-start --strict-entry` refuses a likely fragment.
+
+Standalone sessions retain preflight version/result, image and target digests, explicit
+ROM/VRAM range, mapping delta, source digest, and compiler recipe in immutable session
+context. Later exploration therefore uses the same target evidence rather than reconstructing
+layout from a different path.
+
+## Historical results and residual families
+
+Index old observations once, then refresh incrementally:
+
+```bash
+n64dk result-index --project . --roots .tmp .n64dk results \
+  --database .n64dk/results.sqlite
+n64dk result-query --function func_800ABA74 --timeline
+n64dk result-query --max-score 12
+n64dk result-query --stale-mapping
+n64dk residual-clusters --max-score 32
+```
+
+The index consumes native session databases, match JSON, score-bearing logs, and candidate C
+sources. Observations are marked `valid_current_target`, `stale_mapping`, `boundary_changed`,
+or `unknown_provenance`; invalid targets are excluded from ordinary ranking. Missing absolute
+source paths are resolved by content digest when available, with weaker basename recovery
+clearly labelled unverified.
+
+Residual fingerprints normalize addresses while preserving opcode substitutions, typed
+register flow, basic-block position, size/count categories, and branch-likely distinctions.
+Clusters return evidence-specific candidate forms. Function queries also identify pairs whose
+remaining residual components bracket the target and name the smallest likely typed-data-flow
+discriminator.
+
 All accept `--format json`. Manifests: source rows `ROM_START SIZE SOURCE FLAGS [SHA256]`
 (pipeline from the header comment: IDO / SN / KMC) or unit rows `UNIT VRAM SIZE [STATUS]`
 (source `src/code/{unit}.c` etc., flags from the profile or `--flags`).
