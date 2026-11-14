@@ -12,17 +12,20 @@ from pathlib import Path
 from ..cli import command
 from ..match import context as contextmod
 from ..match import inventory as invmod
+from ..match.layout import from_inventory, preflight
+from ..match.registry import SessionRegistry, standard_store
 
 
 def _inventory_args(p):
     p.add_argument("--project", default=".")
     p.add_argument("--output", help="write the complete JSON inventory")
     p.add_argument("--remaining", action="store_true", help="include ranked remaining functions")
+    p.add_argument("--refresh-sources", action="store_true")
 
 
 @command("match-inventory", "Build an interval-correct function and translation-unit inventory")
 def match_inventory(args):
-    result = invmod.build(args.project)
+    result = invmod.build(args.project, args.refresh_sources)
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -61,13 +64,19 @@ def context_bundle(args):
         raise ValueError(f"function selector resolved to {len(rows)} catalogue rows")
     row = rows[0]
     start = int(row["vram"], 0)
-    offset = start - args.vram_delta if args.vram_delta is not None else int(row["rom"], 0)
+    layout = from_inventory(row)
+    if args.vram_delta is not None and args.vram_delta != layout.delta:
+        raise ValueError(f"--vram-delta 0x{args.vram_delta:X} conflicts with catalogue-section "
+                         f"delta 0x{layout.delta:X}")
+    layout_check = preflight(args.image, layout, row.get("catalogue_status", ""))
+    offset = layout.rom
     same = [item for item in inventory["functions"] if item["image"] == row["image"]]
     index = same.index(row)
     neighbours = [{key: item[key] for key in ("name", "vram", "size", "state")}
                   for item in same[max(0, index - 2):index + 3] if item is not row]
     result = contextmod.bundle(args.image, start, row["size"], offset, neighbours)
     result["inventory"] = row
+    result["layout_preflight"] = layout_check
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +102,11 @@ def _sweep_args(p):
                    help="loaded image/ROM for an inventory image (repeatable; required by --run)")
     p.add_argument("--pipeline", help="matching pipeline for launched sessions")
     p.add_argument("--flags", help="compiler flags for launched sessions")
+    p.add_argument("--refresh-sources", action="store_true",
+                   help="incrementally refresh the persistent candidate-source index")
+    p.add_argument("--run-ready-only", action="store_true",
+                   help="resume stored ready items without rebuilding inventory or scanning sources")
+    p.add_argument("--details", action="store_true", help="include every tranche item")
 
 
 def _state(root: Path) -> sqlite3.Connection:
@@ -108,19 +122,119 @@ def _state(root: Path) -> sqlite3.Connection:
           rank REAL NOT NULL, status TEXT NOT NULL, session_id TEXT, reason TEXT NOT NULL,
           PRIMARY KEY (tranche_id, function_id));
     """)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(tranche_items)")}
+    additions = {"candidate_source": "TEXT", "layout": "TEXT", "best_score": "INTEGER",
+                 "residual_counts": "TEXT", "historical_session_id": "TEXT",
+                 "historical_score": "INTEGER", "comparison": "TEXT", "updated_ns": "INTEGER"}
+    for name, kind in additions.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE tranche_items ADD COLUMN {name} {kind}")
+    db.commit()
     return db
+
+
+def _launch_one(args, project: str, row: dict, mappings: dict[str, str]):
+    from .match import _session_evaluator
+    from ..match.engine import default_pipelines
+    from ..match.pipeline import split_flags
+    from ..match.session import MatchSession, SessionStore
+    from ..match.symbols import discover
+    from ..match.toolchain import PROFILES, load_config
+    from ..rom import Rom
+    import shlex
+
+    function_id = row["id"]
+    image_path = mappings.get(row["image"])
+    if not image_path:
+        return function_id, "blocked", None, None, {}, None, None, "blocked", \
+            f"missing --image-file {row['image']}=PATH"
+    source_value = row.get("candidate_source")
+    source_path = Path(project, source_value) if source_value else None
+    if source_path is None or not source_path.is_file():
+        return function_id, "needs-source", None, None, {}, None, None, "blocked", \
+            "candidate source disappeared"
+    layout = from_inventory(row)
+    check = preflight(image_path, layout, row.get("catalogue_status", ""))
+    check["cross_checks"] = row.get("mapping_evidence", [])
+    cfg = load_config(project, None, None)
+    pipeline = args.pipeline or ((default_pipelines(cfg) or ["kmc+builtin"])[0])
+    family = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}.get(pipeline, "kmc")
+    flags = shlex.split(args.flags) if args.flags else list(PROFILES[family].default_flags)
+    image = Rom.load(image_path)
+    symbol_files = discover(cfg.project)
+    context = {
+        "source_name": source_path.name, "source_suffix": source_path.suffix or ".c",
+        "rom": str(Path(image_path).resolve()), "rom_sha256": hashlib.sha256(image.data).hexdigest(),
+        "project": str(cfg.project), "toolchain_root": str(cfg.toolchain_root) if cfg.toolchain_root else None,
+        "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
+        "include": [str(value) for value in cfg.include],
+        "symbols": [str(value.resolve()) for value in symbol_files], "normalizer": cfg.normalizer,
+        "vram_delta": layout.delta, "addr": layout.function_vram, "size": layout.function_size,
+        "infer_externals": True, "default_pipeline": pipeline, "default_flags": flags,
+        "inventory_id": function_id, "inventory_image": row["image"], "layout_preflight": check,
+    }
+    store_root = standard_store(project)
+    store = SessionStore(store_root)
+    try:
+        session = MatchSession(store, _session_evaluator(context))
+        session_id, baseline = session.create(context, source_path.read_bytes(), pipeline,
+                                              tuple(split_flags(flags, pipeline).flags))
+        registry = SessionRegistry(project)
+        try:
+            registry.register(session_id, store_root, context, baseline.source_digest, "quickwin-sweep")
+            history = registry.same_target(context)
+        finally:
+            registry.close()
+        previous = next((item for item in history if item["session_id"] != session_id), None)
+        historical_score = previous["score"] if previous else None
+        comparison = ("new" if previous is None else "improved" if baseline.exact or
+                      (baseline.score is not None and historical_score is not None and baseline.score < historical_score)
+                      else "tied" if baseline.score == historical_score else "regressed")
+        reason = baseline.error or (f"score {baseline.score}" if baseline.score is not None else "baseline retained")
+        return function_id, "exact" if baseline.exact else "active", session_id, baseline.score, \
+            baseline.counts, previous["session_id"] if previous else None, historical_score, comparison, reason
+    finally:
+        store.close()
 
 
 @command("quickwin-sweep", "Create or resume a persistent interval-aware cross-function tranche")
 def quickwin_sweep(args):
-    inventory = invmod.build(args.project)
-    selected = None if args.all_images or not args.image else set(args.image)
-    ranked = invmod.rank(inventory, args.limit, selected)
-    digest = hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
+    overall_started = time.monotonic()
+    compile_seconds = 0.0
+    if args.run_ready_only and not args.resume:
+        raise ValueError("--run-ready-only requires --resume")
     db = _state(Path(args.state_root))
+    if args.run_ready_only:
+        existing = db.execute("SELECT project, inventory_digest FROM tranches WHERE tranche_id = ?",
+                              (args.resume,)).fetchone()
+        if not existing:
+            db.close()
+            raise ValueError(f"unknown tranche {args.resume}")
+        project, digest = existing
+        stored = db.execute("""SELECT function_id, image, name, vram, size, rank, reason,
+                                      candidate_source, layout FROM tranche_items
+                               WHERE tranche_id = ? AND status = 'ready' ORDER BY ordinal""",
+                            (args.resume,)).fetchall()
+        inventory = {"project": project, "functions": []}
+        for values in stored:
+            layout_value = json.loads(values[8]) if values[8] else None
+            if not layout_value:
+                continue
+            inventory["functions"].append({"id": values[0], "image": values[1], "name": values[2],
+                "vram": values[3], "size": values[4], "rank": values[5], "reason": values[6],
+                "candidate_source": values[7], **layout_value})
+        ranked = inventory["functions"]
+        tranche_id = args.resume
+    else:
+        inventory = invmod.build(args.project, args.refresh_sources)
+        selected = None if args.all_images or not args.image else set(args.image)
+        ranked = invmod.rank(inventory, args.limit, selected)
+        stable_inventory = {key: value for key, value in inventory.items() if key != "source_index"}
+        digest = hashlib.sha256(json.dumps(stable_inventory, sort_keys=True).encode()).hexdigest()
+        tranche_id = args.resume
     try:
         now = time.time_ns()
-        tranche_id = args.resume or hashlib.sha256(
+        tranche_id = tranche_id or hashlib.sha256(
             f"{inventory['project']}:{digest}:{now}".encode()).hexdigest()[:20]
         existing = db.execute("SELECT inventory_digest FROM tranches WHERE tranche_id = ?",
                               (tranche_id,)).fetchone()
@@ -131,11 +245,17 @@ def quickwin_sweep(args):
                        (tranche_id, inventory["project"], digest, max(1, args.jobs), now, now))
             for ordinal, row in enumerate(ranked, 1):
                 status = "ready" if row.get("candidate_source") else "needs-source"
-                db.execute("INSERT INTO tranche_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-                           (tranche_id, ordinal, row["id"], row["image"], row["name"], row["vram"],
-                            row["size"], row["rank"], status, row["reason"]))
+                layout_value = {key: row.get(key) for key in
+                                ("section_rom", "section_vram", "section_size", "catalogue_status", "rom")}
+                db.execute("""INSERT INTO tranche_items
+                    (tranche_id, ordinal, function_id, image, name, vram, size, rank, status,
+                     session_id, reason, candidate_source, layout, updated_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)""",
+                    (tranche_id, ordinal, row["id"], row["image"], row["name"], row["vram"],
+                     row["size"], row["rank"], status, row["reason"], row.get("candidate_source"),
+                     json.dumps(layout_value, sort_keys=True), now))
             db.commit()
-        if args.run:
+        if args.run or args.run_ready_only:
             mappings = dict(value.split("=", 1) for value in args.image_file if "=" in value)
             inventory_by_id = {row["id"]: row for row in inventory["functions"]}
             pending = db.execute("""SELECT function_id FROM tranche_items
@@ -143,60 +263,24 @@ def quickwin_sweep(args):
                                  (tranche_id,)).fetchall()
 
             def launch(function_id: str):
-                from .match import _session_evaluator
-                from ..match.engine import default_pipelines
-                from ..match.pipeline import split_flags
-                from ..match.session import MatchSession, SessionStore
-                from ..match.symbols import discover
-                from ..match.toolchain import PROFILES, load_config
-                from ..rom import Rom
-                import shlex
-
-                row = inventory_by_id[function_id]
-                image_path = mappings.get(row["image"])
-                if not image_path:
-                    return function_id, "blocked", None, f"missing --image-file {row['image']}=PATH"
-                source_path = Path(inventory["project"], row["candidate_source"])
-                if not source_path.is_file():
-                    return function_id, "needs-source", None, "candidate source disappeared"
-                cfg = load_config(inventory["project"], None, None)
-                pipeline = args.pipeline or ((default_pipelines(cfg) or ["kmc+builtin"])[0])
-                family = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}.get(pipeline, "kmc")
-                flags = shlex.split(args.flags) if args.flags else list(PROFILES[family].default_flags)
-                image = Rom.load(image_path)
-                rom = int(row["rom"], 0)
-                vram = int(row["vram"], 0)
-                symbol_files = discover(cfg.project)
-                context = {
-                    "source_name": source_path.name, "source_suffix": source_path.suffix or ".c",
-                    "rom": str(Path(image_path).resolve()),
-                    "rom_sha256": hashlib.sha256(image.data).hexdigest(),
-                    "project": str(cfg.project),
-                    "toolchain_root": str(cfg.toolchain_root) if cfg.toolchain_root else None,
-                    "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
-                    "include": [str(value) for value in cfg.include],
-                    "symbols": [str(value.resolve()) for value in symbol_files],
-                    "normalizer": cfg.normalizer, "vram_delta": vram - rom,
-                    "addr": vram, "size": row["size"], "infer_externals": True,
-                    "default_pipeline": pipeline, "default_flags": flags,
-                    "inventory_id": function_id, "inventory_image": row["image"],
-                }
-                store = SessionStore(Path(args.state_root) / "sessions")
                 try:
-                    session = MatchSession(store, _session_evaluator(context))
-                    session_id, baseline = session.create(context, source_path.read_bytes(),
-                                                          pipeline, tuple(split_flags(flags, pipeline).flags))
-                    return function_id, "exact" if baseline.exact else "active", session_id, \
-                        baseline.error or (f"score {baseline.score}" if baseline.score is not None else "baseline retained")
-                finally:
-                    store.close()
+                    return _launch_one(args, inventory["project"], inventory_by_id[function_id], mappings)
+                except Exception as error:
+                    return function_id, "blocked", None, None, {}, None, None, "blocked", str(error)
 
             with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+                compile_started = time.monotonic()
                 launched = list(pool.map(lambda row: launch(row[0]), pending))
-            for function_id, status, session_id, reason in launched:
-                db.execute("""UPDATE tranche_items SET status = ?, session_id = ?, reason = ?
+                compile_seconds = time.monotonic() - compile_started
+            for (function_id, status, session_id, score, counts, historical_session,
+                 historical_score, comparison, reason) in launched:
+                db.execute("""UPDATE tranche_items SET status = ?, session_id = ?, reason = ?,
+                              best_score = ?, residual_counts = ?, historical_session_id = ?,
+                              historical_score = ?, comparison = ?, updated_ns = ?
                               WHERE tranche_id = ? AND function_id = ?""",
-                           (status, session_id, reason, tranche_id, function_id))
+                           (status, session_id, reason, score, json.dumps(counts, sort_keys=True),
+                            historical_session, historical_score, comparison, time.time_ns(),
+                            tranche_id, function_id))
             db.execute("UPDATE tranches SET updated_ns = ? WHERE tranche_id = ?", (time.time_ns(), tranche_id))
             db.commit()
         rows = db.execute("""SELECT ordinal, function_id, image, name, vram, size, rank, status,
@@ -207,8 +291,13 @@ def quickwin_sweep(args):
         counts = {status: sum(item["status"] == status for item in items)
                   for status in sorted({item["status"] for item in items})}
         result = {"tranche_id": tranche_id, "inventory_digest": digest, "jobs": max(1, args.jobs),
-                  "selected": len(items), "status": counts, "items": items,
-                  "next": [item for item in items if item["status"] != "exact"][:20]}
+                  "selected": len(items), "status": counts,
+                  "next": [item for item in items if item["status"] != "exact"][:20],
+                  "timing": {"discovery_seconds": inventory.get("source_index", {}).get("elapsed_seconds", 0.0),
+                             "compilation_and_matching_seconds": round(compile_seconds, 6),
+                             "total_seconds": round(time.monotonic() - overall_started, 6)}}
+        if args.details:
+            result["items"] = items
         if args.report:
             report = Path(args.report)
             report.parent.mkdir(parents=True, exist_ok=True)
@@ -225,3 +314,85 @@ def quickwin_sweep(args):
 
 
 quickwin_sweep.arguments = _sweep_args
+
+
+def _sweep_status_args(p):
+    p.add_argument("tranche_id")
+    p.add_argument("--state-root", default=".n64dk/quickwin-sweeps")
+    p.add_argument("--status", action="append", default=[])
+    p.add_argument("--summary-only", action="store_true")
+    p.add_argument("--best-details", action="store_true")
+    p.add_argument("--exact-only", action="store_true")
+    p.add_argument("--needs-source", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--changed-since", type=int, help="nanosecond timestamp from a prior response")
+
+
+@command("quickwin-sweep-status", "Inspect a tranche with compact status and history filters")
+def quickwin_sweep_status(args):
+    db = _state(Path(args.state_root))
+    try:
+        tranche = db.execute("""SELECT project, inventory_digest, jobs, created_ns, updated_ns
+                                FROM tranches WHERE tranche_id = ?""", (args.tranche_id,)).fetchone()
+        if not tranche:
+            raise ValueError(f"unknown tranche {args.tranche_id}")
+        requested = list(args.status)
+        if args.exact_only:
+            requested.append("exact")
+        if args.needs_source:
+            requested.append("needs-source")
+        where = ["tranche_id = ?"]
+        values: list = [args.tranche_id]
+        if requested:
+            where.append("status IN (" + ",".join("?" for _ in requested) + ")")
+            values += requested
+        if args.changed_since is not None:
+            where.append("COALESCE(updated_ns, 0) > ?")
+            values.append(args.changed_since)
+        query = f"""SELECT ordinal, image, name, vram, size, status, session_id, reason,
+                           best_score, residual_counts, historical_session_id, historical_score,
+                           comparison, updated_ns FROM tranche_items
+                    WHERE {' AND '.join(where)} ORDER BY ordinal LIMIT ?"""
+        rows = db.execute(query, (*values, max(0, args.limit))).fetchall()
+        items = []
+        for row in rows:
+            item = dict(zip(("ordinal", "image", "name", "vram", "size", "status", "session_id",
+                             "reason", "best_score", "residual_counts", "historical_session_id",
+                             "historical_score", "comparison", "updated_ns"), row))
+            item["residual_counts"] = json.loads(item["residual_counts"] or "{}")
+            if item["session_id"]:
+                from ..match.registry import resolve_store
+                from ..match.session import SessionStore
+                store = SessionStore(resolve_store(item["session_id"], tranche[0]))
+                try:
+                    current = store.best(item["session_id"])
+                    registry = SessionRegistry(tranche[0])
+                    try:
+                        history = registry.same_target(store.context(item["session_id"]))
+                    finally:
+                        registry.close()
+                    project_best = history[0] if history else None
+                    item["project_best"] = project_best
+                    if project_best:
+                        item["historical_session_id"] = project_best["session_id"]
+                        item["historical_score"] = project_best["score"]
+                        item["comparison"] = ("tied" if project_best["session_id"] == item["session_id"] or
+                                              project_best["score"] == current.score else "regressed")
+                    if args.best_details:
+                        item["best"] = current.summary(True)
+                finally:
+                    store.close()
+            items.append(item)
+        counts = dict(db.execute("""SELECT status, COUNT(*) FROM tranche_items
+                                   WHERE tranche_id = ? GROUP BY status""", (args.tranche_id,)).fetchall())
+        result = {"tranche_id": args.tranche_id, "project": tranche[0],
+                  "inventory_digest": tranche[1], "jobs": tranche[2], "status": counts,
+                  "created_ns": tranche[3], "updated_ns": tranche[4], "matched": len(items)}
+        if not args.summary_only:
+            result["items"] = items
+        return result
+    finally:
+        db.close()
+
+
+quickwin_sweep_status.arguments = _sweep_status_args

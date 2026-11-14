@@ -129,12 +129,12 @@ def _compare_at(out: Outcome, elf: Elf, source: Path, spec: BuildSpec, target: T
             base = res.bases.get(elf.sections[sym.section].name)
             if base is not None:
                 out.defined[sym.name] = base + sym.value
+    try:
+        text = cmp.relocate(elf, ".text", res.bases, _with(syms, res.inferred_symbols))[:out.size]
+        out.digest = hashlib.sha256(text).hexdigest()
+    except (KeyError, ValueError) as exc:
+        out.digest = f"error: {exc}"
     if expected_digest is not None:
-        try:
-            text = cmp.relocate(elf, ".text", res.bases, _with(syms, res.inferred_symbols))[:out.size]
-            out.digest = hashlib.sha256(text).hexdigest()
-        except (KeyError, ValueError) as exc:
-            out.digest = f"error: {exc}"
         out.digest_ok = out.digest == expected_digest
 
 

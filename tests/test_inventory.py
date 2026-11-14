@@ -7,6 +7,9 @@ import unittest
 from pathlib import Path
 
 from n64dk.match import context, inventory
+from n64dk.match.layout import Layout, preflight
+from n64dk.match.registry import SessionRegistry, resolve_store
+from n64dk.match.session import MatchSession, SessionStore
 
 
 class InventoryTests(unittest.TestCase):
@@ -61,6 +64,46 @@ segments:
             result = context.bundle(image, 0x80001000, 12)
             self.assertEqual(result["callees"], ["0x80001020"])
             self.assertEqual(len(result["disassembly"]), 3)
+
+    def test_layout_is_derived_from_section_and_rejects_data(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            image = root / "image.bin"
+            image.write_bytes(b"\0" * 0x100 + struct.pack(">III", 0x27BDFFF0, 0x03E00008, 0))
+            layout = Layout("overlay5", 0x100, 0x800C5F48, 0x100,
+                            0x800C5F48, 12)
+            result = preflight(image, layout)
+            self.assertEqual(layout.delta, 0x800C5E48)
+            self.assertEqual(result["mapping_authority"], "catalogue-section")
+            bad = root / "bad.bin"
+            bad.write_bytes(b"\0" * 0x100 + struct.pack(">III", 0x70000000, 0x70000000, 0x70000000))
+            with self.assertRaisesRegex(ValueError, "data-like"):
+                preflight(bad, layout)
+
+    def test_registry_resolves_legacy_tranche_store(self):
+        class Outcome:
+            exact = True
+            error = None
+            result = None
+            def as_dict(self):
+                return {"exact": True}
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            store_root = root / ".n64dk/quickwin-sweeps/sessions"
+            store = SessionStore(store_root)
+            try:
+                session_id, _ = MatchSession(store, lambda *_: Outcome()).create(
+                    {"rom_sha256": "a", "addr": 1, "size": 4}, b"x", "kmc+as", ())
+            finally:
+                store.close()
+            self.assertEqual(resolve_store(session_id, root), store_root)
+            registry = SessionRegistry(root)
+            try:
+                self.assertEqual(len(registry.same_target(
+                    {"rom_sha256": "a", "addr": 1, "size": 4})), 1)
+            finally:
+                registry.close()
 
 
 if __name__ == "__main__":

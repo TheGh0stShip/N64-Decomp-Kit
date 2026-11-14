@@ -111,6 +111,8 @@ n64dk match-session-try SESSION_ID [--proposal JSON_OR_FILE] [--jobs N]
 n64dk match-session-status SESSION_ID [--candidates]
 n64dk match-session-export SESSION_ID OUTPUT [--candidate-id ID]
 n64dk match-session-prepare-winner SESSION_ID OUTPUT_DIR [--candidate-id ID]
+n64dk match-session-explore SESSION_ID [--rounds N] [--variants-per-round N] [--jobs N]
+n64dk match-session-explain SESSION_ID --from CANDIDATE --to CANDIDATE
 ```
 
 ## Transactional matching sessions
@@ -179,6 +181,39 @@ Session state defaults to `.n64dk/match-sessions`, which is ignored by Git. Sour
 remain content-addressed there and are never written into the project tree during evaluation.
 `match-session-prepare-winner` accepts only an exact candidate, recompiles it independently,
 and writes source, a proof receipt, and an exact-winner queue row without editing the project.
+
+Sessions are registered project-wide. Status, try, export, explain, explore, and winner
+preparation resolve a session ID regardless of whether it originated as a standalone session
+or a tranche item; `--state-root` remains available only as an explicit override. Historical
+frontiers are keyed by loaded-image digest, section-derived mapping, address, and size, so an
+older better observation remains visible without conflating different images.
+
+## Residual-guided exploration
+
+`match-session-explore` repeatedly branches from every nondominated frontier candidate. Its
+small transformation library is activated by typed residual evidence and currently covers
+compound versus expanded field updates, declaration lifetime separation, commutative operand
+ordering, and bounded optimization-pressure flags. It never writes candidate files.
+
+```bash
+n64dk --format json match-session-explore SESSION_ID \
+  --strategy residual-guided --jobs 16 --rounds 8 \
+  --variants-per-round 12 --stop-on-exact --best-details
+```
+
+Each experiment has a stable signature over target session, parent source, pipeline, flags,
+hypothesis family, and variant digests. Repeated signatures are skipped. The durable ledger
+records unique compiled objects, best residual delta, rejected flags, conclusion, and result
+IDs. Search stops on exactness, exhaustion, or two rounds without a new frontier candidate.
+The compact result reports invariant residuals, disproved families, and escalation targets.
+
+Exploration refuses sessions without a successful image-layout preflight. This intentionally
+limits it to sessions whose catalogue section, loaded image, target interval, instruction
+validity, and return/fall-through boundary were verified before compilation.
+
+Use `match-session-explain` to compare two retained candidates. It reports improved and
+worsened residual classes, whether the sources compiled identically, a compact source diff,
+and whether the stated hypothesis was supported or refuted.
 
 All accept `--format json`. Manifests: source rows `ROM_START SIZE SOURCE FLAGS [SHA256]`
 (pipeline from the header comment: IDO / SN / KMC) or unit rows `UNIT VRAM SIZE [STATUS]`

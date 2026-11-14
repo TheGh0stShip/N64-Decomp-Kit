@@ -22,6 +22,7 @@ from n64dk.match.runner import ExecutionLimits, RunnerError, UnitRunner
 from n64dk.match.jobs import JobConfig, JobStore, MatchJob, generate_candidates
 from n64dk.match.session import (MatchSession, SessionCandidate, SessionStore,
                                  apply_edits, frontier)
+from n64dk.match.explore import explore
 from n64dk.match.profiles import ProfileRegistry
 from n64dk.project import OwnedSpan, WorkUnit
 from n64dk.research import audit as audit_research
@@ -615,6 +616,27 @@ class MatchSessionTests(unittest.TestCase):
         dominated = row("dominated", 9, {"register": 5, "scheduling": 2})
         self.assertEqual({item.candidate_id for item in frontier(
             [register_shape, schedule_shape, dominated])}, {"register", "schedule"})
+
+    def test_residual_explorer_is_bounded_and_records_negative_evidence(self):
+        def evaluate(source, pipeline, flags, label):
+            return self.FakeOutcome(5, {"register": 2, "scheduling": 1})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(tmp)
+            try:
+                session = MatchSession(store, evaluate)
+                session_id, _ = session.create(
+                    {"layout_preflight": {"ok": True}},
+                    b"int f(int x) { int y = x; y += x; return y; }\n",
+                    "kmc+as", ("-O2",))
+                result = explore(store, session, session_id, jobs=2, rounds=3,
+                                 variants_per_round=4)
+                self.assertLessEqual(result["rounds"], 3)
+                self.assertLessEqual(result["source_variants"], 12)
+                self.assertTrue(store.experiments(session_id))
+                self.assertIn("disproved_hypothesis_classes", result)
+            finally:
+                store.close()
 
 
 class ProfileTests(unittest.TestCase):

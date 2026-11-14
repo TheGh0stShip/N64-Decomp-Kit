@@ -105,6 +105,13 @@ class SessionStore:
                 updated_ns INTEGER NOT NULL,
                 PRIMARY KEY (pipeline_family, flag)
             );
+            CREATE TABLE IF NOT EXISTS session_experiments (
+                session_id TEXT NOT NULL, signature TEXT NOT NULL, round INTEGER NOT NULL,
+                family TEXT NOT NULL, parent_id TEXT NOT NULL, variants INTEGER NOT NULL,
+                unique_objects INTEGER NOT NULL, best_delta INTEGER, conclusion TEXT NOT NULL,
+                payload TEXT NOT NULL, created_ns INTEGER NOT NULL,
+                PRIMARY KEY (session_id, signature)
+            );
         """)
         self.db.commit()
 
@@ -199,6 +206,34 @@ class SessionStore:
                     updated_ns=excluded.updated_ns
             """, (self._family(pipeline), flag, int(supported), evidence[-2000:], time.time_ns()))
             self.db.commit()
+
+    def experiment_seen(self, session_id: str, signature: str) -> bool:
+        return self.db.execute("""SELECT 1 FROM session_experiments
+                                  WHERE session_id = ? AND signature = ?""",
+                               (session_id, signature)).fetchone() is not None
+
+    def record_experiment(self, session_id: str, signature: str, round_number: int,
+                          family: str, parent_id: str, variants: int, unique_objects: int,
+                          best_delta: int | None, conclusion: str, payload: dict) -> None:
+        self.db.execute("""INSERT OR IGNORE INTO session_experiments
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, signature, round_number, family, parent_id, variants, unique_objects,
+             best_delta, conclusion, _canonical(payload), time.time_ns()))
+        self.db.commit()
+
+    def experiments(self, session_id: str) -> list[dict]:
+        rows = self.db.execute("""SELECT signature, round, family, parent_id, variants,
+                   unique_objects, best_delta, conclusion, payload, created_ns
+                   FROM session_experiments WHERE session_id = ? ORDER BY created_ns""",
+                               (session_id,)).fetchall()
+        keys = ("signature", "round", "family", "parent_id", "variants", "unique_objects",
+                "best_delta", "conclusion", "payload", "created_ns")
+        result = []
+        for row in rows:
+            item = dict(zip(keys, row))
+            item["payload"] = json.loads(item["payload"])
+            result.append(item)
+        return result
 
 
 def _flags(value) -> tuple[str, ...]:
@@ -455,8 +490,8 @@ class MatchSession:
             "best": self.store.best(session_id).summary(details),
             "frontier": [row.summary(details) for row in current_frontier],
             "attempts": len(rows),
+            "suggestions": suggest(self.store.best(session_id).counts),
         }
-        result["suggestions"] = suggest(self.store.best(session_id).counts)
 
     def status(self, session_id: str, include_candidates: bool = False,
                details: bool = False) -> dict:
@@ -469,6 +504,8 @@ class MatchSession:
             "failed": sum(row.status == "failed" for row in rows),
             "best": self.store.best(session_id).summary(details),
             "frontier": [row.summary(details) for row in frontier(rows)],
+            "suggestions": suggest(self.store.best(session_id).counts),
+            "experiments": self.store.experiments(session_id),
         }
         if include_candidates:
             result["candidates"] = [row.summary(details) for row in rows]

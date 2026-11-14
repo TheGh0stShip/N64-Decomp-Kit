@@ -44,16 +44,20 @@ class InventoryFunction:
     end: int
     size: int
     rom: int
+    section_rom: int
+    section_vram: int
+    section_size: int
     catalogue_status: str
     state: str
     reason: str
     owner: str | None
     candidate_source: str | None
+    mapping_evidence: tuple[str, ...]
     rank: float | None
 
     def as_dict(self) -> dict:
         value = asdict(self)
-        for key in ("vram", "end", "rom"):
+        for key in ("vram", "end", "rom", "section_rom", "section_vram"):
             value[key] = f"0x{value[key]:X}"
         return value
 
@@ -100,7 +104,11 @@ def _manifest_intervals(project: Path, image: str,
     return result
 
 
-def _candidate_source(project: Path, name: str, vram: int) -> str | None:
+def _candidate_source(project: Path, name: str, vram: int, index=None) -> str | None:
+    if index is not None:
+        found = index.find(name, vram)
+        if found:
+            return found[0]["path"]
     candidates = [project / ".tmp" / f"{name}_candidate.c",
                   project / ".tmp" / f"func_{vram:08X}_candidate.c"]
     for candidate in candidates:
@@ -131,8 +139,12 @@ def _splat(project: Path) -> list[dict]:
     return result
 
 
-def build(project: str | Path) -> dict:
+def build(project: str | Path, refresh_sources: bool = False) -> dict:
     root = Path(project).expanduser().resolve()
+    from .source_index import SourceIndex
+    source_index = SourceIndex(root)
+    source_stats = source_index.refresh() if refresh_sources or source_index.empty() else {
+        "scanned": 0, "hashed": 0, "elapsed_seconds": 0.0, "cache_hit": True}
     functions: list[InventoryFunction] = []
     images = []
     for catalogue in _catalogues(root):
@@ -167,7 +179,7 @@ def build(project: str | Path) -> dict:
             structural = words & _EXCLUDED_WORDS
             if size < 12:
                 structural.add("undersized")
-            candidate = _candidate_source(root, name, start)
+            candidate = _candidate_source(root, name, start, source_index)
             if source_owners or status.startswith("c"):
                 state, reason = "covered", "covered by a C translation-unit interval"
                 owner = source_owners[0].source if source_owners else None
@@ -182,8 +194,11 @@ def build(project: str | Path) -> dict:
                 state, reason, owner = "remaining", "uncovered complete catalogue interval", candidate
                 rank = round(1000.0 / max(size, 4) + (25 if candidate else 0), 6)
             identity = hashlib.sha256(f"{root.name}:{image}:{start:x}:{end:x}".encode()).hexdigest()[:20]
-            item = InventoryFunction(identity, image, name, start, end, size, rom, status,
-                                     state, reason, owner, candidate, rank)
+            evidence = [f"catalogue:{catalogue.relative_to(root)}:{section[1]:#x}->{section[0]:#x}"]
+            evidence += [f"manifest:{claim.source}:{claim.start:#x}-{claim.end:#x}" for claim in owners]
+            item = InventoryFunction(identity, image, name, start, end, size, rom,
+                                     section[1], section[0], section[2], status,
+                                     state, reason, owner, candidate, tuple(evidence), rank)
             functions.append(item)
             image_rows.append(item)
         images.append({"name": image, "catalogue": str(catalogue.relative_to(root)),
@@ -192,11 +207,13 @@ def build(project: str | Path) -> dict:
                        "remaining": sum(row.state == "remaining" for row in image_rows),
                        "excluded": sum(row.state == "excluded" for row in image_rows)})
     functions.sort(key=lambda row: (row.image, row.vram))
+    source_index.close()
     return {
         "project": str(root),
         "model": "interval-v1",
         "images": images,
         "splat": _splat(root),
+        "source_index": source_stats,
         "summary": {"functions": len(functions),
                     "covered": sum(row.state == "covered" for row in functions),
                     "remaining": sum(row.state == "remaining" for row in functions),

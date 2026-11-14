@@ -34,6 +34,10 @@ and Mario Kart 64 (NKTE), located through `n64dk.fixtures` (roms.toml / N64DK_RO
 | `n64dk.match.experiments` | append-only causal experiment ledger |
 | `n64dk.match.jobs` | persistent candidate lineage, bounded generation, beam search, resume and export |
 | `n64dk.match.session` | transactional standalone edits, batched flag/source trials and residual frontier |
+| `n64dk.match.layout` | authoritative catalogue-section mapping and code/boundary preflight |
+| `n64dk.match.registry` | project-wide session resolution and historical target frontier |
+| `n64dk.match.source_index` | incremental content-addressed candidate-source discovery |
+| `n64dk.match.explore` | bounded residual-guided multi-round experiment loop and explanations |
 | `n64dk.match.provenance` | genuine-C and positive handwritten-assembly credit policy |
 | `n64dk.research` | source/finding quality audit before research is automated |
 | `n64dk.commands.*` | CLI subcommands (one module per area), registered with `@command` |

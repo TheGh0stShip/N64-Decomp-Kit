@@ -52,6 +52,12 @@ the rest are `needs-source`, so a missing semantic reconstruction is not disguis
 compiler failure. Resume with `--resume TRANCHE_ID`. A changed inventory requires a new
 tranche, preserving the denominator and ranking used by the earlier report.
 
+Candidate discovery uses `.n64dk/source-index.sqlite`. `--refresh-sources` performs an
+incremental path/mtime/size scan and hashes only changed candidate files. Build, extraction,
+bundle, archive, campaign, cache, and repository-control directories are ignored. Once a
+tranche exists, `--run-ready-only --resume ID` reads stored source and section mappings and
+does no inventory or source scan.
+
 To launch independent baseline sessions, provide one loaded image per selected inventory
 image:
 
@@ -63,9 +69,28 @@ n64dk --format json quickwin-sweep --project . --all-images --limit 500 --jobs 1
 ```
 
 Each ready function receives its own content-addressed transactional session under the sweep
-state root. Workers are distributed across functions, exact baselines stop only their own
+project's standard session store. Workers are distributed across functions, exact baselines stop only their own
 item, and near matches remain active with their session IDs. Re-running the tranche does not
 relaunch active or exact items.
+
+Before a worker is allocated, the mapping is recomputed from the containing catalogue
+section. The preflight verifies the function lies inside both section intervals and the loaded
+image, decodes the target, rejects data-like bytes, and verifies a return/tail or declared
+fall-through boundary. Its receipt records the first and last instructions, validity ratio,
+image digest, derived delta, and winning `catalogue-section` authority. A caller-supplied delta
+that disagrees with the catalogue is rejected.
+
+Compact inspection does not rerun inventory:
+
+```bash
+n64dk --format json quickwin-sweep-status TRANCHE_ID --summary-only
+n64dk --format json quickwin-sweep-status TRANCHE_ID --status active --best-details
+n64dk --format json quickwin-sweep-status TRANCHE_ID --needs-source --limit 50
+```
+
+Rows include the current score and residual counts, best historical session and score, and
+whether the new observation improved, tied, regressed, or had no predecessor. Session IDs are
+resolved through the project registry, including legacy tranche stores.
 
 ## Session transactions and exact winners
 

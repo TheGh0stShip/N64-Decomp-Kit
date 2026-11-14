@@ -101,6 +101,9 @@ export, and proof boundaries.
 | `match-inventory --project DIR` | Reconcile catalogues and manifest intervals, including aggregate translation units |
 | `context-bundle --project DIR --image IMAGE --function NAME` | Collect target code, callers, callees, globals and access patterns |
 | `quickwin-sweep --project DIR --all-images --limit N --jobs N` | Create/resume a persistent ranked cross-function tranche |
+| `quickwin-sweep-status ID [--status active]` | Filter tranche rows and inspect current versus historical best results |
+| `match-session-explore ID --rounds N --jobs N` | Run bounded residual-guided source experiments over the frontier |
+| `match-session-explain ID --from A --to B` | Explain residual and source changes between two candidates |
 | `match-session-prepare-winner SESSION_ID DIR` | Independently recompile an exact winner and prepare an auditable export queue |
 | `match-job-run PROJECT.toml --unit UNIT` | Create or resume a bounded, persistent candidate/compile/diagnose search job |
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |

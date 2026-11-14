@@ -15,6 +15,7 @@ from ..match import symbols as symmod
 from ..match.engine import Target, batch, default_pipelines, manifest_row, match_source, sweep
 from ..match.pipeline import PIPELINES, BuildSpec, split_flags, scratch_dir
 from ..match.session import MatchSession, SessionStore
+from ..match.registry import SessionRegistry, resolve_store, standard_store
 from ..match.toolchain import Config, PROFILES, load_config
 from ..rom import Rom
 
@@ -218,7 +219,7 @@ def _session_start_args(p):
     p.add_argument("--pipeline", choices=PIPELINES)
     p.add_argument("--flags")
     p.add_argument("--no-infer", action="store_true")
-    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--state-root", help="session store (default: <project>/.n64dk/match-sessions)")
     p.add_argument("--details", action="store_true", help="include the full instruction diff")
     _session_output_args(p)
 
@@ -245,7 +246,7 @@ def _project_session_output(value: dict, args, store: SessionStore | None = None
         return {"session_id": value["session_id"], "candidate": candidate.summary(True)}
     if getattr(args, "summary_only", False):
         return {key: item for key, item in value.items()
-                if key not in {"frontier", "results", "candidates", "context"}}
+                if key not in {"frontier", "results", "candidates", "context", "experiments"}}
     if getattr(args, "exact_only", False):
         result = dict(value)
         for key in ("frontier", "results", "candidates"):
@@ -262,14 +263,20 @@ def match_session_start(args):
     source_bytes = source.read_bytes() if args.source != "-" else sys.stdin.buffer.read()
     spec = _spec(args, cfg)
     context = _session_context(args, cfg, target, sym_files, source, spec)
-    store = SessionStore(args.state_root)
+    store_root = Path(args.state_root).resolve() if args.state_root else standard_store(cfg.project)
+    store = SessionStore(store_root)
     try:
         session = MatchSession(store, _session_evaluator(context))
         session_id, baseline = session.create(context, source_bytes,
                                               spec.pipeline, tuple(spec.flags))
+        registry = SessionRegistry(cfg.project)
+        try:
+            registry.register(session_id, store_root, context, baseline.source_digest, "standalone")
+        finally:
+            registry.close()
         result = {
             "session_id": session_id,
-            "state_root": str(Path(args.state_root).resolve()),
+            "state_root": str(store_root),
             "baseline": baseline.summary(args.details or args.best_details),
             "frontier": [baseline.summary(args.details or args.best_details)] if baseline.status == "evaluated" else [],
         }
@@ -291,7 +298,8 @@ def _read_proposal(value: str) -> dict:
 
 def _session_try_args(p):
     p.add_argument("session_id")
-    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--state-root")
+    p.add_argument("--project", default=".")
     p.add_argument("--proposal", default="-",
                    help="JSON object, JSON file, or - for stdin (default)")
     p.add_argument("--jobs", type=int, default=4)
@@ -301,7 +309,7 @@ def _session_try_args(p):
 
 @command("match-session-try", "Apply in-memory edits and evaluate source/flag variants as one transaction")
 def match_session_try(args):
-    store = SessionStore(args.state_root)
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         context = store.context(args.session_id)
         session = MatchSession(store, _session_evaluator(context))
@@ -317,7 +325,8 @@ match_session_try.arguments = _session_try_args
 
 def _session_status_args(p):
     p.add_argument("session_id")
-    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--state-root")
+    p.add_argument("--project", default=".")
     p.add_argument("--candidates", action="store_true")
     p.add_argument("--details", action="store_true", help="include full outcome and diff entries")
     _session_output_args(p)
@@ -325,11 +334,18 @@ def _session_status_args(p):
 
 @command("match-session-status", "Inspect a standalone matching session and its residual frontier")
 def match_session_status(args):
-    store = SessionStore(args.state_root)
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         session = MatchSession(store, lambda *_args: None)
         value = session.status(args.session_id, args.candidates or args.exact_only,
                                args.details or args.best_details)
+        registry = SessionRegistry(args.project)
+        try:
+            historical = registry.same_target(store.context(args.session_id))
+        finally:
+            registry.close()
+        value["project_best"] = historical[0] if historical else None
+        value["historical_sessions"] = len(historical)
         return _project_session_output(value, args, store)
     finally:
         store.close()
@@ -341,13 +357,14 @@ match_session_status.arguments = _session_status_args
 def _session_export_args(p):
     p.add_argument("session_id")
     p.add_argument("output")
-    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--state-root")
+    p.add_argument("--project", default=".")
     p.add_argument("--candidate-id", help="default: current best candidate")
 
 
 @command("match-session-export", "Export a retained session candidate without editing project source")
 def match_session_export(args):
-    store = SessionStore(args.state_root)
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         candidate = (store.get(args.session_id, args.candidate_id)
                      if args.candidate_id else store.best(args.session_id))
@@ -370,13 +387,14 @@ match_session_export.arguments = _session_export_args
 def _winner_prepare_args(p):
     p.add_argument("session_id")
     p.add_argument("output_dir")
-    p.add_argument("--state-root", default=".n64dk/match-sessions")
+    p.add_argument("--state-root")
+    p.add_argument("--project", default=".")
     p.add_argument("--candidate-id", help="default: exact best candidate")
 
 
 @command("match-session-prepare-winner", "Independently recompile an exact candidate and prepare an integration transaction")
 def match_session_prepare_winner(args):
-    store = SessionStore(args.state_root)
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
     try:
         candidate = (store.get(args.session_id, args.candidate_id)
                      if args.candidate_id else store.best(args.session_id))
@@ -417,6 +435,57 @@ def match_session_prepare_winner(args):
 
 
 match_session_prepare_winner.arguments = _winner_prepare_args
+
+
+def _session_explore_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--strategy", choices=("residual-guided",), default="residual-guided")
+    p.add_argument("--jobs", type=int, default=4)
+    p.add_argument("--rounds", type=int, default=4)
+    p.add_argument("--variants-per-round", type=int, default=12)
+    p.add_argument("--stop-on-exact", action="store_true")
+    p.add_argument("--best-details", action="store_true")
+
+
+@command("match-session-explore", "Run bounded multi-round residual-guided source experiments")
+def match_session_explore(args):
+    from ..match.explore import explore
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        session = MatchSession(store, _session_evaluator(store.context(args.session_id)))
+        result = explore(store, session, args.session_id, args.jobs, args.rounds,
+                         args.variants_per_round, args.stop_on_exact)
+        if args.best_details:
+            result["best"] = store.best(args.session_id).summary(True)
+        return result
+    finally:
+        store.close()
+
+
+match_session_explore.arguments = _session_explore_args
+
+
+def _session_explain_args(p):
+    p.add_argument("session_id")
+    p.add_argument("--project", default=".")
+    p.add_argument("--state-root")
+    p.add_argument("--from", dest="from_id", required=True)
+    p.add_argument("--to", dest="to_id", required=True)
+
+
+@command("match-session-explain", "Explain source and residual changes between two candidates")
+def match_session_explain(args):
+    from ..match.explore import explain
+    store = SessionStore(resolve_store(args.session_id, args.project, args.state_root))
+    try:
+        return explain(store, args.session_id, args.from_id, args.to_id)
+    finally:
+        store.close()
+
+
+match_session_explain.arguments = _session_explain_args
 
 
 def _batch_args(p):
