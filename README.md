@@ -37,6 +37,9 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
+First-draft lifting is optional. Install it with `.venv/bin/pip install -e '.[draft]'`;
+ordinary analysis and matching do not require m2c.
+
 ROM images are never part of the repository. Pass a path on the command line; tests and
 fixtures find ROMs through `roms.toml` (ignored by git) or the `N64DK_ROMS` environment
 variable (see [Tests](#tests)).
@@ -104,6 +107,12 @@ export, and proof boundaries.
 | `quickwin-sweep-status ID [--status active]` | Filter tranche rows and inspect current versus historical best results |
 | `tranche-run --project DIR --all-images --limit N --jobs N` | Run cached preflight, per-function recipes, durable matching, bounded exploration and winner queuing |
 | `source-scaffold FUNCTION --image FILE` | Emit compilable ordinary C and a separate evidence receipt for a source-less interval |
+| `m2c-draft IMAGE --addr A --size N --vram-delta D` | Emit symbolized assembly and, when m2c is installed, a first-draft C function without modifying project source |
+| `draft-sweep --rom IMAGE --catalogue FILE --out DIR` | Preflight source-less intervals, lift them with m2c, apply bounded compile repairs and rank exact/near drafts |
+| `fragment-audit IMAGE --catalogue FILE --vram-delta D` | Identify probable interior catalogue starts and produce advisory merge proposals |
+| `asm-score TARGET CANDIDATE` | Compute asm-differ/decomp-permuter-style penalties alongside byte-exact matching evidence |
+| `match-hints REPORT.json` | Convert aligned residual instructions into compiler-aware source hypotheses |
+| `similar-queue --set NAME,IMAGE,DELTA,CATALOGUE[,MANIFEST...]` | Rank unmatched functions by reusable matched siblings and estimated difficulty |
 | `structure-layout-infer` / `prototype-solve` / `tu-reconstruct` | Aggregate shared types, solve ABI declarations and prepare whole-unit reconstruction |
 | `match-session-explore ID --rounds N --jobs N` | Run bounded residual-guided source experiments over the frontier |
 | `match-session-explain ID --from A --to B` | Explain residual and source changes between two candidates |

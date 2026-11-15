@@ -1655,6 +1655,10 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(len(specs), 48)
         self.assertEqual(specs[24].pipeline, "ido5.3")
         self.assertEqual(non_axis_flags(["-O2", "-G", "0", "-DX", "-mips2", "-nostdinc", "-g"]), ["-DX", "-nostdinc"])
+        extended = sweep_specs(["kmc+builtin"], extended=True)
+        self.assertGreater(len(extended), 24)
+        self.assertTrue(any("-mcpu=r4600" in spec.flags for spec in extended))
+        self.assertFalse(any("-mcpu=r4600" in spec.flags and "-mips3" not in spec.flags for spec in extended))
 
 
 # ---------------------------------------------------------------------------- ROM tests

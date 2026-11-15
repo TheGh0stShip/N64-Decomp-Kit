@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import csv
+import contextlib
 import hashlib
 import json
+import random
 import sqlite3
 import threading
 import time
@@ -181,12 +183,16 @@ def _sweep_args(p):
                    help="incrementally refresh the persistent candidate-source index")
     p.add_argument("--run-ready-only", action="store_true",
                    help="resume stored ready items without rebuilding inventory or scanning sources")
+    p.add_argument("--draft-missing", action="store_true",
+                   help="use m2c to create transient starter C for verified source-less intervals")
+    p.add_argument("--m2c-context", help="preprocessed declarations/types supplied to m2c drafts")
     p.add_argument("--details", action="store_true", help="include every tranche item")
 
 
 def _state(root: Path) -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(root / "sweeps.sqlite", timeout=30, check_same_thread=False)
+    db = sqlite3.connect(root / "sweeps.sqlite", timeout=30, check_same_thread=False,
+                         isolation_level=None)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS tranches (
@@ -213,6 +219,28 @@ def _state(root: Path) -> sqlite3.Connection:
                 if "duplicate column" not in str(error).lower(): raise
     db.commit()
     return db
+
+
+@contextlib.contextmanager
+def _immediate(db: sqlite3.Connection, attempts: int = 8):
+    """Serialize a short metadata write and retry external WAL contention with jitter."""
+    delay = 0.01
+    for attempt in range(attempts):
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            break
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error).lower() or attempt + 1 == attempts:
+                raise
+            time.sleep(delay + random.random() * delay)
+            delay = min(delay * 2, 0.5)
+    try:
+        yield
+    except BaseException:
+        db.rollback()
+        raise
+    else:
+        db.commit()
 
 
 def _launch_one(args, context_cache: ProjectContext, row: dict, phase=None):
@@ -286,6 +314,50 @@ def _launch_one(args, context_cache: ProjectContext, row: dict, phase=None):
         store.close()
 
 
+def _draft_missing_source(args, context_cache: ProjectContext, row: dict, check: dict,
+                          recipe: dict) -> dict:
+    """Create a content-addressed, non-project draft for one verified interval."""
+    import tempfile
+
+    from ..match import autodraft
+    from ..match.engine import Target, match_source
+    from ..match.pipeline import split_flags
+
+    image = context_cache.image(row["image"])
+    offset = int(check["selected_image_offset"], 0)
+    size = int(row["size"])
+    vram = int(row["vram"], 0)
+    if offset < 0 or offset + size > len(image.data):
+        return {"ok": False, "state": "draft_failed", "reason": "verified interval is outside loaded image"}
+    delta = vram - offset
+    context = Path(args.m2c_context).expanduser().resolve() if getattr(args, "m2c_context", None) else None
+    root = Path(args.state_root).expanduser().resolve() / "drafts" / image.digest[:16]
+    root.mkdir(parents=True, exist_ok=True)
+    spec = split_flags(list(recipe["flags"]), recipe["pipeline"])
+    target = Target(image.data, delta, (0, len(image.data)))
+    with tempfile.TemporaryDirectory(prefix="n64dk-autodraft-build-") as work:
+        def evaluate(path, address, length):
+            return match_source(path, spec, context_cache.config, target, address, length,
+                                context_cache.symbols, Path(work), None)
+
+        draft = autodraft.draft_one(row["name"], vram, size, image.data[offset:offset + size],
+                                    lambda _address: None, evaluate, root,
+                                    compiler=recipe["pipeline"], context=context,
+                                    family="ido" if recipe["pipeline"].startswith("ido") else "gcc",
+                                    image=image.data, image_vram=delta)
+    if draft.status not in {"compiled", "exact"} or not draft.source_path:
+        return {"ok": False, "state": "draft_failed", "reason": draft.error or draft.status,
+                "draft_status": draft.status, "jump_tables": draft.jump_tables,
+                "repairs": draft.repairs}
+    source = Path(draft.source_path).read_text()
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    path = root / f"{row['name']}-{digest[:16]}.c"
+    path.write_text(source)
+    return {"ok": True, "state": "ready_verified", "path": str(path), "digest": digest,
+            "draft_status": draft.status, "draft_score": draft.score,
+            "jump_tables": draft.jump_tables, "repairs": draft.repairs}
+
+
 @command("quickwin-sweep", "Create or resume a persistent interval-aware cross-function tranche")
 def quickwin_sweep(args):
     overall_started = time.monotonic()
@@ -345,10 +417,18 @@ def quickwin_sweep(args):
                             image.path, from_inventory(row), data=image.data)
                     excluded = True
                 else:
-                    source = context_cache.validate_source(row)
-                    planned["source_validation"] = source
                     planned["compiler_recipe"] = context_cache.infer_recipe(
                         row, getattr(args, "pipeline", None), getattr(args, "flags", None))
+                    source = context_cache.validate_source(row)
+                    if (not source["ok"] and source["state"] == "source_missing"
+                            and getattr(args, "draft_missing", False)):
+                        source = _draft_missing_source(args, context_cache, row,
+                                                       planned["layout_preflight"],
+                                                       planned["compiler_recipe"])
+                        if source["ok"]:
+                            planned["candidate_source"] = source["path"]
+                            row["candidate_source"] = source["path"]
+                    planned["source_validation"] = source
                     if not source["ok"]:
                         planned["planned_status"] = source["state"]
                         planned["planned_reason"] = source["reason"]
@@ -424,21 +504,22 @@ def quickwin_sweep(args):
                 with write_lock:
                     db_started = time.monotonic()
                     now_ns = time.time_ns()
-                    db.execute("""UPDATE tranche_items SET phase=?,status=?,worker_id=?,heartbeat_ns=?,
-                                  started_ns=COALESCE(started_ns,?),finished_ns=CASE WHEN ? THEN ? ELSE finished_ns END,
-                                  updated_ns=? WHERE tranche_id=? AND function_id=?""",
-                               (phase, status, worker or threading.current_thread().name, now_ns, now_ns,
-                                int(finished), now_ns, now_ns, tranche_id, function_id)); db.commit()
+                    with _immediate(db):
+                        db.execute("""UPDATE tranche_items SET phase=?,status=?,worker_id=?,heartbeat_ns=?,
+                                      started_ns=COALESCE(started_ns,?),finished_ns=CASE WHEN ? THEN ? ELSE finished_ns END,
+                                      updated_ns=? WHERE tranche_id=? AND function_id=?""",
+                                   (phase, status, worker or threading.current_thread().name, now_ns, now_ns,
+                                    int(finished), now_ns, now_ns, tranche_id, function_id))
                     database_seconds += time.monotonic() - db_started
             def launch(function_id: str):
                 with write_lock:
-                    claimed = db.execute("""UPDATE tranche_items SET status='running',phase='claimed',
-                        worker_id=?,started_ns=COALESCE(started_ns,?),heartbeat_ns=?,updated_ns=?
-                        WHERE tranche_id=? AND function_id=? AND status IN
-                        ('ready_verified','interrupted','stale_running')""",
-                        (threading.current_thread().name, time.time_ns(), time.time_ns(), time.time_ns(),
-                         tranche_id, function_id)).rowcount
-                    db.commit()
+                    with _immediate(db):
+                        claimed = db.execute("""UPDATE tranche_items SET status='running',phase='claimed',
+                            worker_id=?,started_ns=COALESCE(started_ns,?),heartbeat_ns=?,updated_ns=?
+                            WHERE tranche_id=? AND function_id=? AND status IN
+                            ('ready_verified','interrupted','stale_running')""",
+                            (threading.current_thread().name, time.time_ns(), time.time_ns(), time.time_ns(),
+                             tranche_id, function_id)).rowcount
                 if not claimed:
                     return function_id, "skipped_claimed", None, None, {}, None, None, "blocked", \
                         "row was claimed by another worker", None, {}
@@ -465,9 +546,10 @@ def quickwin_sweep(args):
                     while not heartbeat_stop.wait(5):
                         with write_lock:
                             db_started = time.monotonic(); now_ns = time.time_ns()
-                            db.execute("""UPDATE tranche_items SET heartbeat_ns=?,updated_ns=?
-                                          WHERE tranche_id=? AND status='running'""",
-                                       (now_ns, now_ns, tranche_id)); db.commit()
+                            with _immediate(db):
+                                db.execute("""UPDATE tranche_items SET heartbeat_ns=?,updated_ns=?
+                                              WHERE tranche_id=? AND status='running'""",
+                                           (now_ns, now_ns, tranche_id))
                             database_seconds += time.monotonic() - db_started
                 heartbeat_thread = threading.Thread(target=heartbeat, name="n64dk-tranche-heartbeat", daemon=True)
                 heartbeat_thread.start()
@@ -478,21 +560,23 @@ def quickwin_sweep(args):
                          historical_score, comparison, reason, recipe, timing) = result
                         with write_lock:
                             db_started = time.monotonic()
-                            db.execute("""UPDATE tranche_items SET status=?,phase='complete',session_id=?,reason=?,
-                              best_score=?,residual_counts=?,historical_session_id=?,historical_score=?,comparison=?,
-                              recipe=?,timing=?,finished_ns=?,heartbeat_ns=?,updated_ns=?
-                              WHERE tranche_id=? AND function_id=?""", (status, session_id, reason, score,
-                              json.dumps(counts, sort_keys=True), historical_session, historical_score, comparison,
-                              json.dumps(recipe, sort_keys=True) if recipe is not None else None,
-                              json.dumps(timing, sort_keys=True), time.time_ns(),
-                              time.time_ns(), time.time_ns(), tranche_id, function_id)); db.commit()
+                            with _immediate(db):
+                                db.execute("""UPDATE tranche_items SET status=?,phase='complete',session_id=?,reason=?,
+                                  best_score=?,residual_counts=?,historical_session_id=?,historical_score=?,comparison=?,
+                                  recipe=?,timing=?,finished_ns=?,heartbeat_ns=?,updated_ns=?
+                                  WHERE tranche_id=? AND function_id=?""", (status, session_id, reason, score,
+                                  json.dumps(counts, sort_keys=True), historical_session, historical_score, comparison,
+                                  json.dumps(recipe, sort_keys=True) if recipe is not None else None,
+                                  json.dumps(timing, sort_keys=True), time.time_ns(),
+                                  time.time_ns(), time.time_ns(), tranche_id, function_id))
                             database_seconds += time.monotonic() - db_started
                 except KeyboardInterrupt:
                     cancel_event.set()
                     for future in futures: future.cancel()
                     with write_lock:
-                        db.execute("""UPDATE tranche_items SET status='interrupted',phase='cancelled',updated_ns=?
-                                      WHERE tranche_id=? AND status='running'""", (time.time_ns(), tranche_id)); db.commit()
+                        with _immediate(db):
+                            db.execute("""UPDATE tranche_items SET status='interrupted',phase='cancelled',updated_ns=?
+                                          WHERE tranche_id=? AND status='running'""", (time.time_ns(), tranche_id))
                     raise
                 finally:
                     heartbeat_stop.set(); heartbeat_thread.join()
@@ -655,6 +739,9 @@ def _tranche_run_args(p):
     p.add_argument("--prepare-exact", action="store_true")
     p.add_argument("--gate-exact", action="store_true")
     p.add_argument("--checkpoint-every", type=int, default=1)
+    p.add_argument("--no-draft-missing", action="store_false", dest="draft_missing", default=True,
+                   help="leave source-less verified intervals queued instead of generating m2c drafts")
+    p.add_argument("--m2c-context", help="preprocessed declarations/types supplied to m2c drafts")
     p.add_argument("--pipeline")
     p.add_argument("--flags")
     p.add_argument("--report")
@@ -668,7 +755,8 @@ def tranche_run(args):
     sweep_args = Namespace(project=args.project, all_images=args.all_images, image=args.image,
         limit=args.limit, jobs=args.jobs, state_root=args.state_root, resume=None, report=args.report,
         run=args.run_ready, image_file=args.image_file, pipeline=args.pipeline, flags=args.flags,
-        refresh_sources=False, run_ready_only=False, details=False, format=getattr(args, "format", "json"))
+        refresh_sources=False, run_ready_only=False, details=False, format=getattr(args, "format", "json"),
+        draft_missing=args.draft_missing, m2c_context=args.m2c_context)
     result = quickwin_sweep(sweep_args); tranche_id = result["tranche_id"]
     db = _state(Path(args.state_root)); explored = []; prepared = []
     try:

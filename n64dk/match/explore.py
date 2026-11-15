@@ -31,7 +31,8 @@ def _replace_each(pattern, source: str, replacement, family: str, limit: int) ->
     return out
 
 
-def variants(source: str, counts: dict[str, int], limit: int) -> list[dict]:
+def variants(source: str, counts: dict[str, int], limit: int,
+             compiler_family: str = "any") -> list[dict]:
     """Generate small ordinary-C edits selected by residual evidence."""
     proposed = []
     if counts.get("register") or counts.get("scheduling"):
@@ -39,10 +40,11 @@ def variants(source: str, counts: dict[str, int], limit: int) -> list[dict]:
             lambda m: f"{m[1]}{m[2]} {m[3]}= {m[4]};", "compound-assignment", limit)
         proposed += _replace_each(_COMPOUND, source,
             lambda m: f"{m[1]}{m[2]} = {m[2]} {m[3]} {m[4]};", "expanded-assignment", limit)
-        proposed += _replace_each(_DECL, source,
-            lambda m: f"{m[1]}{m[2]} {m[3]};\n{m[1]}{m[3]} = {m[4]};",
-            "declaration-lifetime-separation", limit)
-    if counts.get("operand-order") or counts.get("register"):
+        if compiler_family != "gcc":
+            proposed += _replace_each(_DECL, source,
+                lambda m: f"{m[1]}{m[2]} {m[3]};\n{m[1]}{m[3]} = {m[4]};",
+                "declaration-lifetime-separation", limit)
+    if counts.get("operand-order") or (counts.get("register") and compiler_family != "gcc"):
         proposed += _replace_each(_COMMUTE, source,
             lambda m: f"{m[3]} {m[2]} {m[1]}", "commutative-operand-order", limit)
     unique = {}
@@ -96,7 +98,9 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
             if remaining <= 0:
                 break
             source = store.cache.get(parent.source_digest).decode()
-            generated = variants(source, parent.counts, remaining) if "spelling" in dimensions else []
+            compiler_family = ("ido" if parent.pipeline.startswith("ido") else
+                               "gcc" if parent.pipeline.startswith(("kmc", "gcc", "sn")) else "any")
+            generated = variants(source, parent.counts, remaining, compiler_family) if "spelling" in dimensions else []
             graph = lifetime_graph(parent.outcome, context)
             ownership = graph.get("call_result_ownership", {})
             if "lifetime" in dimensions and ownership.get("transfers"):
@@ -105,7 +109,11 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
                 generated += lifetime_variants(source, graph, remaining - len(generated))
             if "narrowing" in dimensions and parent.counts.get("instruction"):
                 generated += narrowing_variants(source, remaining - len(generated))
-            if "prototype" in dimensions:
+            residual_entries = parent.outcome.get("diff", {}).get("entries", [])
+            call_residual = bool(ownership.get("transfers")) or any(
+                str(entry.get(side) or "").split(None, 1)[0] in {"jal", "jalr", "bal"}
+                for entry in residual_entries for side in ("compiled", "retail"))
+            if "prototype" in dimensions and (compiler_family != "gcc" or call_residual):
                 declarations = re.findall(r"(?m)^\s*(?:extern\s+)?[\w *]+\s+(func_[0-9A-Fa-f]{8})\s*\([^;]*\)\s*;", source)
                 for symbol in declarations[:2]:
                     generated += prototype_variants(source, symbol, ["void", "s16", "u16", "s32"],

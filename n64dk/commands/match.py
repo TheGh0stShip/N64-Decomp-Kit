@@ -172,6 +172,8 @@ def _match_args(p):
                    help="search pipelines x flags x rodata placement for the first exact configuration")
     p.add_argument("--pipelines", help="comma-separated pipelines for --sweep (default: all available)")
     p.add_argument("--all", action="store_true", help="with --sweep: do not stop at the first exact result")
+    p.add_argument("--extended-flags", action="store_true",
+                   help="with --sweep: add bounded GCC CPU and optimization-pass discriminators")
     p.add_argument("--no-infer", action="store_true",
                    help="do not recover unresolved external symbols from the retail code")
     p.add_argument("--lines", type=int, default=24, help="diff lines shown in text output")
@@ -185,7 +187,7 @@ def match(args):
         pipes = args.pipelines.split(",") if args.pipelines else None
         base = split_flags(shlex.split(args.flags), "kmc+builtin") if args.flags else None
         res = sweep(source, cfg, target, args.addr, args.size, syms, pipes, args.jobs,
-                    stop_at_first=not args.all, base_spec=base)
+                    stop_at_first=not args.all, base_spec=base, extended_flags=args.extended_flags)
         out = {"source": str(source), "vram": f"0x{(res.exact.vram if res.exact else args.addr or 0):08X}",
                "tried": len(res.tried),
                "pipelines": pipes or default_pipelines(cfg), "exact": res.exact is not None}

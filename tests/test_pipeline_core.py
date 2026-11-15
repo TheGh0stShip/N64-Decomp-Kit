@@ -22,7 +22,7 @@ from n64dk.match.runner import ExecutionLimits, RunnerError, UnitRunner
 from n64dk.match.jobs import JobConfig, JobStore, MatchJob, generate_candidates
 from n64dk.match.session import (MatchSession, SessionCandidate, SessionStore,
                                  apply_edits, frontier)
-from n64dk.match.explore import explore
+from n64dk.match.explore import explore, variants as explore_variants
 from n64dk.match.profiles import ProfileRegistry
 from n64dk.project import OwnedSpan, WorkUnit
 from n64dk.research import audit as audit_research
@@ -532,6 +532,14 @@ class MatchJobTests(unittest.TestCase):
 
 
 class MatchSessionTests(unittest.TestCase):
+    def test_gcc_spelling_search_skips_erased_families(self):
+        source = "s32 f(s32 a, s32 b) { s32 x = a + b; return x; }"
+        gcc = explore_variants(source, {"register": 1}, 20, "gcc")
+        other = explore_variants(source, {"register": 1}, 20, "ido")
+        self.assertNotIn("commutative-operand-order", {item["family"] for item in gcc})
+        self.assertNotIn("declaration-lifetime-separation", {item["family"] for item in gcc})
+        self.assertIn("commutative-operand-order", {item["family"] for item in other})
+
     class FakeOutcome:
         def __init__(self, score, counts, exact=False, error=None):
             from types import SimpleNamespace

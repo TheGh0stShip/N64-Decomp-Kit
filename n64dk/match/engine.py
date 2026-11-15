@@ -215,7 +215,7 @@ def _l(x):
     return list(x) if isinstance(x, list) else [x]
 
 
-def sweep_specs(pipelines: list[str]) -> list[BuildSpec]:
+def sweep_specs(pipelines: list[str], extended: bool = False) -> list[BuildSpec]:
     """Configurations in preference order: flags vary fastest within each pipeline, with the
     usual retail settings (-O2, no -g, -mips3/-mips2, -G0) first."""
     out = []
@@ -230,6 +230,16 @@ def sweep_specs(pipelines: list[str]) -> list[BuildSpec]:
             else:
                 flags += [*_l(G), *_l(isa)]
             out.append(BuildSpec(pipe, flags))
+    if extended:
+        additions = []
+        for spec in out:
+            if spec.pipeline.startswith("ido"):
+                continue
+            options = ["-fno-schedule-insns2", "-fforce-addr", "-fno-force-mem", "-fvolatile"]
+            if "-mips3" in spec.flags:
+                options += ["-mcpu=r4600", "-mcpu=r4650"]
+            additions += [BuildSpec(spec.pipeline, [*spec.flags, option]) for option in options]
+        out += additions
     return out
 
 
@@ -267,10 +277,10 @@ class SweepResult:
 def sweep(source: Path, cfg: Config, target: Target, vram: int, size: int | None,
           symbols: symmod.SymbolMap, pipelines: list[str] | None = None, jobs: int | None = None,
           includes: list[Path] | None = None, stop_at_first: bool = True,
-          base_spec: BuildSpec | None = None) -> SweepResult:
+          base_spec: BuildSpec | None = None, extended_flags: bool = False) -> SweepResult:
     """Try pipelines x flags (x rodata placement, done inside the compare) and stop at the
     first exact configuration in preference order."""
-    specs = sweep_specs(pipelines or default_pipelines(cfg))
+    specs = sweep_specs(pipelines or default_pipelines(cfg), extended_flags)
     if base_spec is not None:
         extra = non_axis_flags(base_spec.flags)
         for s in specs:

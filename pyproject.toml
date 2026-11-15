@@ -7,6 +7,9 @@ license = {text = "GPL-3.0-or-later"}
 requires-python = ">=3.11"
 dependencies = ["rabbitizer>=1.16"]
 
+[project.optional-dependencies]
+draft = ["m2c @ git+https://github.com/matt-kempster/m2c"]
+
 [project.scripts]
 n64dk = "n64dk.cli:main"
 

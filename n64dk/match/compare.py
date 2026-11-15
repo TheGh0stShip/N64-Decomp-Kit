@@ -223,6 +223,7 @@ class Result:
     inferred_symbols: dict[str, int] = field(default_factory=dict)
     diff: diffmod.Report | None = None
     compiled_size: int = 0
+    compiled_text: bytes = field(default=b"", repr=False)
     error: str | None = None
 
     def as_dict(self) -> dict:
@@ -295,7 +296,8 @@ def compare_object(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int 
         exact = error is None and body == target and len(body) == size and tail_ok
         note = "" if tail_ok else "nonzero bytes after expected size"
         res = Result(exact, SectionCompare(".text", text_vram, size, exact, _first_diff(body, target), note),
-                     bases=trial, inferred_symbols=inferred, compiled_size=len(text), error=error)
+                     bases=trial, inferred_symbols=inferred, compiled_size=len(text),
+                     compiled_text=text, error=error)
         if best is None or (res.exact and not best.exact) or (
                 not best.exact and res.text.first_diff is not None and best.text.first_diff is not None
                 and res.text.first_diff > best.text.first_diff):
