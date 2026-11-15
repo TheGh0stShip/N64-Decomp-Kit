@@ -54,7 +54,7 @@ delta.
 
 ## Verification performed during integration
 
-- Full suite: 527 tests passed, 17 skipped.
+- Full suite: 529 tests passed, 17 skipped.
 - Real donor transplant test: BattleTanx to Nagano passed under the IDO toolchain.
 - Fresh Nagano sample: 40/40 selected functions were strictly exact, 320 bytes, in 7.5 seconds;
   all 40 entered the strict queue and none were assumed.
