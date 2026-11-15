@@ -22,7 +22,8 @@ from n64dk.match.runner import ExecutionLimits, RunnerError, UnitRunner
 from n64dk.match.jobs import JobConfig, JobStore, MatchJob, generate_candidates
 from n64dk.match.session import (MatchSession, SessionCandidate, SessionStore,
                                  apply_edits, frontier)
-from n64dk.match.explore import explore, variants as explore_variants
+from n64dk.match.explore import (_frontier_signature, _opcode, explore,
+                                 variants as explore_variants)
 from n64dk.match.profiles import ProfileRegistry
 from n64dk.project import OwnedSpan, WorkUnit
 from n64dk.research import audit as audit_research
@@ -532,6 +533,20 @@ class MatchJobTests(unittest.TestCase):
 
 
 class MatchSessionTests(unittest.TestCase):
+    def test_residual_opcode_accepts_missing_insertion_and_deletion_sides(self):
+        self.assertEqual(_opcode(""), "")
+        self.assertEqual(_opcode(None), "")
+        self.assertEqual(_opcode("  jal func_80000000"), "jal")
+
+    def test_frontier_stagnation_ignores_duplicate_candidate_ids(self):
+        def row(identity):
+            return SessionCandidate(identity, None, "a" * 64, identity, "test",
+                                    "kmc+as", ("-O2",), "evaluated", False, 5,
+                                    {"register": 1}, {"sha256_text": "b" * 64}, None, 1)
+
+        self.assertEqual(_frontier_signature([row("first")]),
+                         _frontier_signature([row("second")]))
+
     def test_gcc_spelling_search_skips_erased_families(self):
         source = "s32 f(s32 a, s32 b) { s32 x = a + b; return x; }"
         gcc = explore_variants(source, {"register": 1}, 20, "gcc")

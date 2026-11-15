@@ -19,6 +19,12 @@ _COMPOUND = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*(?:->|\.)[A-Za-z_]\w*)\s*([+\-*|
 _COMMUTE = re.compile(r"\b([A-Za-z_]\w*(?:->\w+|\.\w+)?)\s*([+*|&^])\s*([A-Za-z_]\w*(?:->\w+|\.\w+)?)\b")
 
 
+def _opcode(value) -> str:
+    """Return an instruction opcode, including for an absent diff side."""
+    parts = str(value or "").split(None, 1)
+    return parts[0] if parts else ""
+
+
 def _replace_each(pattern, source: str, replacement, family: str, limit: int) -> list[dict]:
     out = []
     for index, found in enumerate(pattern.finditer(source)):
@@ -55,15 +61,24 @@ def variants(source: str, counts: dict[str, int], limit: int,
 
 
 def _signature(session_id: str, parent: SessionCandidate, family: str, candidates: list[dict]) -> str:
-    def opcode(value):
-        parts = str(value or "").split(None, 1)
-        return parts[0] if parts else "missing"
     value = {"pipeline": parent.pipeline, "flags": parent.flags, "family": family,
              "residual": parent.counts,
-             "transitions": [(row.get("kind"), opcode(row.get("compiled")), opcode(row.get("retail")))
+             "transitions": [(row.get("kind"), _opcode(row.get("compiled")) or "missing",
+                              _opcode(row.get("retail")) or "missing")
                              for row in parent.outcome.get("diff", {}).get("entries", [])],
              "source_shapes": sorted(source_shape(item["source"]) for item in candidates)}
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def _frontier_signature(candidates: list[SessionCandidate]) -> set[tuple]:
+    """Identify distinct compiled frontier states, not transient candidate rows."""
+    states = set()
+    for item in candidates:
+        object_digest = item.outcome.get("sha256_text")
+        identity = object_digest or item.source_digest
+        states.add((identity, item.pipeline, tuple(item.flags), item.exact, item.score,
+                    tuple(sorted(item.counts.items()))))
+    return states
 
 
 def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: int = 4,
@@ -85,7 +100,7 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
     disproved = set()
     window_rejected = 0
     dimensions = dimensions or {"spelling", "prototype", "lifetime", "narrowing", "control-flow", "flags"}
-    previous_frontier = {item.candidate_id for item in frontier(store.candidates(session_id))}
+    previous_frontier = _frontier_signature(frontier(store.candidates(session_id)))
 
     for round_number in range(1, max(0, rounds) + 1):
         executed_rounds = round_number
@@ -111,7 +126,7 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
                 generated += narrowing_variants(source, remaining - len(generated))
             residual_entries = parent.outcome.get("diff", {}).get("entries", [])
             call_residual = bool(ownership.get("transfers")) or any(
-                str(entry.get(side) or "").split(None, 1)[0] in {"jal", "jalr", "bal"}
+                _opcode(entry.get(side)) in {"jal", "jalr", "bal"}
                 for entry in residual_entries for side in ("compiled", "retail"))
             if "prototype" in dimensions and (compiler_family != "gcc" or call_residual):
                 declarations = re.findall(r"(?m)^\s*(?:extern\s+)?[\w *]+\s+(func_[0-9A-Fa-f]{8})\s*\([^;]*\)\s*;", source)
@@ -194,7 +209,7 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
             if stop_on_exact and store.best(session_id).exact:
                 break
         current = frontier(store.candidates(session_id))
-        previous_frontier = {item.candidate_id for item in current}
+        previous_frontier = _frontier_signature(current)
         changed = previous_frontier != before_frontier
         new_objects = len(unique_objects - before_objects)
         stagnant_rounds = 0 if changed else stagnant_rounds + 1
