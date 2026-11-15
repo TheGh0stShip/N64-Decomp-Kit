@@ -428,7 +428,7 @@ def solve(image: Image, catalogue: list[Row], also: list[Image] = (), verified: 
                            to="nonstandard-abi", flags=["needs-tu"], target=_row_json(f.row)))
         hand = [c for c in causemod.target_causes(f.flow) if c.id == "assembly.handwritten" and c.confidence >= 0.85]
         if hand:
-            ops.append(_op("retype", hand[0].confidence, [f"{f.name}: {"; ".join(hand[0].evidence)}"], to="handwritten",
+            ops.append(_op("retype", hand[0].confidence, [f"{f.name}: " + "; ".join(hand[0].evidence)], to="handwritten",
                            target=_row_json(f.row)))
         # end of the row
         nxt = row_after(f.end)
