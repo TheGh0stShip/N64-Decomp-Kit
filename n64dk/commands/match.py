@@ -621,12 +621,14 @@ def _session_explore_args(p):
     p.add_argument("--variants-per-round", type=int, default=12)
     p.add_argument("--stop-on-exact", action="store_true")
     p.add_argument("--best-details", action="store_true")
+    p.add_argument("--summary-only", action="store_true", help="omit frontier and per-round detail")
+    p.add_argument("--best-only", action="store_true", help="return compact run summary and session best")
     p.add_argument("--target-window", help="target residual byte window START:END")
     p.add_argument("--freeze-prefix", type=lambda value: int(value, 0),
                    help="freeze residual behavior before this target offset")
     p.add_argument("--freeze-suffix", type=lambda value: int(value, 0),
                    help="freeze residual behavior at and after this target offset")
-    p.add_argument("--dimensions", default="spelling,prototype,lifetime,narrowing,control-flow,flags")
+    p.add_argument("--dimensions", default="iterate,spelling,prototype,lifetime,narrowing,control-flow,flags")
 
 
 @command("match-session-explore", "Run bounded multi-round residual-guided source experiments")
@@ -647,6 +649,11 @@ def match_session_explore(args):
                          {value.strip() for value in args.dimensions.split(",") if value.strip()})
         if args.best_details:
             result["best"] = store.best(args.session_id).summary(True)
+        elif args.best_only:
+            result["best"] = store.best(args.session_id).summary(False)
+        if args.summary_only or args.best_only:
+            result.pop("frontier", None)
+            result.pop("round_reports", None)
         return result
     finally:
         store.close()

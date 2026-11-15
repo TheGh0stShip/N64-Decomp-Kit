@@ -1472,6 +1472,8 @@ def _lifetime_args(p):
     p.add_argument("--jobs", type=int, default=16)
     p.add_argument("--rounds", type=int, default=4)
     p.add_argument("--variants-per-round", type=int, default=16)
+    p.add_argument("--summary-only", action="store_true", help="omit frontier and per-round detail")
+    p.add_argument("--best-only", action="store_true", help="include only the compact session best")
 
 
 @command("register-lifetime-explore", "Explore bounded carrier, scope, declaration and return-lifetime hypotheses")
@@ -1489,6 +1491,11 @@ def register_lifetime_explore(args):
             {"name": "scope shortening", "expected": "remove interference before the residual site"},
             {"name": "joined return", "expected": "force convergence on one return register"},
         ]
+        if args.best_only:
+            result["best"] = store.best(args.session_id).summary(False)
+        if args.summary_only or args.best_only:
+            result.pop("frontier", None)
+            result.pop("round_reports", None)
         return result
     finally: store.close()
 

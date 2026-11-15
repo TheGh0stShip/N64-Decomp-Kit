@@ -97,6 +97,7 @@ export, and proof boundaries.
 | `match SRC --rom ROM [--addr VRAM] [--sweep]` | Build one source and compare it relocated against the ROM; sweep pipelines and flags |
 | `match-batch MANIFEST... --project DIR` | Rebuild and verify every unit of matching manifests in parallel |
 | `match-permute SRC --rom ROM --addr VRAM` | Permutation search scored by the relocated diff |
+| `match-iterate SRC --rom ROM --addr VRAM --size N` | Run one preflighted, session-persistent beam search over types, signedness, safe lifetimes, declaration order and bounded expression forms |
 | `match-session-start SRC --rom ROM ...` | Start a persistent standalone source-matching session |
 | `match-session-try SESSION_ID` | Apply in-memory edits and compile a batch of source/flag variants |
 | `match-session-status SESSION_ID` | Show the best result and nondominated residual frontier |
@@ -143,6 +144,21 @@ export, and proof boundaries.
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |
 | `match-job-export JOB_ID OUTPUT` | Export a candidate and non-proof-grade evidence without editing project source |
 | `match-diagnose COMPILED TARGET` | Rank boundary/toolchain/semantic/type/regalloc/reload/scheduling causes |
+
+`match-iterate` never edits its input. It validates the project image and strict function entry,
+compiles variants concurrently, deduplicates equivalent objects, and stores the complete run under
+`.n64dk/match-iterate/` plus the standard session registry. Type, cast, field-signedness and
+variable-splitting edits are explicitly marked as requiring semantic review; pure lifetime moves
+and declaration reordering use conservative dependency guards. A compact invocation is:
+
+```sh
+n64dk --format json match-iterate candidate.c --project . --rom overlay_composite.z64 \
+  --addr 0x80000000 --size 0x100 --jobs 16 --budget 400 --summary-only --out best.c
+```
+
+Use `--families lifetime,order,expression` to restrict the run to behavior-preserving forms.
+`m2c-draft` and preflighted `draft-sweep` reject explicit raw/composite deltas that disagree with
+the authoritative project mapping.
 | `gcc27-regalloc FILE.lreg [--global-dump FILE.greg]` | Explain GCC 2.7.x pseudo priorities, ties and hard-register assignments |
 | `toolchain-fingerprint --profile P --file ROLE=PATH...` | Content-hash the real compiler/assembler/linker identity |
 | `provenance-audit SOURCE...` | Reject assembly escapes, unproven assembly and non-proof-grade credit |

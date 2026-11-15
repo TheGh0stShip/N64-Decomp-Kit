@@ -1,9 +1,13 @@
 import struct
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from n64dk.match import autodraft, m2c_bridge
+from n64dk.commands.accelerate import _draft_mapping
 
 
 def asm(*words):
@@ -81,6 +85,44 @@ class RepairTest(unittest.TestCase):
                                      lambda *_args: None, Path(tmp), jobs=1)
         self.assertEqual(report["rows"][0]["status"], "skipped")
         self.assertIn("outside", report["rows"][0]["error"])
+
+    def test_exact_draft_score_ignores_unowned_alignment(self):
+        code = asm(0x03E00008, 0x00000000)
+        outcome = SimpleNamespace(
+            exact=True, error=None,
+            result=SimpleNamespace(compiled_text=code + b"\x00\x00\x00\x00", diff=None))
+        lifted = {"asm": "glabel f\n", "source": "void f(void) {}\n", "error": None}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("n64dk.match.autodraft.m2c_bridge.draft", return_value=lifted):
+            row = autodraft.draft_one("f", 0x80001000, len(code), code, lambda _a: None,
+                                      lambda *_a: outcome, Path(tmp))
+        self.assertEqual(row.status, "exact")
+        self.assertEqual(row.asm_score["total"], 0)
+
+
+class MappingTest(unittest.TestCase):
+    def test_composite_delta_disagreement_fails_closed(self):
+        args = Namespace(project=".", addr=0x800A2078, size=0xF8,
+                         image="overlay_2_composite.z64", vram_delta=0x80000000)
+        row = {"id": "target", "image": "overlay2", "vram": "0x800A2078", "size": 0xF8}
+        with patch("n64dk.match.inventory.build", return_value={"functions": [row]}), \
+             patch("n64dk.match.layout.from_inventory", return_value=object()), \
+             patch("n64dk.match.layout.resolve_image_map",
+                   return_value={"selected": {"offset": 0xA2C78,
+                                                "authority": "anchored-composite-region"}}):
+            with self.assertRaisesRegex(ValueError, "conflicts|project mapping"):
+                _draft_mapping(args)
+
+    def test_canonical_composite_delta_records_authority(self):
+        args = Namespace(project=".", addr=0x800A2078, size=0xF8,
+                         image="overlay_2_composite.z64", vram_delta=0x7FFFF400)
+        row = {"id": "target", "image": "overlay2", "vram": "0x800A2078", "size": 0xF8}
+        with patch("n64dk.match.inventory.build", return_value={"functions": [row]}), \
+             patch("n64dk.match.layout.from_inventory", return_value=object()), \
+             patch("n64dk.match.layout.resolve_image_map",
+                   return_value={"selected": {"offset": 0xA2C78,
+                                                "authority": "anchored-composite-region"}}):
+            self.assertEqual(_draft_mapping(args)["authority"], "anchored-composite-region")
 
 
 if __name__ == "__main__":

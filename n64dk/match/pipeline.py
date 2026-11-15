@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,6 +37,9 @@ _CACHE_LOCK = threading.RLock()
 _CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
 _PIPELINE_STATS = {"compiler_seconds": 0.0, "assembler_seconds": 0.0,
                    "object_conversion_seconds": 0.0, "tool_invocations": 0}
+_INCLUDE_FILE_CACHE: dict[str, tuple[int, int, int, str, bytes]] = {}
+_INCLUDE_RE = re.compile(
+    rb"(?m)^\s*#\s*include\s*([<\"])([^>\"\r\n]+)[>\"]")
 
 
 def object_cache_stats() -> dict[str, int]:
@@ -124,18 +128,67 @@ def _as_flags(flags: list[str]) -> list[str]:
     return ["-mips3", "-G0"]
 
 
-def _include_closure_digest(paths: tuple[str, ...]) -> str:
+def _cached_file(path: Path) -> tuple[str, bytes]:
+    """Return a content digest and bytes, avoiding repeated header reads across a tranche."""
+    resolved = str(path.resolve())
+    stat = path.stat()
+    with _CACHE_LOCK:
+        cached = _INCLUDE_FILE_CACHE.get(resolved)
+        if cached and cached[:3] == (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size):
+            return cached[3], cached[4]
+    data = path.read_bytes()
+    value = hashlib.sha256(data).hexdigest()
+    with _CACHE_LOCK:
+        _INCLUDE_FILE_CACHE[resolved] = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, value, data)
+    return value, data
+
+
+def _include_closure_digest(source: Path, roots: tuple[Path, ...],
+                            forced: tuple[str, ...] = ()) -> str:
+    """Hash only recursively resolved includes, never entire include or scratch trees.
+
+    The path and content of every resolved dependency are retained in the identity. Missing
+    includes are also recorded so adding one invalidates the next invocation. Conditional
+    includes may be conservatively retained, but unrelated files are never visited.
+    """
+    roots = tuple(dict.fromkeys(Path(value).resolve() for value in roots if Path(value).is_dir()))
     digest = hashlib.sha256()
-    for value in paths:
-        root = Path(value)
-        if not root.is_dir(): continue
-        digest.update(str(root).encode())
-        for path in sorted(root.rglob("*")):
-            if path.is_file() and path.suffix.lower() in {".h", ".inc", ".def", ".c"}:
-                stat = path.stat()
-                digest.update(str(path.relative_to(root)).encode())
-                digest.update(str(stat.st_mtime_ns).encode()); digest.update(str(stat.st_size).encode())
-                digest.update(path.read_bytes())
+    visited: set[Path] = set()
+
+    def resolve(name: str, quote: bool, parent: Path | None) -> Path | None:
+        candidates = ([parent / name] if quote and parent else []) + [root / name for root in roots]
+        return next((item.resolve() for item in candidates if item.is_file()), None)
+
+    def visit(path: Path) -> None:
+        path = path.resolve()
+        if path in visited or not path.is_file():
+            return
+        visited.add(path)
+        value, data = _cached_file(path)
+        digest.update(str(path).encode()); digest.update(value.encode())
+        for found in _INCLUDE_RE.finditer(data):
+            name = found.group(2).decode(errors="surrogateescape")
+            child = resolve(name, found.group(1) == b'"', path.parent)
+            if child is None:
+                digest.update(b"missing:"); digest.update(name.encode(errors="surrogateescape"))
+            else:
+                visit(child)
+
+    # Source contents are already part of the object identity, but parsing it discovers roots.
+    source_data = source.read_bytes()
+    for found in _INCLUDE_RE.finditer(source_data):
+        name = found.group(2).decode(errors="surrogateescape")
+        child = resolve(name, found.group(1) == b'"', source.parent)
+        if child is None:
+            digest.update(b"missing:"); digest.update(name.encode(errors="surrogateescape"))
+        else:
+            visit(child)
+    for name in forced:
+        child = resolve(name, True, source.parent)
+        if child is None:
+            digest.update(b"missing-forced:"); digest.update(name.encode(errors="surrogateescape"))
+        else:
+            visit(child)
     return digest.hexdigest()
 
 
@@ -173,7 +226,12 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
         if value:
             path = Path(value); include_roots.append((cfg.project / path).resolve() if not path.is_absolute() else path)
     include_roots.append(source.parent)
-    include_paths = tuple(str(value) for value in include_roots)
+    forced = []
+    for index, flag in enumerate(spec.flags):
+        if flag == "-include" and index + 1 < len(spec.flags):
+            forced.append(spec.flags[index + 1])
+        elif flag.startswith("-include") and len(flag) > len("-include"):
+            forced.append(flag[len("-include"):])
     normalizer_digest = None
     if cfg.normalizer and Path(cfg.normalizer).is_file():
         normalizer_digest = hashlib.sha256(Path(cfg.normalizer).read_bytes()).hexdigest()
@@ -182,7 +240,8 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
     identity = json.dumps({"source": hashlib.sha256(source.read_bytes()).hexdigest(),
         "pipeline": pipe, "flags": spec.flags, "normalizer": spec.normalizer_args,
         "section_bases": spec.section_bases, "defines": defines or [],
-        "includes": _include_closure_digest(include_paths), "compiler": _compiler_digest(cfg, pipe),
+        "includes": _include_closure_digest(source, tuple(include_roots), tuple(forced)),
+        "compiler": _compiler_digest(cfg, pipe),
         "normalizer_hook": normalizer_digest, "pipeline_code": pipeline_code},
         sort_keys=True)
     cache_key = hashlib.sha256(identity.encode()).hexdigest()

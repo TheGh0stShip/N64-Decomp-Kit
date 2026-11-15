@@ -171,7 +171,11 @@ def draft_one(name: str, vram: int, size: int, code: bytes, read_word, evaluate,
     report = outcome.result.diff
     row.status = "exact" if outcome.exact else "compiled"
     if outcome.result.compiled_text:
-        row.asm_score = community_score(code, outcome.result.compiled_text, vram).as_dict()
+        # MatchEngine may retain assembler alignment beyond the function-owned interval.
+        # The community scorer has no ownership model, so compare exactly the same byte
+        # range as the typed matcher.  Otherwise a byte-exact 8-byte leaf can misleadingly
+        # receive insertion penalties for harmless trailing alignment.
+        row.asm_score = community_score(code, outcome.result.compiled_text[:size], vram).as_dict()
     if report is not None:
         row.score, row.counts = report.score, dict(report.counts)
         row.hints = [h["hint"] for h in residual_hints(report, family)][:6]

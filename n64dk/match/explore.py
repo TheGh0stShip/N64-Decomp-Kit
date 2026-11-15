@@ -99,7 +99,8 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
     round_reports = []
     disproved = set()
     window_rejected = 0
-    dimensions = dimensions or {"spelling", "prototype", "lifetime", "narrowing", "control-flow", "flags"}
+    dimensions = dimensions or {"iterate", "spelling", "prototype", "lifetime", "narrowing",
+                                "control-flow", "flags"}
     previous_frontier = _frontier_signature(frontier(store.candidates(session_id)))
 
     for round_number in range(1, max(0, rounds) + 1):
@@ -115,7 +116,23 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
             source = store.cache.get(parent.source_digest).decode()
             compiler_family = ("ido" if parent.pipeline.startswith("ido") else
                                "gcc" if parent.pipeline.startswith(("kmc", "gcc", "sn")) else "any")
-            generated = variants(source, parent.counts, remaining, compiler_family) if "spelling" in dimensions else []
+            generated = []
+            if "iterate" in dimensions and compiler_family in {"gcc", "ido"}:
+                from .iterate import variants as iterate_variants
+                families = []
+                if parent.counts.get("instruction") or parent.counts.get("immediate"):
+                    families += ["types", "fields", "casts", "expression"]
+                if parent.counts.get("register") or parent.counts.get("scheduling"):
+                    families += ["lifetime", "order", "scope", "split"]
+                for item in iterate_variants(source, context.get("inventory_name") or
+                                             context.get("function") or "", tuple(dict.fromkeys(families))):
+                    generated.append({"label": item.label, "source": item.source,
+                                      "family": "iterate-" + item.family,
+                                      "semantic_review": item.semantic_review})
+                    if len(generated) >= remaining:
+                        break
+            if "spelling" in dimensions and len(generated) < remaining:
+                generated += variants(source, parent.counts, remaining - len(generated), compiler_family)
             graph = lifetime_graph(parent.outcome, context)
             ownership = graph.get("call_result_ownership", {})
             if "lifetime" in dimensions and ownership.get("transfers"):
@@ -196,12 +213,17 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
                 if best_delta is None or best_delta >= 0:
                     disproved.add(family)
                 payload = {"result_ids": [item["candidate_id"] for item in results],
-                           "rejected": result["rejected"], "object_digests": sorted(object_digests)}
+                           "rejected": result["rejected"], "object_digests": sorted(object_digests),
+                           "semantic_review_required": any(item.get("semantic_review", False)
+                                                           for item in items)}
                 store.record_experiment(session_id, signature, round_number, family,
                                         parent.candidate_id, len(items) or 2, len(object_digests),
                                         best_delta, conclusion, payload)
                 experiments.append({"family": family, "variants": len(items) or 2,
+                                    "unique_sources": len({item["source_digest"] for item in results}),
                                     "unique_objects": len(object_digests),
+                                    "cache_reused": sum(bool(item.get("cache_hit")) for item in results),
+                                    "semantic_review_required": payload["semantic_review_required"],
                                     "best_delta": best_delta, "conclusion": conclusion})
                 remaining -= len(items) or 2
                 if stop_on_exact and store.best(session_id).exact:
@@ -228,7 +250,11 @@ def explore(store: SessionStore, session: MatchSession, session_id: str, jobs: i
     for family in sorted({item["family"] for report in round_reports for item in report["experiments"]}):
         items = [item for report in round_reports for item in report["experiments"] if item["family"] == family]
         family_reports.append({"family": family, "trials": sum(item["variants"] for item in items),
+            "unique_sources": sum(item.get("unique_sources", 0) for item in items),
+            "unique_preprocessed": None,
             "unique_objects": sum(item["unique_objects"] for item in items),
+            "cache_reused": sum(item.get("cache_reused", 0) for item in items),
+            "semantic_review_required": any(item.get("semantic_review_required", False) for item in items),
             "best_delta": min((item["best_delta"] for item in items if item["best_delta"] is not None), default=None),
             "conclusions": sorted({item["conclusion"] for item in items}),
             "disproved": family in disproved})
