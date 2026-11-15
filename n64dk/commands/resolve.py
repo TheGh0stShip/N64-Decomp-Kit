@@ -158,16 +158,31 @@ class _Runner:
                     spec.symbols.update(self.spec.symbols)
                     out.append((f"{spec.pipeline} {' '.join(spec.flags)}", spec.pipeline,
                                 self.evaluator(vram, size, filename, spec)))
-            # Siblings first: the current flags under each pipeline that shares their dialect (the
-            # other IDO version, the other KMC lanes), then the usual settings of every sibling in
-            # turn, so that the first few alternatives span the compilers and not one compiler's
-            # flag variations.
+            # The first alternatives must span the compilers, not one compiler's variations: a
+            # title built with one compiler usually carries library code built with another, and
+            # when the family of a function is uncertain every available compiler is a candidate.
+            #   1. the current flags under each pipeline of the same dialect (the other IDO
+            #      version, the other KMC lanes);
+            #   2. the usual settings of every other pipeline, one each;
+            #   3. the other optimisation levels of the current compiler and its dialect siblings
+            #      (libraries at -O1 or -O3, a debug file);
+            #   4. the remaining usual settings, in turn.
             def dialect(pipeline: str) -> str:
                 return pipeline[:3] if pipeline[:3] in ("ido", "kmc") else pipeline
             ordered = [split_flags(list(self.spec.flags), pipeline) for pipeline in pipelines
                        if dialect(pipeline) == dialect(self.spec.pipeline)]
             swept = [sweep_specs([pipeline])[:max(1, limit // max(1, len(pipelines)))] for pipeline in pipelines]
-            for rank in range(max((len(specs) for specs in swept), default=0)):
+            ordered += [specs[0] for specs in swept if specs]
+            # optimisation levels: of the current recipe when its compiler is a candidate for this
+            # function, and of each other candidate compiler's usual settings
+            current_is_candidate = family is None or self.spec.pipeline.startswith("ido") == (family == "ido")
+            bases = ([self.spec] if current_is_candidate else []) + list(ordered)
+            for other in ("-O1", "-O3", "-O2"):
+                for base in bases:
+                    level = next((f for f in base.flags if re.fullmatch(r"-O\d?", f)), None)
+                    if level is not None and level != other:
+                        ordered.append(split_flags([other if f == level else f for f in base.flags], base.pipeline))
+            for rank in range(1, max((len(specs) for specs in swept), default=0)):
                 ordered += [specs[rank] for specs in swept if rank < len(specs)]
             for spec in ordered:
                 key = (spec.pipeline, tuple(sorted(spec.flags)))
@@ -406,6 +421,125 @@ def _twin_pass(store, image: str, todo, target, runner, names, emit, starts) -> 
     return won
 
 
+_BASIC_TYPEDEF = re.compile(r"(?m)^[ \t]*typedef\s+[^;{}]*?\b(?:s8|u8|s16|u16|s32|u32|s64|u64|f32|f64)\s*;[ \t]*\n?")
+
+
+def prepare_answer(text: str) -> str:
+    """A refiner's answer as a buildable unit: the kit's typedef prelude in front, and the
+    answer's own redefinitions of those basic types removed (a duplicate typedef is an error
+    for these compilers)."""
+    if "N64DK_M2C_PRELUDE" in text:
+        return text
+    return autodraft.PRELUDE + "\n" + _BASIC_TYPEDEF.sub("", text)
+
+
+def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, settings, args) -> dict:
+    """Hand the cases the mechanical ladder left unresolved to the configured refiner
+    (``n64dk.match.refine``), nearest first.  An answer that beats the case's best goes through
+    the normal ladder, so it is searched, strictly verified and classified like any other
+    source.  A case that already holds a ``refine`` stage is not asked about again."""
+    from ..match import refine as refinemod
+    settings.validate()
+    signature = settings.signature()
+    rows = []
+    wanted = {n for item in (getattr(args, "refine_names", None) or []) for n in item.split(",") if n}
+    for name, vram, size in todo:
+        if wanted and name not in wanted:
+            continue
+        case = store.get(resolvemod.case_id(image, vram, size))
+        if case is None or case.status not in settings.statuses or (settings.max_size and size > settings.max_size):
+            continue
+        if settings.max_score and (case.best_score is None or case.best_score > settings.max_score):
+            continue
+        if any(stage.get("stage") == "refine" and stage.get("signature") == signature
+               for stage in case.stages) and not args.force:
+            continue
+        rows.append((case.best_score if case.best_score is not None else 1 << 30, size, name, vram))
+    rows.sort()
+    if settings.max_cases:
+        rows = rows[:settings.max_cases]
+    totals = {"attempted": 0, "improved": 0, "exact": 0, "assumed": 0, "calls": 0, "errors": 0}
+    lock = threading.Lock()
+
+    def one(row):
+        _score, size, name, vram = row
+        case = store.get(resolvemod.case_id(image, vram, size))
+        pipeline, _, flags = (case.recipe or "").partition(" ")
+        spec = split_flags(shlex.split(flags), pipeline) if pipeline else runner.spec
+        spec.section_bases.update(runner.spec.section_bases)
+        spec.symbols.update(runner.spec.symbols)
+        primary = runner.evaluator(vram, size, f"{name}.c", spec)
+        offset = vram - target.delta
+        code = target.rom[offset:offset + size]
+        flow = runner.flow(vram, size)
+        won: dict[str, tuple] = {}                       # answer digest -> (label, pipeline, evaluator)
+
+        def evaluate(text: str):
+            """The case's recipe first; an answer that is not exact there is also built under the
+            sibling recipes, because the case's recipe is itself only the best guess so far."""
+            evaluation, built = primary(text)
+            if evaluation.exact or args.no_recipes:
+                return evaluation, built
+            from ..match import causes as causemod
+            family = causemod.compiler_family(flow)
+            family = family["family"] if family["confidence"] >= 0.8 else None
+            others = list(runner.recipes(vram, size, f"{name}.c")(family))[:resolvemod.CROSS_RECIPES]
+            if runner.label(spec) != runner.label(runner.spec):          # the configured default, if not tried yet
+                others.insert(0, (runner.label(runner.spec), runner.spec.pipeline,
+                                  runner.evaluator(vram, size, f"{name}.c", runner.spec)))
+            for label, pipeline, other in others:
+                attempt, attempt_built = other(text)
+                better = attempt.score is not None and (evaluation.score is None or attempt.score < evaluation.score
+                                                        or (attempt.exact and not evaluation.exact))
+                if better:
+                    evaluation, built = attempt, attempt_built
+                    won[hashlib.sha256(text.encode()).hexdigest()] = (label, pipeline, other)
+                if evaluation.exact:
+                    break
+            return evaluation, built
+
+        best_source = store.source(case.best_digest) if case.best_digest else None
+        best = primary(best_source)[0] if best_source else None
+        tables = m2c_bridge.find_jump_tables(target.rom, target.delta, vram, size)
+        assembly = m2c_bridge.emit_asm(name, code, vram, names, tables)
+        declarations = ""
+        if runner.rendered is not None and vram in runner.facts:
+            declarations = runner.rendered.focused(runner.facts[vram], vram, True, typedefs=False)
+        result = refinemod.refine(name, settings, evaluate, assembly, case.recipe or runner.label(spec), best_source,
+                                  best, case.causes, prepare=prepare_answer, declarations=declarations, emit=emit)
+        stage = {"stage": "refine", "signature": signature,
+                 "rounds": result["rounds"], "calls": result["calls"],
+                 "history": result["history"], "improved": result["improved"], "errors": result["errors"][:2]}
+        if result["improved"]:
+            before = case.builds
+            label, pipeline, chosen = won.get(hashlib.sha256(result["best_source"].encode()).hexdigest(),
+                                              (case.recipe or runner.label(spec), spec.pipeline, primary))
+            case = resolvemod.resolve(store, image, name, vram, code, chosen, source=result["best_source"],
+                                      flow=flow, neighbours=starts, budget=args.budget, jobs=2,
+                                      force=True, emit=emit, pipeline=pipeline, recipe_label=label, rom_offset=offset,
+                                      strict=runner.strict(vram, size, f"{name}.c", starts),
+                                      search_ceiling=getattr(args, "search_ceiling", resolvemod.SEARCH_CEILING))
+            case.builds += before
+        case.stages.append(stage)
+        store.put(case)
+        with lock:
+            totals["attempted"] += 1
+            totals["improved"] += bool(result["improved"])
+            totals["calls"] += result["calls"]
+            totals["errors"] += len(result["errors"])
+            totals["exact"] += case.status == "exact" and bool(result["improved"])
+            totals["assumed"] += case.status == "assumed" and bool(result["improved"])
+        if emit:
+            emit({"event": "refine-case", "name": name, "status": case.status, "score": case.best_score,
+                  "improved": result["improved"]})
+        return case
+
+    with ThreadPoolExecutor(max(1, settings.jobs)) as pool:
+        refined = [c for c in pool.map(one, rows)]
+    totals["cases"] = {c.case_id: c for c in refined}
+    return totals
+
+
 def worker_count(requested: int | None, functions: int, memory_per_worker_mb: int = 0,
                  memory_reserve_mb: int = 0) -> int:
     """Worker processes for a sweep.  ``0`` means automatic: one per two hardware threads (a
@@ -548,6 +682,29 @@ def resolve_hard(args):
         coordinate_shift = args.catalogue_shift
     names = {address: name for name, address in syms.items()}
     functions = [(n, v - coordinate_shift, s) for n, v, s in catalogue_functions]
+    trimmed = {"functions": 0, "bytes": 0}
+    if not getattr(args, "keep_padding", False):
+        # A catalogue interval often runs to the next function and so includes the zero words
+        # that align the next object.  No C produces them, so a function measured with them
+        # can never be exact: the interval that is resolved ends at the code.
+        from ..analysis import boundaries as boundmod
+        fitted = []
+        for name, vram, size in functions:
+            offset = vram - target.delta
+            padding = 0
+            if size >= 12 and 0 <= offset <= len(target.rom) - size:
+                try:
+                    terminated, padding = boundmod._terminated(flowmod.analyse_in_image(target.rom, target.delta,
+                                                                                         vram, size))
+                except Exception:
+                    terminated, padding = False, 0
+                if not terminated or padding >= size:
+                    padding = 0
+            if padding:
+                trimmed["functions"] += 1
+                trimmed["bytes"] += padding
+            fitted.append((name, vram, size - padding))
+        functions = fitted
     starts = {v for _n, v, _s in functions}
     covered, matched_rows = [], []
     for item in args.manifest:
@@ -673,6 +830,18 @@ def resolve_hard(args):
             if twins:
                 replaced = {c.case_id for c in twins}
                 cases = [c for c in cases if c.case_id not in replaced] + twins
+            refine_info = None
+            from ..match import refine as refinemod
+            settings = getattr(args, "refine", None) or refinemod.Settings.from_table(
+                None, getattr(args, "refine_command", None))
+            if settings is not None:
+                for key in ("rounds", "max_cases", "jobs", "max_score"):
+                    value = getattr(args, f"refine_{key}", None)
+                    if value is not None:
+                        setattr(settings, key, value)
+                refine_info = _refine_pass(store, image, todo, target, runner, names, emit, starts, settings, args)
+                refined = refine_info.pop("cases")
+                cases = [c for c in cases if c.case_id not in refined] + list(refined.values())
         elapsed = time.time() - started
         queue = resolvemod.hard_queue(cases)
         exact = [c for c in cases if c.status == "exact"]
@@ -685,7 +854,8 @@ def resolve_hard(args):
                 "seconds": round(elapsed, 1),
                 "exact_per_hour": round(len(exact) * 3600 / elapsed, 1) if elapsed else None,
                 "context": context_info, "recipes": recipe_info, "twins": len(twins),
-                "workers": workers, "worker_errors": worker_errors,
+                "workers": workers, "worker_errors": worker_errors, "refine": refine_info,
+                "padding_trimmed": trimmed,
                 "queue": [{k: g[k] for k in ("cause", "meaning", "functions", "bytes", "expected_progress")}
                           | {"best": g["best"][:args.show]} for g in queue["queue"]],
                 "state": str(store.root)}
@@ -706,6 +876,18 @@ def _hard_args(p):
     p.add_argument("--max-size", type=_int, default=0)
     p.add_argument("--min-size", type=_int, default=4)
     p.add_argument("--every", type=int, default=1, help="take every Nth function (sampling for benchmarks)")
+    p.add_argument("--keep-padding", action="store_true",
+                   help="resolve catalogue intervals as given, including trailing alignment padding")
+    p.add_argument("--refine-command",
+                   help="external author for the cases the ladder leaves unresolved: a command that reads "
+                        "a prompt on stdin and prints C (see n64dk.match.refine); every answer is built and "
+                        "strictly verified")
+    p.add_argument("--refine-rounds", type=int, help="rounds of feedback per function (default 3)")
+    p.add_argument("--refine-names", action="append", default=[],
+                   help="ask only about these functions (comma separated, repeatable)")
+    p.add_argument("--refine-max-cases", type=int, help="ask about at most this many cases, nearest first")
+    p.add_argument("--refine-max-score", type=int, help="ask only about cases at most this far from the target")
+    p.add_argument("--refine-jobs", type=int, help="refiner calls in parallel (default 4)")
     p.add_argument("--workers", type=int, default=1,
                    help="worker processes sharing the sweep (0: automatic, from hardware threads and free "
                         "memory); --jobs is divided among them")

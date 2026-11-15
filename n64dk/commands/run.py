@@ -76,6 +76,20 @@ def _identity(**values) -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def refine_settings(settings: dict, args):
+    """``[run.refine]`` (or a per-image override) merged with the command line; None when no
+    refiner command is configured."""
+    from ..match import refine as refinemod
+    built = refinemod.Settings.from_table(settings.get("refine"), getattr(args, "refine_command", None))
+    if built is None:
+        return None
+    for key in ("rounds", "max_cases", "jobs", "max_score"):
+        value = getattr(args, f"refine_{key}", None)
+        if value is not None:
+            setattr(built, key, value)
+    return built
+
+
 @command("decompile-run", "Drive every configured image through boundaries, donors, resolution, strict queue and ledger")
 def decompile_run(args):
     project = Path(args.project).resolve()
@@ -183,6 +197,7 @@ def decompile_run(args):
                 rom=str(spec.path), vram_delta=spec.vram_delta if spec.delta_source == "declared" else None,
                 jobs=jobs, workers=args.workers,
                 worker_memory_mb=args.worker_memory_mb, memory_reserve_mb=args.memory_reserve_mb,
+                refine=refine_settings(settings, args), refine_command=None, keep_padding=False,
                 search_ceiling=(args.search_ceiling if args.search_ceiling is not None
                                 else settings.get("search_ceiling", resolvemod.SEARCH_CEILING)),
                 symbols=[str(project / s) for s in settings.get("symbols", [])],
@@ -261,7 +276,7 @@ def _headline(item: dict) -> dict:
             "donor_verified": sum(len(r.get("functions", [])) for r in donors.get("verified", [])),
             "resolved": resolve.get("statuses"), "exact_bytes": resolve.get("exact_bytes"),
             "queued": queue.get("strict_exact"), "queued_strict_exact": queue.get("strict_exact"),
-            "awaiting_symbols": queue.get("assumed"),
+            "awaiting_symbols": queue.get("assumed"), "refine": resolve.get("refine"),
             "errors": [k for k, v in item.items() if isinstance(v, dict) and "error" in v]}
 
 
@@ -276,6 +291,11 @@ def _markdown(report: dict) -> str:
                   f"- queued for integration (strictly exact): {head['queued_strict_exact']}",
                   f"- byte-identical, awaiting symbol declarations: {head.get('awaiting_symbols') or 0} "
                   "(`queue/assumed.tsv`; review `queue/symbols.assumed.txt`, add it to the symbol file, rerun)"]
+        if head.get("refine"):
+            info = head["refine"]
+            lines.append(f"- refiner: asked about {info.get('attempted')} cases in {info.get('calls')} calls; "
+                         f"{info.get('improved')} improved, {info.get('exact')} became exact, "
+                         f"{info.get('assumed')} byte-identical awaiting symbols, {info.get('errors')} call errors")
         if item.get("boundaries"):
             lines.append(f"- boundary operations proposed: {item['boundaries'].get('operations')}")
         if item.get("ledger") and "totals" in item["ledger"]:
@@ -306,6 +326,13 @@ def _args(p):
     p.add_argument("--flags", default="-O2 -G0 -mips3 -mgp32 -mfp32")
     p.add_argument("--jobs", type=int, default=0,
                    help="parallel builds in total (default: the number of hardware threads)")
+    p.add_argument("--refine-command",
+                   help="external author for unresolved cases: reads a prompt on stdin, prints C "
+                        "(default: [run.refine] command; none configured means the stage is skipped)")
+    p.add_argument("--refine-rounds", type=int)
+    p.add_argument("--refine-max-cases", type=int)
+    p.add_argument("--refine-max-score", type=int)
+    p.add_argument("--refine-jobs", type=int)
     p.add_argument("--workers", type=int, default=0,
                    help="worker processes for the resolve stage (default 0: automatic, from hardware "
                         "threads and free memory)")

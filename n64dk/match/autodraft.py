@@ -57,6 +57,9 @@ _VOID_VALUE = re.compile(_LINE + r"void value not ignored")
 _VOID_ARITHMETIC = re.compile(_LINE + r"(?:Unacceptable operand of '[-+]'|Bad operand type for \+= or -=)")
 _ARGUMENT_COUNT = re.compile(_LINE + r"(?:Number of arguments doesn't agree with the number in the declaration|"
                              r"too (?:few|many) arguments to function)")
+_REDECLARED = re.compile(_LINE + r"redeclaration of [`'](\w+)'")
+_VOID_DEREFERENCE = re.compile(_LINE + r"(?:warning: dereferencing `void \*' pointer|"
+                               r"Reference of an expression of void type or an incomplete type)")
 _POINTER_INTEGER = re.compile(_LINE + r"illegal combination of pointer and integer")
 _DEREF = re.compile(r"(?<![\w)\]])\*\(")
 _BODY = re.compile(r"(?m)^[\w \*]+\([^;{}]*\)\s*\{\n")
@@ -99,6 +102,22 @@ def repair(source: str, error: str) -> str | None:
     if found and line_of(found) is not None:
         for callee in re.findall(r"\b(\w+)\(", lines[line_of(found)]):
             changed = re.sub(rf"(?m)^void ({re.escape(callee)}\(\);)", r"s32 \1", source)
+            if changed != source:
+                return changed
+    found = _REDECLARED.search(error)
+    if found and line_of(found) is not None:
+        # a decompiler declares one stack slot twice when it is used with two types: the later
+        # declaration goes, the first one stands
+        number = line_of(found)
+        if re.fullmatch(rf"\s*(?:[A-Za-z_]\w*[\s\*]+)+{re.escape(found.group(2))}\s*(?:\[[^\]]*\])*\s*;\s*",
+                        lines[number]):
+            del lines[number]
+            return "\n".join(lines)
+    found = _VOID_DEREFERENCE.search(error)
+    if found and line_of(found) is not None:
+        # ``*p`` with ``void *p``: the draft meant a word
+        for name in dict.fromkeys(_IDENT.findall(lines[line_of(found)])):
+            changed = re.sub(rf"\bvoid \*(?=\s*{re.escape(name)}\b\s*[;,)=])", "s32 *", source)
             if changed != source:
                 return changed
     found = _VOID_ARITHMETIC.search(error)

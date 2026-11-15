@@ -514,5 +514,22 @@ class KmcRecoveryTest(unittest.TestCase):
         _perturb_and_recover(self, self.compile, TRUTHS["loop"], "control")
 
 
+class ConstantFalseLoopTest(unittest.TestCase):
+    """``do { ... } while (0)`` must never become a pre-tested loop: the body would stop running."""
+
+    def test_no_pretested_form_of_a_do_while_zero(self):
+        source = ("typedef int s32;\nextern s32 g;\n\nvoid f(void) {\n    s32 i;\n\n    i = 1;\n    do {\n        g = i;\n"
+                  "        i += 1;\n    } while (0);\n    g = 2;\n}\n")
+        offered = astforms.variants(source, "f", ("control",), limit=64, check=False)
+        self.assertFalse([v.label for v in offered if "while (0) {" in v.source or "; 0; " in v.source])
+        self.assertFalse([v.label for v in offered if "do-while -> while" in v.label or "do-while -> for" in v.label])
+
+    def test_a_real_rotated_loop_is_still_offered(self):
+        source = ("typedef int s32;\nextern s32 g;\n\nvoid f(void) {\n    s32 i;\n\n    i = 0;\n    do {\n        g = i;\n"
+                  "        i += 1;\n    } while (i < 5);\n}\n")
+        labels = [v.label for v in astforms.variants(source, "f", ("control",), limit=64, check=False)]
+        self.assertTrue(any("do-while -> while" in label for label in labels), labels)
+
+
 if __name__ == "__main__":
     unittest.main()

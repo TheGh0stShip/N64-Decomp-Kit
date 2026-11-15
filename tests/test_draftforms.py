@@ -58,6 +58,47 @@ class NarrowTest(unittest.TestCase):
         self.assertEqual(draftforms.narrow("int x;\n", "f"), ("int x;\n", []))
 
 
+class PadTest(unittest.TestCase):
+    SOURCE = PREAMBLE + "s32 f(s32 a) {\n    s32 sp1C;\n    s32 temp_v0;\n\n    sp1C = a;\n    return sp1C;\n}\n"
+
+    def test_pad_goes_before_or_after_the_declarations(self):
+        top = draftforms.pad(self.SOURCE, "f", 12, "top")
+        self.assertIn("s32 f(s32 a) {\n    s32 pad[3];\n    s32 sp1C;\n    s32 temp_v0;\n", top)
+        bottom = draftforms.pad(self.SOURCE, "f", 4, "bottom")
+        self.assertIn("    s32 sp1C;\n    s32 temp_v0;\n    s32 pad;\n\n    sp1C = a;", bottom)
+
+    def test_pad_name_does_not_collide_and_bad_requests_are_refused(self):
+        again = draftforms.pad(draftforms.pad(self.SOURCE, "f", 8, "top"), "f", 4, "top")
+        self.assertIn("    s32 pad2;\n    s32 pad[2];\n", again)
+        self.assertIsNone(draftforms.pad(self.SOURCE, "f", 0))
+        self.assertIsNone(draftforms.pad(self.SOURCE, "missing", 8))
+
+    def test_function_without_declarations(self):
+        source = PREAMBLE + "void f(void) {\n    g();\n}\n"
+        self.assertIn("void f(void) {\n    s32 pad[2];\n    g();\n}", draftforms.pad(source, "f", 8, "bottom"))
+
+
+@unittest.skipUnless(HAVE_PARSER, "pycparser not installed")
+class InlinedTest(unittest.TestCase):
+    SOURCE = (PREAMBLE + "s32 g(s32);\n\ns32 f(s32 a) {\n    s32 sp1C;\n    s32 temp_v0;\n    s32 temp_t6;\n\n"
+              "    temp_v0 = g(a);\n    temp_t6 = temp_v0 + 4;\n    sp1C = temp_t6;\n    g(sp1C);\n    return sp1C;\n}\n")
+
+    def test_only_the_decompiler_temporaries_by_default(self):
+        text, applied = draftforms.inlined(self.SOURCE, "f")
+        self.assertTrue(applied)
+        self.assertNotIn("temp_t6", text)
+        self.assertIn("s32 sp1C;", text)                                # a stack variable is kept
+        self.assertIn("sp1C = temp_v0 + 4;", text)
+
+    def test_any_local_on_request(self):
+        text, _applied = draftforms.inlined(self.SOURCE, "f", only=None)
+        self.assertNotIn("sp1C", text)
+
+    def test_nothing_to_substitute(self):
+        source = PREAMBLE + "s32 f(s32 a) {\n    return a;\n}\n"
+        self.assertEqual(draftforms.inlined(source, "f"), (source, []))
+
+
 @unittest.skipUnless(HAVE_PARSER, "pycparser not installed")
 class NormalFormTest(unittest.TestCase):
     ROTATED = (PREAMBLE + "s32 g();\n\nvoid f(void) {\n    s16 i;\n\n    i = 0;\n    do {\n        g(i & 0xFFFF);\n"

@@ -73,5 +73,32 @@ class RunCommandTest(unittest.TestCase):
         self.assertIn("stages with errors: ['ledger']", text)
 
 
+class RegistrationTest(unittest.TestCase):
+    """The command line must reach ``decompile_run`` with every option it documents."""
+
+    def test_command_is_registered_with_its_options(self):
+        import contextlib
+        import io
+        from n64dk import cli
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), self.assertRaises(SystemExit) as stop:
+            cli.main(["decompile-run", "--help"])
+        self.assertEqual(stop.exception.code, 0)
+        text = buffer.getvalue()
+        for option in ("--project", "--out", "--donors", "--workers", "--search-ceiling", "--refine-command",
+                       "--refine-rounds", "--max-size", "--budget"):
+            self.assertIn(option, text)
+
+    def test_resolve_hard_documents_the_refine_and_padding_options(self):
+        import contextlib
+        import io
+        from n64dk import cli
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), self.assertRaises(SystemExit):
+            cli.main(["resolve-hard", "--help"])
+        for option in ("--refine-command", "--refine-names", "--keep-padding", "--workers", "--search-ceiling"):
+            self.assertIn(option, buffer.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

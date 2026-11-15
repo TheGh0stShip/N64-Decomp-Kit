@@ -44,7 +44,7 @@ BLOCKING = ("boundary.fragment", "boundary.false_split", "boundary.embedded_data
 # 40 reached an exact match, the furthest success started at 29, and those 630 took 37% of all
 # builds.  0 or None removes the ceiling.
 SEARCH_CEILING = 40
-CROSS_DRAFTS, CROSS_RECIPES = 5, 3      # drafts x recipes tried when no draft is exact under the default recipe
+CROSS_DRAFTS, CROSS_RECIPES = 4, 8      # drafts x recipes tried when no draft is exact under the default recipe
 
 STATUSES = ("exact", "assumed", "near", "open", "blocked-boundary", "needs-tu", "probable-handwritten", "needs-source",
             "does-not-build", "stale")
@@ -175,7 +175,7 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
             neighbours: set[int] | None = None, budget: int = 300, jobs: int = 8, force: bool = False,
             near: int = 10, emit=None, pipeline: str | None = None, recipes=None, strict=None,
             recipe_label: str = "", rom_offset: int | None = None,
-            search_ceiling: int | None = SEARCH_CEILING) -> Case:
+            search_ceiling: int | None = SEARCH_CEILING, frame_fit: bool = True) -> Case:
     """Run the ladder for one function and store the case.
 
     ``evaluate(text) -> (iterate.Evaluation, relocated candidate bytes or None)``;
@@ -322,6 +322,69 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         case.stages.append({"stage": "drafts-x-recipes", "tried": tried, "chosen": chosen, "score": base.score})
         if chosen:
             event("recipe-selected", recipe=chosen, score=base.score)
+
+    # 2c. frame fit.  When the candidate's stack frame differs from the target's, every
+    #     stack-relative instruction differs and the score says nothing about the rest of the
+    #     draft.  The difference is measured, so the repair is computed: substitute the
+    #     temporaries that only name sub-expressions, then reserve what is still missing.
+    if frame_fit and flow is not None and flow.frame.size and base is None:
+        base = run(text)                                       # a supplied source: its baseline, once
+        case.builds += 1
+    if frame_fit and flow is not None and flow.frame.size and base is not None and not base.exact \
+            and base.score is not None:
+        from . import draftforms
+
+        def frame_of(candidate: str) -> int | None:
+            code = built.get(hashlib.sha256(candidate.encode()).hexdigest())
+            if not code:
+                return None
+            try:
+                return flowmod.analyse(code, vram).frame.size
+            except Exception:
+                return None
+
+        tried, fitted = 0, None
+        pool = [text] + [row[3] for row in scored if row[0] != 1 << 30 and row[3] != text][:1]
+        for start in pool:
+            size = frame_of(start)
+            if size is None or size == flow.frame.size:
+                continue
+            attempts = []
+            if size > flow.frame.size:                       # too many locals: fewer temporaries
+                for only, label in ((r"temp_\w+", "inlined"), (None, "inlined all")):
+                    slim, steps = draftforms.inlined(start, name, only=only)
+                    if not steps:
+                        continue
+                    evaluation = run(slim)
+                    tried += 1
+                    case.builds += 1
+                    attempts.append((evaluation, slim, label))
+                    start, size = slim, frame_of(slim) or size
+                    if size <= flow.frame.size:
+                        break
+            if size < flow.frame.size:                       # bytes missing: reserve them
+                missing = flow.frame.size - size
+                for amount, where in ((missing, "top"), (missing, "bottom"), (missing - 4, "top")):
+                    padded = draftforms.pad(start, name, amount, where) if amount > 0 else None
+                    if padded is None:
+                        continue
+                    evaluation = run(padded)
+                    tried += 1
+                    case.builds += 1
+                    attempts.append((evaluation, padded, f"pad {amount} {where}"))
+                    if evaluation.exact:
+                        break
+            for evaluation, candidate, label in attempts:
+                if evaluation.score is not None and (evaluation.score < base.score or
+                                                     (evaluation.exact and not base.exact)):
+                    base, text, fitted = evaluation, candidate, label
+                    origin = origin + "+frame"
+            if base.exact:
+                break
+        if tried:
+            case.stages.append({"stage": "frame-fit", "tried": tried, "chosen": fitted, "score": base.score,
+                                "target_frame": flow.frame.size})
+            event("frame-fit", tried=tried, chosen=fitted, score=base.score)
     case.stages.append({"stage": "source", "origin": origin})
 
     # 3. baseline

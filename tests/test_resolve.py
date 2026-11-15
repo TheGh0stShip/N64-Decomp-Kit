@@ -191,6 +191,44 @@ class ResolveTest(unittest.TestCase):
         self.assertTrue([s for s in again.stages if s["stage"] == "iterate"])   # no ceiling: the search runs
         self.assertGreater(len(calls), 2)
 
+    def test_frame_fit_reserves_the_measured_missing_bytes(self):
+        """The candidate's frame is 8 bytes smaller than the target's: the repair is computed from
+        the two frames (a pad of exactly that size) and tried before any search."""
+        from n64dk.analysis import flow as flowmod
+        big = code([0x27BDFFE0, 0xAFBF0014, 0x8FBF0014, 0x03E00008, 0x27BD0020])     # frame 0x20
+        small = code([0x27BDFFE8, 0xAFBF0014, 0x8FBF0014, 0x03E00008, 0x27BD0018])   # frame 0x18
+        source = "void work(void) {\n    s32 a;\n\n    a = 1;\n    g(a);\n}\n"
+        seen = []
+
+        def evaluate(text):
+            seen.append(text)
+            if "s32 pad[2];" in text:
+                return iterate.Evaluation(0, True, {"counts": {}, "entries": []},
+                                          outcome={"proof": {"verdict": "exact"}}), big
+            return iterate.Evaluation(9, False, {"counts": {"immediate": 3}, "entries": []}), small
+
+        case = resolve.resolve(self.store, "main", "work", BASE, big, evaluate, source=source, jobs=1,
+                               flow=flowmod.analyse(big, BASE), budget=40)
+        self.assertEqual(case.status, "exact")
+        fit = [s for s in case.stages if s["stage"] == "frame-fit"][0]
+        self.assertEqual((fit["chosen"], fit["target_frame"]), ("pad 8 top", 0x20))
+        self.assertEqual(len(seen), 2)                                   # baseline, then the computed pad
+        self.assertFalse([s for s in case.stages if s["stage"] == "iterate"])
+
+    def test_frame_fit_is_not_tried_when_the_frames_agree(self):
+        from n64dk.analysis import flow as flowmod
+        big = code([0x27BDFFE0, 0xAFBF0014, 0x8FBF0014, 0x03E00008, 0x27BD0020])
+        calls = []
+
+        def evaluate(text):
+            calls.append(text)
+            return iterate.Evaluation(300, False, {"counts": {"instruction": 60}, "entries": []}), big
+
+        case = resolve.resolve(self.store, "main", "work", BASE, big, evaluate, source="void work(void) {\n}\n",
+                               jobs=1, flow=flowmod.analyse(big, BASE), budget=40)
+        self.assertFalse([s for s in case.stages if s["stage"] == "frame-fit"])
+        self.assertEqual(case.status, "open")
+
     def test_worker_count(self):
         from n64dk.commands.resolve import worker_count
         self.assertEqual(worker_count(1, 500), 1)

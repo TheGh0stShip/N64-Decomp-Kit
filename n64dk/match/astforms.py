@@ -1741,7 +1741,11 @@ def _control_m2c(ctx: Ctx):
         simple_prev = prev is not None and prev.kind == "simple" and \
             isinstance(prev.ast, (c_ast.Assignment, c_ast.UnaryOp, c_ast.ExprList)) and \
             "\n" not in src[prev.start:prev.end] and not ctx.prep.has_comment(prev.start, prev.end)
-        if sn.kind == "do":
+        if sn.kind == "do" and re.fullmatch(r"\(*\s*0[uUlL]*\s*\)*", src[slice(*ctx.prep.cond_span(sn))].strip()):
+            # ``do { ... } while (0)`` is a block, not a rotated loop: as a ``while`` or ``for``
+            # its body would never run, so no pre-tested form of it is ever offered
+            pass
+        elif sn.kind == "do":
             ca, cb = ctx.prep.cond_span(sn)
             ctext = src[ca:cb]
             body = sn.children[0]

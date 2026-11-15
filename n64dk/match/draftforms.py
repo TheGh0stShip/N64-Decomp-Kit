@@ -267,3 +267,70 @@ def drafts(source: str, name: str) -> list[tuple[str, str, bool]]:          # no
             seen.add(text)
             out.append(("narrow+normal", text, True))
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Frame fitting.  A decompiler names every value it saw in a register (``temp_v0``, ``temp_t9``),
+# and several compilers reserve a stack slot for every declared local whether or not it ends up
+# in a register.  The draft's frame is then larger than the original's and every stack-relative
+# instruction differs, which makes a draft that is otherwise right look hopeless.  Two edits fix
+# the frame, and they are computed, not searched for: remove the temporaries that are only names
+# for sub-expressions (``inlined``), and reserve the bytes that are still missing (``pad``).
+
+_DECLARATION = re.compile(r"^[ \t]+(?:(?:volatile|const|register|static|unsigned|signed|struct|union|enum)\s+)*"
+                          r"[A-Za-z_]\w*[\w \t\*]*?\b[A-Za-z_]\w*(?:\[[^\]]*\])*(?:\s*=[^;]*)?;[ \t]*(?:/\*.*\*/)?[ \t]*$")
+
+
+def inlined(source: str, name: str, limit: int = 48, only: str | None = r"temp_\w+") -> tuple[str, list[str]]:
+    """Substitute every temporary that only names a sub-expression.  ``only`` restricts the
+    variables considered (default: the decompiler's ``temp_*`` names; None: any local the
+    engine can substitute).  Returns (text, applied)."""
+    wanted = re.compile(rf"inline-temp: (?:{only}) = ") if only else None
+    try:
+        from . import astforms
+    except Exception:
+        return source, []
+    text, applied = source, []
+    for _step in range(limit):
+        try:
+            offered = astforms.variants(text, name, ("inline-temp",), limit=64, check=False)
+        except Exception:
+            break
+        chosen = next((v for v in offered if not v.semantic_review and v.source != text
+                       and (wanted is None or wanted.match(v.label))), None)
+        if chosen is None:
+            break
+        text = chosen.source
+        applied.append(chosen.label)
+    if applied:
+        try:
+            valid = astforms.diagnose(text, name).startswith("ok")
+        except Exception:
+            valid = False
+        if not valid:
+            return source, []
+    return text, applied
+
+
+def pad(source: str, name: str, size: int, where: str = "top") -> str | None:
+    """Reserve ``size`` bytes of frame with an unused local, before (``top``) or after
+    (``bottom``) the function's other declarations.  None when the function is not found."""
+    span = _iterate._function_span(source, name)
+    if span is None or size <= 0:
+        return None
+    _start, body_start, end = span
+    body = source[body_start:end]
+    taken = set(re.findall(r"\bpad\d*\b", body))
+    label = next(n for n in ["pad"] + [f"pad{i}" for i in range(2, 64)] if n not in taken)
+    words = max(1, (size + 3) // 4)
+    line = f"    s32 {label}{'' if words == 1 else f'[{words}]'};\n"
+    lines = body.split("\n")
+    first = 1 if lines and not lines[0].strip() else 0          # text after the opening brace
+    last = first
+    while last < len(lines) and (_DECLARATION.match(lines[last]) or
+                                 (not lines[last].strip() and last + 1 < len(lines)
+                                  and _DECLARATION.match(lines[last + 1]))):
+        last += 1
+    at = first if where == "top" else last
+    offset = body_start + sum(len(text) + 1 for text in lines[:at])
+    return source[:offset] + line + source[offset:]

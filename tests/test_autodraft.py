@@ -177,6 +177,23 @@ class IdoRepairTest(unittest.TestCase):
     def test_pointer_integer_assignment_gets_the_target_type(self):
         self.assertIn("    var_a1 = (s32 *) (arg1);", self.fix(9, "illegal combination of pointer and integer"))
 
+    def test_redeclared_stack_slot_keeps_its_first_declaration(self):
+        source = "void f(void) {\n    s32 sp1C;\n    f32 sp1C;\n    s32 a;\n\n    a = sp1C;\n}\n"
+        ido = "cfe: Error: f.c, line 3: redeclaration of 'sp1C'; previous declaration at line 2 in file 'f.c'"
+        gcc = "f.c:3: redeclaration of `sp1C'\nf.c:2: `sp1C' previously declared here"
+        for message in (ido, gcc):
+            self.assertEqual(autodraft.repair(source, message),
+                             "void f(void) {\n    s32 sp1C;\n    s32 a;\n\n    a = sp1C;\n}\n")
+        self.assertIsNone(autodraft.repair(source, "f.c:6: redeclaration of `sp1C'"))   # not a declaration line
+
+    def test_dereferenced_void_pointer_becomes_a_word_pointer(self):
+        source = "s32 f(void *arg0) {\n    void *var_v0;\n\n    var_v0 = arg0;\n    return *var_v0;\n}\n"
+        for message in ("f.c:5: warning: dereferencing `void *' pointer\nf.c:5: void value not ignored as it ought to be",
+                        "cfe: Error: f.c, line 5: Reference of an expression of void type or an incomplete type."):
+            fixed = autodraft.repair(source, message)
+            self.assertIn("    s32 *var_v0;", fixed)
+            self.assertIn("void *arg0", fixed)
+
     def test_gcc_wording_still_works(self):
         fixed = autodraft.repair(self.SOURCE, "f.c:8: `sp4' undeclared (first use this function)")
         self.assertIn("    s32 sp4;", fixed)
