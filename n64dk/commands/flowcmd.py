@@ -8,7 +8,7 @@ from ..analysis import abi as abimod
 from ..analysis import flow as flowmod
 from ..analysis import values as valuemod
 from ..analysis import structures as structuremod
-from ..analysis.functions import load_catalogue
+from ..analysis.catalogue import load as load_catalogue
 from ..cli import command
 from ..match import causes as causemod
 

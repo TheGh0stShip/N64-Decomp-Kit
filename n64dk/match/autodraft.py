@@ -48,41 +48,86 @@ extern s32 m2c_unhandled();
 _BAD_TYPE = re.compile(r"(?<![\w?])\?(?![\w?])")           # m2c's unknown type marker
 
 
-_UNDECLARED = re.compile(r":(\d+): `(\w+)' undeclared")
-_UNARY = re.compile(r":(\d+): invalid type argument of `unary \*'")
-_VOID_VALUE = re.compile(r":(\d+): void value not ignored")
+# Diagnostics are matched for both compiler families: GCC prints ``file:LINE: message``, IDO's
+# front end prints ``cfe: Error: file, line LINE: message`` followed by the source line and a caret.
+_LINE = r"(?::|, line )(\d+): "
+_UNDECLARED = re.compile(_LINE + r"(?:`(\w+)' undeclared|'(\w+)' undefined)")
+_UNARY = re.compile(_LINE + r"(?:invalid type argument of `unary \*'|Dereferenced a non-pointer)")
+_VOID_VALUE = re.compile(_LINE + r"void value not ignored")
+_VOID_ARITHMETIC = re.compile(_LINE + r"(?:Unacceptable operand of '[-+]'|Bad operand type for \+= or -=)")
+_ARGUMENT_COUNT = re.compile(_LINE + r"(?:Number of arguments doesn't agree with the number in the declaration|"
+                             r"too (?:few|many) arguments to function)")
+_POINTER_INTEGER = re.compile(_LINE + r"illegal combination of pointer and integer")
 _DEREF = re.compile(r"(?<![\w)\]])\*\(")
 _BODY = re.compile(r"(?m)^[\w \*]+\([^;{}]*\)\s*\{\n")
+_IDENT = re.compile(r"[A-Za-z_]\w*")
 
 
 def repair(source: str, error: str) -> str | None:
-    """One mechanical fix for a compiler diagnostic on an m2c draft, or None.
+    """One mechanical fix for a compiler diagnostic (GCC or IDO) on an m2c draft, or None.
 
     * an undeclared ``spXX``/temporary gets an ``s32`` declaration at the top of the body;
     * a dereference of an integer expression on the reported line gets an ``(s32 *)`` cast;
-    * a callee declared ``void`` whose value is used becomes ``s32``.
+    * a callee declared ``void`` whose value is used becomes ``s32``;
+    * arithmetic on a ``void *`` (an extension IDO rejects) retypes that variable ``s8 *``,
+      which keeps the byte-wise arithmetic the draft meant;
+    * a call through a function-pointer cast, or to a callee, whose argument count disagrees
+      with a guessed prototype makes that prototype unprototyped;
+    * an assignment mixing pointer and integer casts the right-hand side to the target's type.
     These make the draft compile so it can be scored; types still need a human or model."""
     lines = source.split("\n")
+
+    def line_of(found) -> int | None:
+        number = int(found.group(1)) - 1
+        return number if 0 <= number < len(lines) else None
+
     found = _UNDECLARED.search(error)
     if found:
         body = list(_BODY.finditer(source))
         if not body:
             return None
         at = body[-1].end()
-        return source[:at] + f"    s32 {found.group(2)};\n" + source[at:]
+        return source[:at] + f"    s32 {found.group(2) or found.group(3)};\n" + source[at:]
     found = _UNARY.search(error)
-    if found and 0 < int(found.group(1)) <= len(lines):
-        number = int(found.group(1)) - 1
+    if found and line_of(found) is not None:
+        number = line_of(found)
         fixed = _DEREF.sub("*(s32 *)(", lines[number])
         if fixed != lines[number]:
             lines[number] = fixed
             return "\n".join(lines)
     found = _VOID_VALUE.search(error)
-    if found and 0 < int(found.group(1)) <= len(lines):
-        for callee in re.findall(r"\b(\w+)\(", lines[int(found.group(1)) - 1]):
+    if found and line_of(found) is not None:
+        for callee in re.findall(r"\b(\w+)\(", lines[line_of(found)]):
             changed = re.sub(rf"(?m)^void ({re.escape(callee)}\(\);)", r"s32 \1", source)
             if changed != source:
                 return changed
+    found = _VOID_ARITHMETIC.search(error)
+    if found and line_of(found) is not None:
+        for name in dict.fromkeys(_IDENT.findall(lines[line_of(found)])):
+            changed = re.sub(rf"\bvoid \*(?=\s*{re.escape(name)}\b\s*[;,)=])", "s8 *", source)
+            if changed != source:
+                return changed
+    found = _ARGUMENT_COUNT.search(error)
+    if found and line_of(found) is not None:
+        number = line_of(found)
+        fixed = re.sub(r"\(\*\*\)\([^()]*\)", "(**)()", lines[number])
+        if fixed != lines[number]:
+            lines[number] = fixed
+            return "\n".join(lines)
+        for callee in re.findall(r"\b(\w+)\(", lines[number]):
+            changed = re.sub(rf"(?m)^([\w \*]+?\b{re.escape(callee)})\([^;{{}}()]+\);", r"\1();", source)
+            if changed != source:
+                return changed
+    found = _POINTER_INTEGER.search(error)
+    if found and line_of(found) is not None:
+        number = line_of(found)
+        assignment = re.match(r"^(\s*)([A-Za-z_]\w*) = (.+);\s*$", lines[number])
+        if assignment:
+            declared = re.search(rf"(?m)^\s+([\w ]+?\s*\**)\s*{re.escape(assignment.group(2))}\s*;", source)
+            if declared and not assignment.group(3).startswith(f"({declared.group(1).strip()})"):
+                lines[number] = (f"{assignment.group(1)}{assignment.group(2)} = "
+                                 f"({declared.group(1).strip()}) ({assignment.group(3)});")
+                return "\n".join(lines)
     return None
 
 

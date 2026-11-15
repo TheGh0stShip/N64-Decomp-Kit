@@ -116,6 +116,14 @@ def _common(p, rom_required: bool):
     p.add_argument("--jobs", type=int, default=None, help="parallel builds (default: CPU count)")
 
 
+def _mapped_comparison_addr(resolved: dict, catalogue_addr: int, catalogue_shift: int = 0) -> int:
+    comparison = int(resolved["linked_vram"], 0) if resolved.get("linked_vram") else catalogue_addr
+    if catalogue_shift and resolved.get("selected", {}).get("authority") == "raw-overlay":
+        comparison = catalogue_addr - catalogue_shift
+        resolved["linked_vram"] = f"0x{comparison:X}"
+    return comparison
+
+
 def _setup(args):
     cfg = load_config(args.project, args.config, args.toolchain_dir)
     if args.normalizer:
@@ -149,8 +157,11 @@ def _setup(args):
             raise ValueError(f"target interval is ambiguous across images ({choices}); pass --image-name")
         if len(rows) == 1:
             resolved = resolve_image_map(rom_path, from_inventory(rows[0]))
-            comparison_addr = (int(resolved["linked_vram"], 0) if resolved.get("linked_vram")
-                               else args.addr)
+            comparison_addr = _mapped_comparison_addr(
+                resolved, args.addr, int(getattr(args, "catalogue_shift", 0) or 0))
+            # A raw overlay contains linked bytes, while its catalogue may deliberately retain
+            # historical/survey addresses.  The explicit catalogue shift is independent mapping
+            # evidence and must be applied before validating the raw image delta.
             canonical_delta = comparison_addr - resolved["selected"]["offset"]
             if args.vram_delta is not None and args.vram_delta != canonical_delta:
                 raise ValueError(f"explicit vram_delta 0x{args.vram_delta:X} conflicts with canonical "
@@ -796,7 +807,7 @@ def match_batch(args):
     units = []
     for spec in args.manifests:
         path, _, pipe = spec.partition("=")
-        if pipe and pipe not in PIPELINES and pipe != "kmc":
+        if pipe and pipe not in PIPELINES and pipe != "kmc" and not pipe.startswith("custom:"):
             raise SystemExit(f"unknown pipeline {pipe!r}")
         units += manmod.parse(Path(cfg.project, path), cfg.project, target.rom_to_vram, pipe or None,
                               f"kmc+{lane}", args.source_template,

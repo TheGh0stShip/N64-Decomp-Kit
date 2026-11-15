@@ -59,6 +59,8 @@ def function_facts(code: bytes, vram: int, jump_tables: dict[int, list[int]] | N
 
 
 def _arg_type(traits: set[str]) -> str:
+    if "f32" in traits or "f64" in traits:
+        return "f64" if "f64" in traits else "f32"       # float passed in an integer register
     if "pointer" in traits:
         return "void *"
     narrow = [t for t in _NARROW if t in traits]

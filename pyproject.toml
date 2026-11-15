@@ -9,6 +9,7 @@ dependencies = ["rabbitizer>=1.16"]
 
 [project.optional-dependencies]
 draft = ["m2c @ git+https://github.com/matt-kempster/m2c"]
+search = ["pycparser>=2.21"]
 
 [project.scripts]
 n64dk = "n64dk.cli:main"

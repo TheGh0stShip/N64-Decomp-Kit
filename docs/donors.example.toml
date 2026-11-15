@@ -1,0 +1,59 @@
+# Donor projects for `n64dk transplant-scan --donors donors.example.toml`.
+# One [donor.<name>] table per project.  Paths are relative to `root` unless absolute.
+#   image       analysable image of the donor (ROM, or a linear image: then give vram_delta)
+#   vram_delta  optional "0x..." VRAM - file offset (default: main segment from the boot header)
+#   symbols     splat symbol_addrs files (donor names for masked sites)
+#   catalogue   function catalogue(s) used to split multi-function units
+#   include     include directories added to every build (the donor's implicit -I)
+#   manifests   { path, pipeline } with pipeline one of kmc+builtin, kmc+as, kmc+asn64
+#               (or a --assembler=asn64 row flag), ido5.3, ido7.1, sn.  Only .c rows are used.
+# Donor projects are read-only: builds run in a scratch mirror, outputs go to --out.
+
+[donor.nagano]
+root = "/path/to/nagano"
+image = "baseroms/us/baserom.z64"
+symbols = ["analysis/survey/symbol_addrs.txt"]
+catalogue = ["analysis/survey/functions.toml"]
+include = ["include"]
+manifests = [
+  { path = "config/us/matching_kmc_as_units.tsv", pipeline = "kmc+as" },
+  { path = "config/us/matching_ido_units.tsv", pipeline = "ido5.3" },
+  { path = "config/us/matching_ido7_units.tsv", pipeline = "ido7.1" },
+  { path = "config/us/matching_ido_data_units.tsv", pipeline = "ido5.3" },
+]
+
+[donor.BattleTanx]
+root = "/path/to/BattleTanx"
+image = "baseroms/us/baserom.z64"
+symbols = ["undefined_funcs_auto.txt", "undefined_syms_auto.txt"]
+catalogue = ["config/us/recomp_function_boundaries.toml"]
+include = ["include"]
+manifests = [
+  { path = "config/us/matching_units.tsv", pipeline = "ido5.3" },
+  { path = "config/us/matching_kmc_units.tsv", pipeline = "kmc+builtin" },
+  { path = "config/us/matching_sn_units.tsv", pipeline = "sn" },
+]
+
+[donor.Rugrats64]
+root = "/path/to/Rugrats64"
+image = "baseroms/us/baserom.z64"
+symbols = ["analysis/survey/symbol_addrs.txt"]
+catalogue = ["analysis/survey/functions.toml"]
+include = []
+manifests = [
+  { path = "config/us/matching_units.tsv", pipeline = "kmc+builtin" },
+  { path = "config/us/matching_kmc_as_units.tsv", pipeline = "kmc+as" },
+  { path = "config/us/matching_sn_units.tsv", pipeline = "sn" },
+  { path = "config/us/matching_ido_units.tsv", pipeline = "ido5.3" },
+]
+
+[donor.Madden64]
+root = "/path/to/Madden64"
+image = "build/us/main_unpacked.z64"
+symbols = ["build/us/survey/symbol_addrs.txt"]
+catalogue = ["config/us/functions_resident.toml"]
+include = []
+manifests = [
+  { path = "config/us/matching_kmc_units.tsv", pipeline = "kmc+builtin" },
+  { path = "build/us/matching_ido_c_sources.tsv", pipeline = "ido5.3" },
+]

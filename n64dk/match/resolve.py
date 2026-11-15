@@ -39,6 +39,13 @@ from . import causes as causemod
 from . import iterate as itermod
 
 BLOCKING = ("boundary.fragment", "boundary.false_split", "boundary.embedded_data")
+# The variant search is skipped when the best draft is further than this from the target.
+# Measured over 1,712 searches on two titles (IDO and KMC GCC): none of the 630 that started above
+# 40 reached an exact match, the furthest success started at 29, and those 630 took 37% of all
+# builds.  0 or None removes the ceiling.
+SEARCH_CEILING = 40
+CROSS_DRAFTS, CROSS_RECIPES = 5, 3      # drafts x recipes tried when no draft is exact under the default recipe
+
 STATUSES = ("exact", "assumed", "near", "open", "blocked-boundary", "needs-tu", "probable-handwritten", "needs-source",
             "does-not-build", "stale")
 # rough tractability of the top cause, used only to order the queue (higher = sooner)
@@ -75,10 +82,14 @@ class Case:
     builds: int = 0
     updated_ns: int = 0
     proof: dict | None = None
+    recipe: str = ""                 # pipeline and flags the best candidate was built with
+    rom_offset: int | None = None    # file offset of the function in its image, when known
+    strict: dict = field(default_factory=dict)   # verify.strict_compare verdict for an exact candidate
 
     def as_dict(self) -> dict:
         return {"case": self.case_id, "name": self.name, "vram": f"0x{self.vram:08X}", "size": self.size,
                 "status": self.status, "top_cause": self.top_cause, "causes": self.causes,
+                "recipe": self.recipe, "strict": self.strict,
                 "best_score": self.best_score, "best_source": self.best_digest, "builds": self.builds,
                 "stages": self.stages, "next": self.next, "proof": self.proof}
 
@@ -162,7 +173,9 @@ class CaseStore:
 def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, evaluate, *,
             source: str | None = None, draft=None, flow: flowmod.Flow | None = None,
             neighbours: set[int] | None = None, budget: int = 300, jobs: int = 8, force: bool = False,
-            near: int = 10, emit=None, pipeline: str | None = None, recipes=None) -> Case:
+            near: int = 10, emit=None, pipeline: str | None = None, recipes=None, strict=None,
+            recipe_label: str = "", rom_offset: int | None = None,
+            search_ceiling: int | None = SEARCH_CEILING) -> Case:
     """Run the ladder for one function and store the case.
 
     ``evaluate(text) -> (iterate.Evaluation, relocated candidate bytes or None)``;
@@ -170,7 +183,9 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     none is supplied (``family`` is the detected compiler family or None);
     ``recipes(family) -> [(label, pipeline, evaluate)]`` lists alternative build recipes, tried on
     the baseline source when the bytes carry another compiler family's fingerprint or the
-    baseline is far off; ``emit(event_dict)`` receives progress events."""
+    baseline is far off; ``strict(text, recipe_label) -> dict`` re-verifies an exact candidate
+    with the non-circular oracle (its verdict is stored on the case; a ``mismatch`` demotes the
+    case to ``open``); ``emit(event_dict)`` receives progress events."""
     size, digest = len(target), hashlib.sha256(target).hexdigest()
     key = case_id(image, vram, size)
 
@@ -186,12 +201,35 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         previous = None
     if previous is not None and previous.status == "exact" and not force:
         return previous
-    case = Case(key, image, name, vram, size, digest)
+    case = Case(key, image, name, vram, size, digest, recipe=recipe_label, rom_offset=rom_offset)
     if previous is not None:
         case.closed_families, case.best_digest, case.best_score = (previous.closed_families, previous.best_digest,
                                                                    previous.best_score)
 
     def finish(status: str, ranked, next_step: str = "") -> Case:
+        if status in ("exact", "assumed") and case.proof and case.proof.get("verdict") not in (None, "not-run"):
+            # the evaluator already verified strictly (engine proof): one verdict, one place
+            case.strict = dict(case.proof)
+            event("strict-verdict", verdict=case.strict.get("verdict"),
+                  assumptions=len(case.strict.get("assumptions", [])))
+        elif status == "exact" and strict is not None:
+            try:
+                case.strict = strict(store.source(case.best_digest) or "", case.recipe) or {}
+            except Exception as error:                     # verification trouble must not lose the case
+                case.strict = {"verdict": "error", "error": str(error)[-200:]}
+            verdict = case.strict.get("verdict")
+            event("strict-verdict", verdict=verdict, assumptions=len(case.strict.get("assumptions", [])))
+            if verdict == "mismatch":
+                status, next_step = "open", "exact under the exploration oracle but not under strict " \
+                    "verification: " + "; ".join(case.strict.get("conflicts", [])[:2])
+            elif verdict == "assumed":
+                status, next_step = "assumed", "declare the assumed symbols/sections, then verify again"
+            elif verdict != "exact":
+                status, next_step = "open", "strict verification did not produce an exact verdict"
+        if status == "exact" and (case.strict or {}).get("verdict") != "exact":
+            # No exploration oracle, historical label, or interrupted verifier may grant exact
+            # credit.  Exact is a proof state, not a score or a caller assertion.
+            status, next_step = "open", "strict verification proof is missing"
         case.status = status
         case.causes = [c.as_dict() for c in ranked]
         case.top_cause = ranked[0].id if ranked else ""
@@ -222,18 +260,6 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     text, origin = source, "supplied"
     if text is None and case.best_digest:
         text, origin = store.source(case.best_digest), "previous-best"
-    if text is None and draft is not None:
-        text, error = draft(family)
-        origin = "draft"
-        if text is None:
-            case.stages.append({"stage": "source", "origin": "draft", "error": (error or "")[-300:]})
-            return finish("needs-source", causemod.diagnose(target, None, vram, flow, neighbours),
-                          "the automatic draft failed: " + (error or "no output")[-200:])
-    if text is None:
-        return finish("needs-source", causemod.diagnose(target, None, vram, flow, neighbours))
-    case.stages.append({"stage": "source", "origin": origin})
-
-    # 3. baseline
     built: dict[str, bytes | None] = {}
 
     def run(candidate: str) -> itermod.Evaluation:
@@ -241,8 +267,67 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         built[hashlib.sha256(candidate.encode()).hexdigest()] = code
         return evaluation
 
-    base = run(text)
-    case.builds += 1
+    base = None
+    scored: list = []
+    if text is None and draft is not None:
+        drafted = draft(family)
+        origin = "draft"
+        if isinstance(drafted, list):
+            # a portfolio of drafts (e.g. with and without recovered declarations): build each and
+            # continue from the closest one, so an unhelpful context can never cost a match
+            for label, candidate in drafted:
+                evaluation = run(candidate)
+                case.builds += 1
+                scored.append((evaluation.score if evaluation.score is not None else 1 << 30, len(scored),
+                               label, candidate, evaluation))
+                if evaluation.exact:
+                    break
+            if scored:
+                scored.sort(key=lambda row: row[:2])
+                _score, _n, origin, text, base = scored[0]
+                origin = "draft:" + origin
+                case.stages.append({"stage": "drafts", "variants": [
+                    {"label": row[2], "score": None if row[0] == 1 << 30 else row[0]} for row in scored]})
+            error = "no draft variant was produced"
+        else:
+            text, error = drafted
+        if text is None:
+            case.stages.append({"stage": "source", "origin": "draft", "error": (error or "")[-300:]})
+            return finish("needs-source", causemod.diagnose(target, None, vram, flow, neighbours),
+                          "the automatic draft failed: " + (error or "no output")[-200:])
+    if text is None:
+        return finish("needs-source", causemod.diagnose(target, None, vram, flow, neighbours))
+
+    # 2b. drafts x recipes.  The portfolio was ranked under one recipe; a draft that is a near
+    #     miss there is often exact under a sibling (another version of the same compiler, the
+    #     flags of a neighbouring unit), and it need not be the draft that ranked first.
+    if recipes is not None and base is not None and not base.exact and scored:
+        candidates = [row for row in scored if row[0] != 1 << 30][:CROSS_DRAFTS]
+        tried, chosen = 0, None
+        for label, recipe_pipeline, recipe_evaluate in list(recipes(family))[:CROSS_RECIPES]:
+            for row in candidates:
+                evaluation, code = recipe_evaluate(row[3])
+                tried += 1
+                case.builds += 1
+                if evaluation.score is not None and (base.score is None or evaluation.score < base.score
+                                                     or (evaluation.exact and not base.exact)):
+                    base, text, origin, chosen = evaluation, row[3], "draft:" + row[2], label
+                    evaluate, pipeline = recipe_evaluate, recipe_pipeline
+                    case.recipe = label
+                    built[hashlib.sha256(text.encode()).hexdigest()] = code
+                if base.exact:
+                    break
+            if base.exact:
+                break
+        case.stages.append({"stage": "drafts-x-recipes", "tried": tried, "chosen": chosen, "score": base.score})
+        if chosen:
+            event("recipe-selected", recipe=chosen, score=base.score)
+    case.stages.append({"stage": "source", "origin": origin})
+
+    # 3. baseline
+    if base is None:
+        base = run(text)
+        case.builds += 1
     wrong_family = family is not None and pipeline is not None and causemod.pipeline_family(pipeline) != family
     if recipes is not None and not base.exact and (wrong_family or base.score is None or base.score > 4 * near):
         tried, chosen = 0, None
@@ -252,6 +337,7 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
             case.builds += 1
             if evaluation.score is not None and (base.score is None or evaluation.score < base.score):
                 base, chosen, evaluate, pipeline = evaluation, label, recipe_evaluate, recipe_pipeline
+                case.recipe = label
                 built[hashlib.sha256(text.encode()).hexdigest()] = code
                 if evaluation.exact:
                     break
@@ -280,32 +366,32 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         else found
     case.stages.append({"stage": "diagnose", "causes": [c.id for c in ranked][:6]})
 
-    # 5. iterate: justified families first, then the rest; never repeat a closed family on the same source
+    # 5. iterate: one search over every family, the ones the causes justify first, so that edits
+    #    from different families can combine; families closed for this exact source on an earlier
+    #    run are not repeated
     best_text, best = text, base
-    order = causemod.family_order(ranked, itermod.FAMILIES)
-    justified = [f for c in ranked for f in c.families if f in itermod.FAMILIES]
-    justified = list(dict.fromkeys(justified))
-    remaining = max(0, budget - case.builds)
-    for label, families, share in (("justified", justified, 0.6), ("all", order, 1.0)):
-        source_digest = hashlib.sha256(best_text.encode()).hexdigest()
-        families = [f for f in families if f not in case.closed_families.get(source_digest, [])]
-        allowance = int(remaining * share) if label == "justified" else max(0, budget - case.builds)
-        if not families or allowance < 4 or best.exact:
-            continue
+    source_digest = hashlib.sha256(best_text.encode()).hexdigest()
+    families = [f for f in causemod.family_order(ranked, itermod.FAMILIES)
+                if f not in case.closed_families.get(source_digest, [])]
+    allowance = max(0, budget - case.builds)
+    if search_ceiling and best.score is not None and best.score > search_ceiling:
+        case.stages.append({"stage": "iterate-skipped", "score": best.score, "ceiling": search_ceiling})
+        event("iterate-skipped", score=best.score, ceiling=search_ceiling)
+        families = []
+    if families and allowance >= 4 and not best.exact:
         result = itermod.descend(best_text, name, run, tuple(families), jobs=jobs, budget=allowance)
         spent = result.get("evaluated", 0)
         case.builds += spent
         improved = result.get("final_score") is not None and result["final_score"] < best.score
         helpful = {row["family"] for row in result.get("sensitivity", []) if row.get("delta", 0) < 0}
-        tried = set(families)
         if not improved:
-            case.closed_families.setdefault(source_digest, [])
-            case.closed_families[source_digest] = sorted(set(case.closed_families[source_digest]) | (tried - helpful))
-        case.stages.append({"stage": "iterate:" + label, "families": families, "builds": spent,
+            closed = set(case.closed_families.get(source_digest, [])) | (set(families) - helpful)
+            case.closed_families[source_digest] = sorted(closed)
+        case.stages.append({"stage": "iterate", "families": families[:12], "builds": spent,
                             "start": result.get("start_score"), "final": result.get("final_score"),
                             "applied": [s.get("applied") for s in result.get("steps", []) if s.get("applied")],
                             "helpful_families": sorted(helpful)})
-        event("iterate", pass_=label, start=result.get("start_score"), final=result.get("final_score"), builds=spent)
+        event("iterate", start=result.get("start_score"), final=result.get("final_score"), builds=spent)
         if improved and result.get("source"):
             best_text = result["source"]
             best = itermod.Evaluation(result["final_score"], bool(result.get("exact")))
@@ -326,6 +412,12 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     if final_code is None:
         _evaluation, final_code = evaluate(best_text)
     ranked = causemod.diagnose(target, final_code, vram, flow, neighbours, pipeline) if final_code is not None else ranked
+    if case.best_score == 0:
+        # byte-identical under the exploration oracle, yet never accepted as exact: keep the
+        # strict verdict with the case instead of calling it a near miss
+        verified, _code = evaluate(best_text)
+        case.proof = (verified.outcome or {}).get("proof") or case.proof
+        return finish("assumed", ranked, "declare or independently prove every strict-verifier assumption")
     return finish("near" if (case.best_score or 0) <= near else "open", ranked)
 
 
@@ -354,3 +446,68 @@ def hard_queue(cases: list[Case]) -> dict:
     for case in cases:
         statuses[case.status] = statuses.get(case.status, 0) + 1
     return {"cases": len(cases), "statuses": statuses, "queue": rows}
+
+
+def export_queue(store: CaseStore, out: Path, image: str | None = None, include_assumed: bool = True) -> dict:
+    """Write every exact case as an integration queue: one source per function, a manifest-style
+    table (``ROM_START  SIZE  SOURCE  FLAGS`` with the pipeline in a comment per row group) and
+    the symbols/sections each unit still needs declared.  Strictly exact cases go to
+    ``queue.tsv``.  Cases that are byte-identical but rest on undeclared addresses (status or
+    verdict ``assumed``) go, when ``include_assumed``, to ``assumed.tsv`` with every assumption in
+    ``assumptions.tsv`` and the declarations that would settle them in ``symbols.assumed.txt``
+    (one ``NAME = 0xADDRESS;`` per symbol, for review: declaring them is the operator's decision,
+    after which a rerun verifies those cases strictly).  Nothing is written anywhere but ``out``."""
+    out = Path(out)
+    rows, skipped, assumptions = [], [], []
+    declarations: dict[tuple[str, str], list[str]] = {}
+    for case in store.all():
+        if case.status not in ("exact", "assumed") or (image and case.image != image):
+            continue
+        verdict = (case.strict or case.proof or {}).get("verdict", "unverified")
+        if case.status == "assumed" and verdict == "exact":
+            verdict = "assumed"
+        if verdict not in ("exact", "assumed") or (verdict == "assumed" and not include_assumed):
+            skipped.append({"case": case.case_id, "name": case.name, "strict": verdict})
+            continue
+        text = store.source(case.best_digest)
+        if text is None:
+            skipped.append({"case": case.case_id, "name": case.name, "strict": "source-missing"})
+            continue
+        folder = out / case.image
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{case.name}.c").write_text(text)
+        pipeline, _, flags = case.recipe.partition(" ")
+        rows.append((case.image, pipeline, case.rom_offset, case.vram, case.size, f"{case.image}/{case.name}.c",
+                     flags, verdict))
+        for item in (case.strict or case.proof or {}).get("assumptions", []):
+            assumptions.append(f"{case.image}\t{case.name}\t{item.get('kind')}\t{item.get('name')}\t"
+                               f"{item.get('address')}")
+            if item.get("kind") == "symbol" and item.get("name") and item.get("address"):
+                declarations.setdefault((item["name"], str(item["address"])), []).append(case.name)
+    rows.sort()
+
+    def table(wanted: str) -> list[str]:
+        lines, current = [], None
+        for image_name, pipeline, rom_offset, vram, size, source, flags, verdict in rows:
+            if verdict != wanted:
+                continue
+            if (image_name, pipeline) != current:
+                current = (image_name, pipeline)
+                lines.append(f"# image {image_name}; pipeline {pipeline}; ROM_START SIZE SOURCE FLAGS  "
+                             "(# VRAM, strict verdict)")
+            start = f"0x{rom_offset:X}" if rom_offset is not None else "?"
+            lines.append(f"{start}\t0x{size:X}\t{source}\t{flags}\t# 0x{vram:08X} {verdict}")
+        return lines
+
+    if rows:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "queue.tsv").write_text("\n".join(table("exact")) + "\n")
+        (out / "assumed.tsv").write_text("\n".join(table("assumed")) + "\n")
+        (out / "assumptions.tsv").write_text("# image\tunit\tkind\tname\taddress\n" + "\n".join(assumptions) + "\n")
+        (out / "symbols.assumed.txt").write_text(
+            "// Addresses the strict verifier had to assume.  Review, then append to the project's symbol file.\n" +
+            "".join(f"{name} = {address}; // used by {', '.join(sorted(set(users))[:4])}\n"
+                    for (name, address), users in sorted(declarations.items(), key=lambda kv: kv[0][1])))
+    return {"exported": len(rows), "bytes": sum(r[4] for r in rows),
+            "strict_exact": sum(1 for r in rows if r[7] == "exact"),
+            "assumed": sum(1 for r in rows if r[7] == "assumed"), "skipped": skipped, "out": str(out)}

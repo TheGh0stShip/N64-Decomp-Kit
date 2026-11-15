@@ -1,8 +1,18 @@
+import shutil
+import atexit
 import tempfile
 import unittest
 from pathlib import Path
 
 from n64dk.match import families, iterate
+
+
+def _scratch(prefix: str = "n64dk-test-") -> str:
+    """A scratch directory removed when the test process exits."""
+    path = tempfile.mkdtemp(prefix=prefix)
+    atexit.register(shutil.rmtree, path, True)
+    return path
+
 
 SOURCE = """#include "types.h"
 
@@ -62,6 +72,16 @@ class FamilyTest(unittest.TestCase):
         self.assertTrue(any(l.startswith("deref-sum to index") for l in found))
         self.assertTrue(any(l.startswith("index to deref-sum") for l in found))
 
+    def test_pass_through_arguments(self):
+        source = ("extern s32 next();\nvoid step(void *object, s32 mode) {\n    next();\n    other(object);\n"
+                  "    last(mode);\n}\n")
+        found = [v.label for v in families.variants(source, "step", ("callargs",))]
+        self.assertEqual(found, ["line 2: next() -> next(object)", "line 2: next() -> next(object, mode)",
+                                 "line 3: other(object) -> other(object, mode)"])     # last(mode) is not a prefix
+        variant = families.variants(source, "step", ("callargs",))[0]
+        self.assertIn("    next(object);\n", variant.source)
+        self.assertTrue(variant.semantic_review)
+
     def test_evidence_selects_volatile_for_a_store_in_a_delay_slot(self):
         report = {"counts": {"scheduling": 2}, "entries": [
             {"compiled": "", "retail": "sb $a2, 0x1($a0)"},
@@ -102,7 +122,7 @@ def _kmc():
         from n64dk.match.toolchain import load_config
     except Exception as error:                                  # pragma: no cover
         return None, str(error)
-    project = Path(tempfile.mkdtemp(prefix="n64dk-families-"))
+    project = Path(_scratch("n64dk-families-"))
     cfg = load_config(project, None, None)
     if cfg.toolchain("kmc") is None:
         return None, "KMC GCC toolchain not configured (N64DK_TOOLCHAIN)"

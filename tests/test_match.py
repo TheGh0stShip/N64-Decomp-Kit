@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from n64dk import fixtures
+from n64dk.commands.match import _mapped_comparison_addr
 from n64dk.match import asn64, diff, manifest, normalize, symbols
 from n64dk.match.engine import (Target, batch, manifest_row, match_source, non_axis_flags, sweep,
                                 sweep_specs)
@@ -32,6 +33,18 @@ JR_RA = 0x03E00008
 LUI_AT_8007 = 0x3C018007
 LUI_AT_8008 = 0x3C018008
 LW_V0_AT = 0x8C220010     # lw $v0,0x10($at)
+
+
+class MappingTests(unittest.TestCase):
+    def test_raw_overlay_applies_catalogue_to_link_shift_before_delta_validation(self):
+        resolved = {"linked_vram": "0x800C77E8", "selected": {"authority": "raw-overlay"}}
+        linked = _mapped_comparison_addr(resolved, 0x800C77E8, 0x18A0)
+        self.assertEqual(linked, 0x800C5F48)
+        self.assertEqual(resolved["linked_vram"], "0x800C5F48")
+
+    def test_anchored_composite_mapping_remains_authoritative(self):
+        resolved = {"linked_vram": "0x800C5F48", "selected": {"authority": "anchored-composite-region"}}
+        self.assertEqual(_mapped_comparison_addr(resolved, 0x800C77E8, 0x18A0), 0x800C5F48)
 
 
 class DiffTests(unittest.TestCase):

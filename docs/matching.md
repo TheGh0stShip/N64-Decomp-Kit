@@ -38,7 +38,35 @@ include = ["include", "src/code/include"]
 symbols = ["config/us/symbol_addrs.txt"]
 normalizer = "python3 tools/normalize_asm.py {input} {output}"
 rom = "baseroms/us/baserom.z64"
+tool_timeout = 120          # seconds per compiler/assembler run; the process group is killed
+
+# Inventory discovery (all optional).  Without [inventory]/[images] the legacy conventions
+# config/**/functions_<image>.toml + config/**/matching_<image>_*units.tsv are used.
+[inventory]
+catalogues = ["analysis/survey/functions.toml"]      # globs; image name = functions_<x> or file stem
+manifests = ["config/us/matching_*.tsv"]             # globs, applied to every catalogue
+pipelines = { "config/us/matching_kmc_as_units.tsv" = "kmc+as" }   # --verify pipeline pins
+kmc_lane = "kmc+builtin"                             # KMC lane for manifests whose header says KMC/GCC
+exclude_names = []                                   # fnmatch on function names (default: none)
+exclude_kinds = []                                   # fnmatch on catalogue kind/status comments
+rom_bias = 0                                         # subtracted from manifest ROM offsets
+
+[images.main]                                        # per image (overrides [inventory] discovery)
+catalogue = "config/us/recomp_function_boundaries.toml"
+manifests = ["config/us/matching_units.tsv", "config/us/matching_kmc_units.tsv"]
+rom_bias = 0          # manifest ROM - catalogue section ROM (0x1000 for a segment-relative catalogue)
+vram_delta = 0x80070000   # optional: VRAM - ROM for `match --image-name main`
+rom = "baseroms/us/baserom.z64"   # optional: image file for `match-inventory --verify`
 ```
+
+Inventory rows separate *declared* coverage (a manifest row with an existing source owns the
+interval: `manifest_declared`) from *verified* coverage (`match-inventory --verify` rebuilt the
+unit from current source and `verify.strict_compare` found it exact: `manifest_verified_current`).
+Every row carries `verified: exact|assumed|mismatch|build-failed|source-missing|unverified`.
+Verdicts are cached in `.n64dk/verification.sqlite`, keyed by the source digest, the include
+closure (headers the preprocessor read, via `-M`), pipeline/flags, toolchain digest, target bytes,
+declared symbols and the other units of the set.  An empty inventory, a manifest row whose source
+is missing, or a conflict makes `consistency.ok` false.
 
 | Profile | Standard flags |
 |---|---|

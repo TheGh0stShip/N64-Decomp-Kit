@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import asn64, normalize
+from . import asn64, custom_pipeline, normalize
 from .toolchain import Config
 
 PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "ido5.3", "ido7.1", "sn", "as")
@@ -228,6 +228,13 @@ def _include_closure_digest(source: Path, roots: tuple[Path, ...],
 
 
 def _compiler_digest(cfg: Config, pipeline: str) -> str:
+    if custom_pipeline.is_custom(pipeline):
+        # a configured lane is identified by its recipe text and the tools it names
+        try:
+            material = custom_pipeline.recipe_for(pipeline, cfg.project).digest_material()
+        except custom_pipeline.CustomPipelineError:
+            return "custom-pipeline-undefined"
+        return hashlib.sha256(material.encode()).hexdigest()
     key = TOOLCHAIN_OF.get(pipeline, "kmc"); root = cfg.toolchain(key); digest = hashlib.sha256()
     if root:
         from .toolchain import PROFILES
@@ -446,6 +453,19 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
         _run([sn / "wibo", sn / "cc1n64.exe", "-quiet", *private_flags, pre, "-o", asm], unit_dir)
         _run([sn / "wibo", sn / "asn64.exe", "-o", psyq, asm], unit_dir)
         _run([sn / "psyq-obj-parser", psyq, "-b", "-n", "-o", obj], unit_dir)
+        return retain()
+    if custom_pipeline.is_custom(pipe):
+        # a lane declared in the project's [pipelines.<name>] configuration
+        local = unit_dir / (source.name if source.suffix else f"{source.name}.c")
+        if local.resolve() != source:
+            shutil.copyfile(source, local)
+        try:
+            recipe = custom_pipeline.recipe_for(pipe, cfg.project)
+            built = custom_pipeline.build(recipe, local, [*private_flags, *inc], [], unit_dir, cfg.project)
+        except custom_pipeline.CustomPipelineError as error:
+            raise BuildError(str(error)) from None
+        if built != obj:
+            shutil.copyfile(built, obj)
         return retain()
     raise BuildError(f"unknown pipeline {pipe!r}")
 

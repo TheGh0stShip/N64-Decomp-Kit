@@ -195,6 +195,10 @@ def track(fl: Flow) -> Facts:
             else:
                 regs.pop(rd, None)
             return
+        if op == 17 and rs in (4, 5):                            # mtc1 / dmtc1: an integer register feeds the FPU
+            if record:
+                note_param(regs.get(rt), "f32" if rs == 4 else "f64")
+            return
         if op in LOADS or op in STORES:
             store = op in STORES
             name, width = (STORES[op][0], STORES[op][1]) if store else (LOADS[op][0], LOADS[op][1])
@@ -230,6 +234,9 @@ def track(fl: Flow) -> Facts:
                     offset = (base[1] + simm - fl.frame.size) & ~3      # sub-word reads of a narrow argument
                     if offset not in facts.stack_args_read:
                         facts.stack_args_read.append(offset)
+            if not store and op in (49, 53) and base is not None and base[0][0] == "sp" and record:
+                # an argument reloaded from its home slot into the FPU was passed as a float
+                note_param(slots.get(base[1] + simm), "f32" if op == 49 else "f64")
             if not store and op not in (49, 53):
                 if base is not None and base[0][0] == "sp" and op in (35, 55):
                     value = slots.get(base[1] + simm)

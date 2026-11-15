@@ -42,8 +42,12 @@ from .typed_explore import source_shape
 
 INT_TYPES = ("s32", "u32", "s16", "u16", "s8", "u8")
 FAMILIES = ("types", "fields", "casts", "lifetime", "order", "expression", "scope", "split",
-            "volatile", "globals", "pointer", "control")
-_EXTENSION_FAMILIES = ("volatile", "globals", "pointer", "control")
+            "volatile", "globals", "pointer", "control", "callargs",
+            # parser-backed families (n64dk.match.astforms); empty when the source cannot be parsed
+            "ast-control", "ast-expr", "ast-temp", "ast-inline-temp", "ast-stmt-order", "ast-decl-order",
+            "ast-cast", "ast-block", "ast-sameline")
+_EXTENSION_FAMILIES = ("volatile", "globals", "pointer", "control", "callargs")
+_AST_PREFIX = "ast-"
 _DECL = re.compile(r"^(\s+(?:register\s+)?)(s8|u8|s16|u16|s32|u32)(\s+)(\w+)(\s*;.*|\s*=\s*[^;]+;.*)$")
 _INIT = re.compile(r"^(\s+(?:register\s+)?)(\w+)(\s+)(\w+)\s*=\s*([^;]+);\s*$")
 _ASSIGN = re.compile(r"^(\s+)(\w+) = ([^;]+);\s*$")
@@ -356,6 +360,14 @@ def variants(source: str, name: str, families=FAMILIES, reach: int = 6) -> list[
     if extension:
         from . import families as extension_families      # imports this module: keep the import late
         out += extension_families.variants(source, name, extension)
+    parsed = tuple(f[len(_AST_PREFIX):] for f in families if f.startswith(_AST_PREFIX))
+    if parsed:
+        try:
+            from . import astforms                           # needs pycparser; optional
+            for item in astforms.variants(source, name, parsed, limit=96):
+                out.append(Variant(item.label, _AST_PREFIX + item.family, item.source, item.semantic_review))
+        except Exception:                                    # a parser problem must never stop the search
+            pass
     unique, seen = [], {hashlib.sha256(source.encode()).hexdigest()}
     for item in out:
         digest = hashlib.sha256(item.source.encode()).hexdigest()

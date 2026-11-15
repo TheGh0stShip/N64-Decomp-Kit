@@ -63,18 +63,23 @@ TAXONOMY = {
     "semantic.unknown": "instructions differ without a recognised pattern",
 }
 FAMILIES_FOR = {
-    "type.signedness": ("types", "fields", "casts", "globals"),
-    "type.width": ("types", "fields", "casts", "globals"),
+    "type.signedness": ("types", "fields", "casts", "globals", "ast-cast"),
+    "type.width": ("types", "fields", "casts", "globals", "ast-cast"),
     "type.volatile": ("volatile", "globals"),
     "global.declaration": ("globals",),
-    "register.lifetime": ("lifetime", "scope", "split"),
-    "register.permutation": ("order", "lifetime", "scope", "split", "expression"),
-    "register.pressure": ("lifetime", "split", "scope", "expression", "types"),
-    "schedule.delay_slot": ("volatile", "lifetime", "order", "expression"),
-    "control.branch_form": ("control", "expression"),
-    "control.branch_likely": ("control", "expression"),
-    "frame.size": ("types", "split", "scope", "volatile"),
-    "semantic.unknown": ("types", "fields", "casts", "expression", "control"),
+    "register.lifetime": ("lifetime", "ast-stmt-order", "scope", "split", "ast-temp", "ast-inline-temp"),
+    "register.permutation": ("callargs", "ast-control", "ast-inline-temp", "ast-temp", "ast-decl-order", "order",
+                             "lifetime", "ast-stmt-order", "scope", "split", "ast-expr", "expression"),
+    "register.pressure": ("callargs", "ast-inline-temp", "ast-temp", "ast-control", "lifetime", "split", "scope",
+                          "ast-expr", "expression", "types"),
+    "schedule.delay_slot": ("volatile", "ast-stmt-order", "lifetime", "order", "ast-sameline", "ast-block",
+                            "expression"),
+    "schedule.load_hazard": ("ast-stmt-order", "ast-sameline", "ast-block"),
+    "control.branch_form": ("ast-control", "control", "ast-expr", "expression"),
+    "control.branch_likely": ("ast-control", "control", "ast-expr", "expression"),
+    "frame.size": ("ast-inline-temp", "ast-temp", "types", "split", "scope", "volatile", "ast-cast"),
+    "semantic.unknown": ("callargs", "ast-control", "ast-expr", "ast-cast", "ast-inline-temp", "types", "fields",
+                         "casts", "expression", "control"),
 }
 _LOAD_SIGN = {("lh", "lhu"), ("lhu", "lh"), ("lb", "lbu"), ("lbu", "lb"), ("slt", "sltu"), ("sltu", "slt"),
               ("slti", "sltiu"), ("sltiu", "slti"), ("sra", "srl"), ("srl", "sra"), ("div", "divu"),
@@ -149,8 +154,8 @@ def compiler_family(flow: Flow) -> dict:
 
 
 def pipeline_family(pipeline: str | None) -> str | None:
-    if not pipeline:
-        return None
+    if not pipeline or pipeline.startswith("custom:"):
+        return None                      # a configured lane: its family is declared, not guessed here
     return "ido" if pipeline.startswith("ido") else "gcc"
 
 

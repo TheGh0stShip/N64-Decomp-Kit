@@ -15,6 +15,10 @@ These cover the residual classes that type/lifetime iteration cannot reach:
               one referenced ``extern`` declaration: integer type, array vs pointer.
 ``pointer``   ``p[i]`` / ``*(p + i)`` and ``(*p).f`` / ``p->f`` spellings.
 ``control``   if/else inversion and loop forms (delegated to ``controlflow.variants``).
+``callargs``  A value that reaches a callee in the register it arrived in leaves no trace at the
+              call site: the caller never writes ``$a0``, so a decompiler emits ``f()`` where the
+              source said ``f(arg0)``.  Variants pass the function's own leading parameters
+              through to a call that currently passes none (or only the first ones).
 
 ``volatile`` and ``globals`` change what the program means to the compiler and are always
 marked ``semantic_review``: a volatile qualifier is legitimate when the memory really is
@@ -27,7 +31,7 @@ import re
 
 from .iterate import INT_TYPES, Variant, _function_span
 
-EXTRA_FAMILIES = ("volatile", "globals", "pointer", "control")
+EXTRA_FAMILIES = ("volatile", "globals", "pointer", "control", "callargs")
 _STORES = {"sb", "sh", "sw", "swc1", "sdc1", "sd"}
 _LOADS = {"lb", "lbu", "lh", "lhu", "lw", "lwc1", "ldc1", "ld"}
 _JUMPS = {"j", "jr", "jal", "jalr", "b", "beq", "bne", "beqz", "bnez", "blez", "bgtz", "bltz", "bgez",
@@ -164,6 +168,26 @@ def variants(source: str, name: str, families=EXTRA_FAMILIES, limit: int = 24) -
                     continue
                 changed = body[:found.start()] + replacement(found) + body[found.end():]
                 emit(f"{label} #{number + 1}", "pointer", head + signature + changed + tail, False)
+
+    if "callargs" in families:
+        params = re.findall(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?=[,)])", signature[signature.find("("):])
+        params = [p for p in params if p != "void"][:4]
+        calls = re.compile(r"(?<![\w.>])([A-Za-z_]\w*)\(\s*((?:[A-Za-z_]\w*\s*,\s*)*[A-Za-z_]\w*)?\s*\)")
+        seen_calls = 0
+        for found in calls.finditer(body):
+            callee = found.group(1)
+            if callee in _KEYWORDS or callee in INT_TYPES or callee == name or callee.startswith("M2C_") \
+                    or seen_calls >= limit:
+                continue
+            given = [a.strip() for a in (found.group(2) or "").split(",") if a.strip()]
+            if given != params[:len(given)] or len(given) >= len(params):
+                continue                      # only a leading run of the function's own parameters can pass through
+            seen_calls += 1
+            line_no = body.count("\n", 0, found.start()) + 1
+            for count in range(len(given) + 1, len(params) + 1):
+                call = f"{callee}({', '.join(params[:count])})"
+                changed = body[:found.start()] + call + body[found.end():]
+                emit(f"line {line_no}: {found.group(0)} -> {call}", "callargs", head + signature + changed + tail, True)
 
     if "control" in families:
         try:

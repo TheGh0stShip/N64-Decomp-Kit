@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import tomllib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -12,29 +11,12 @@ PREFLIGHT_VERSION = "image-map-v3"
 
 
 def configured_image_path(project: str | Path, image: str) -> Path:
-    """Resolve a logical image name through ``n64dk.toml`` without filename guessing."""
-    project = Path(project).expanduser().resolve()
-    config = project / "n64dk.toml"
-    if not config.is_file():
-        raise ValueError(f"logical image {image!r} has no n64dk.toml configuration")
-    entries = tomllib.loads(config.read_text()).get("images", {})
-    normalized = image.replace("_", "").replace("-", "").lower()
-    matches = [(name, value) for name, value in entries.items()
-               if name.replace("_", "").replace("-", "").lower() == normalized]
-    if len(matches) != 1:
-        available = ", ".join(sorted(entries)) or "none"
-        raise ValueError(f"logical image {image!r} resolved to {len(matches)} entries; available: {available}")
-    _name, entry = matches[0]
-    value = entry if isinstance(entry, str) else next(
-        (entry[key] for key in ("composite", "path", "raw") if entry.get(key)), None)
-    if not value:
-        raise ValueError(f"logical image {image!r} has no path/composite/raw file")
-    path = Path(value)
-    path = path if path.is_absolute() else project / path
-    path = path.resolve()
-    if not path.is_file():
-        raise ValueError(f"configured image is missing: {path}")
-    return path
+    """Resolve through the one canonical logical-image registry."""
+    from .images import ImageError, resolve
+    try:
+        return resolve(Path(project).expanduser().resolve(), image).path.resolve()
+    except ImageError as error:
+        raise ValueError(str(error)) from error
 
 
 def _digest(data: bytes) -> str:

@@ -7,7 +7,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ..analysis.functions import load_catalogue
+from ..analysis.catalogue import load as load_catalogue
 from ..cli import command
 from ..elf import Elf
 from ..match import manifest as manmod
@@ -23,7 +23,7 @@ def manifest_verify(args):
     units = []
     for spec in args.manifests:
         path, _, pipe = spec.partition("=")
-        if pipe and pipe not in PIPELINES and pipe != "kmc":
+        if pipe and pipe not in PIPELINES and pipe != "kmc" and not pipe.startswith("custom:"):
             raise SystemExit(f"unknown pipeline {pipe!r}")
         units += manmod.parse(Path(cfg.project, path), cfg.project, target.rom_to_vram, pipe or None,
                               f"kmc+{args.kmc_lane}", None, shlex.split(args.flags) if args.flags else None)

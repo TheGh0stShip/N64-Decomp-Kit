@@ -147,5 +147,40 @@ class MappingTest(unittest.TestCase):
         self.assertEqual(mapping["linked_vram"], "0x800DF2B8")
 
 
+class IdoRepairTest(unittest.TestCase):
+    """The same repairs must fire on IDO front-end diagnostics, which are worded differently."""
+
+    SOURCE = ("void g(s32, s32);  /* extern */\nvoid f(void *arg0, s32 arg1) {\n    void *var_a0;\n    s32 *var_a1;\n\n"
+              "    var_a0 = arg0;\n    var_a0 += 0x28;\n    *(arg0 + sp4) = 0;\n    var_a1 = arg1;\n    g(arg1);\n"
+              "    (*(M2C_UNK (**)(void *, void *))((s8 *)(arg0) + 8))(arg0);\n}\n")
+
+    def fix(self, line, message):
+        return autodraft.repair(self.SOURCE, f"cfe: Error: /tmp/x/f.c, line {line}: {message}\n  src\n ---^")
+
+    def test_undefined_name(self):
+        self.assertIn("{\n    s32 sp4;\n", self.fix(8, "'sp4' undefined; reoccurrences will not be reported."))
+
+    def test_dereferenced_non_pointer(self):
+        self.assertIn("*(s32 *)(arg0 + sp4) = 0;", self.fix(8, "Dereferenced a non-pointer."))
+
+    def test_void_pointer_arithmetic_becomes_byte_pointer(self):
+        fixed = self.fix(7, "Bad operand type for += or -=")
+        self.assertIn("    s8 *var_a0;", fixed)
+        self.assertIn("void *arg0", fixed)                       # only the variable on that line changes
+        self.assertIn("f(s8 *arg0, s32 arg1)", self.fix(8, "Unacceptable operand of '+'."))
+
+    def test_argument_count_disagreement(self):
+        message = "Number of arguments doesn't agree with the number in the declaration."
+        self.assertIn("(*(M2C_UNK (**)())((s8 *)(arg0) + 8))(arg0);", self.fix(11, message))
+        self.assertTrue(self.fix(10, message).startswith("void g();  /* extern */"))
+
+    def test_pointer_integer_assignment_gets_the_target_type(self):
+        self.assertIn("    var_a1 = (s32 *) (arg1);", self.fix(9, "illegal combination of pointer and integer"))
+
+    def test_gcc_wording_still_works(self):
+        fixed = autodraft.repair(self.SOURCE, "f.c:8: `sp4' undeclared (first use this function)")
+        self.assertIn("    s32 sp4;", fixed)
+
+
 if __name__ == "__main__":
     unittest.main()
