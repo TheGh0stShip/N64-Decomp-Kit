@@ -371,9 +371,15 @@ def match_job_export(args):
         candidate = selected[0]
         from ..match.cache import ContentCache
         cache = ContentCache(state_root / "cache")
+        source_bytes = cache.get(candidate.source_digest)
+        if args.output == "-":
+            return {"output": "stdout", "source": source_bytes.decode("utf-8", "replace"),
+                    "evidence": {"job": store.summary(args.job_id), "candidate": asdict(candidate),
+                                 "proof_grade": False},
+                    "candidate_id": candidate.candidate_id, "exact": candidate.exact}
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(cache.get(candidate.source_digest))
+        output.write_bytes(source_bytes)
         evidence = output.with_suffix(output.suffix + ".evidence.json")
         evidence.write_text(json.dumps({
             "job": store.summary(args.job_id),

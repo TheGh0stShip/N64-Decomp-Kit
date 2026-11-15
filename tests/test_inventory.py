@@ -42,13 +42,13 @@ functions = [
             result = inventory.build(root)
             self.assertTrue(any(row["source"] == "aggregate_owned_c" for row in result["reconciliation"]))
             rows = {row["name"]: row for row in result["functions"]}
-            self.assertEqual(rows["first"]["state"], "covered")
-            self.assertEqual(rows["second"]["state"], "covered")
-            self.assertEqual(rows["shared_tail"]["state"], "excluded")
+            self.assertEqual(rows["first"]["state"], "claimed")
+            self.assertEqual(rows["second"]["state"], "claimed")
+            self.assertEqual(rows["shared_tail"]["state"], "assembly")
             self.assertEqual(rows["remaining"]["state"], "assembly")
             self.assertEqual(rows["remaining"]["candidate_source"], ".tmp/remaining_candidate.c")
             self.assertEqual(rows["remaining"]["ownership_state"], "assembly_unit")
-            self.assertEqual(rows["first"]["ownership_state"], "manifest_exact_member")
+            self.assertEqual(rows["first"]["ownership_state"], "manifest_nonexact")
 
     def test_progress_denominator_mismatch_is_explicit(self):
         with tempfile.TemporaryDirectory() as name:
@@ -90,7 +90,7 @@ functions = [{ name = "func_80000000", vram = 0x80000000, size = 0x10 }] # c can
             root = Path(name); config = root / "config/us"; config.mkdir(parents=True)
             (config / "functions_resident.toml").write_text('''
 [[section]]
-rom = 0
+rom = 0x1000
 vram = 0x80000400
 size = 0x100
 functions = [
@@ -101,8 +101,8 @@ functions = [
             (config / "matching_kmc_units.tsv").write_text(
                 "0x1040\t0x20\tsrc/aggregate.c\t-O2\t" + "a" * 64 + "\n")
             rows = inventory.build(root)["functions"]
-            self.assertTrue(all(row["state"] == "covered" for row in rows))
-            self.assertTrue(all(row["ownership_state"] == "manifest_exact_member" for row in rows))
+            self.assertTrue(all(row["state"] == "claimed" for row in rows))
+            self.assertTrue(all(row["ownership_state"] == "manifest_nonexact" for row in rows))
 
     def test_callee_save_store_is_not_semantic_live_in(self):
         with tempfile.TemporaryDirectory() as name:
@@ -152,6 +152,34 @@ functions = [
                                            "offset": 0x2010})
             collisions = physical_collisions(composite_path, layout, mapping, rows)
             self.assertEqual(collisions[0]["owner"], "linked_duplicate")
+
+    def test_shifted_composite_entry_analysis_uses_linked_vram(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            raw_path = root / "overlay.z64"
+            composite_path = root / "overlay_composite.z64"
+            # The catalogue is shifted +0x100 from the retail link address.
+            layout = Layout("overlay", 0, 0x80001100, 0x40,
+                            0x80001120, 16)
+            linked_entry = 0x80001020
+            raw = bytearray(0x40)
+            struct.pack_into(">II", raw, 0,
+                             0x0C000000 | ((linked_entry >> 2) & 0x03FFFFFF), 0)
+            struct.pack_into(">IIII", raw, 0x20, 0x27BDFFF8, 0xAFBF0004,
+                             0x03E00008, 0x27BD0008)
+            raw_path.write_bytes(raw)
+            composite = bytearray(0x1040)
+            struct.pack_into(">I", composite, 8, 0x80001000)
+            composite[0x1000:0x1040] = raw
+            composite_path.write_bytes(composite)
+
+            report = preflight(composite_path, layout, strict_entry=True)
+            self.assertEqual(report["mapping"]["linked_vram"], "0x80001020")
+            self.assertEqual(report["returns"], ["0x80001028"])
+            self.assertEqual(report["entry_preflight"]["call_target_evidence"],
+                             ["0x80001000"])
+            self.assertEqual(report["delay_slot_ownership"]["terminator"],
+                             "0x80001028")
 
     def test_splat_metadata_and_context_bundle(self):
         with tempfile.TemporaryDirectory() as name:

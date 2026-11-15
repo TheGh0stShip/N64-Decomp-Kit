@@ -41,7 +41,9 @@ from dataclasses import dataclass
 from .typed_explore import source_shape
 
 INT_TYPES = ("s32", "u32", "s16", "u16", "s8", "u8")
-FAMILIES = ("types", "fields", "casts", "lifetime", "order", "expression", "scope", "split")
+FAMILIES = ("types", "fields", "casts", "lifetime", "order", "expression", "scope", "split",
+            "volatile", "globals", "pointer", "control")
+_EXTENSION_FAMILIES = ("volatile", "globals", "pointer", "control")
 _DECL = re.compile(r"^(\s+(?:register\s+)?)(s8|u8|s16|u16|s32|u32)(\s+)(\w+)(\s*;.*|\s*=\s*[^;]+;.*)$")
 _INIT = re.compile(r"^(\s+(?:register\s+)?)(\w+)(\s+)(\w+)\s*=\s*([^;]+);\s*$")
 _ASSIGN = re.compile(r"^(\s+)(\w+) = ([^;]+);\s*$")
@@ -49,10 +51,13 @@ _POINTER_TYPE = re.compile(r"\b([su])(8|16|32)( \*)")
 _VALUE_CAST = re.compile(r"\(([su])(8|16)\)\s*")
 _POSTINC = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\+\+;\s*$")
 _PLUS_ONE = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\s*\+=\s*1;\s*$")
-_NEGATE = re.compile(r"!\s*([A-Za-z_]\w*)")
-_ZERO_COMPARE = re.compile(r"([A-Za-z_]\w*)\s*==\s*0")
-_EXPANDED_ASSIGN = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\s*=\s*\2\s*([+\-*|&^])\s*([^;]+);\s*$")
-_COMPOUND_ASSIGN = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\s*([+\-*|&^])=\s*([^;]+);\s*$")
+# ``!x`` <-> ``x == 0`` only for a whole operand: not ``a - b == 0`` and not ``!x->y`` / ``!f(x)``
+_NEGATE = re.compile(r"(?<![\w)\]])!\s*([A-Za-z_]\w*)(?![\w(\[.]|\s*->)")
+_ZERO_COMPARE = re.compile(r"(?<=[(&|,])\s*([A-Za-z_]\w*)\s*==\s*0(?![\w.x])")
+# ``x = x op y`` <-> ``x op= y`` only when y is one operand: ``x = x - a + b`` is not ``x -= a + b``
+_OPERAND = r"(?:\([^;()]*\)|[A-Za-z_0-9.]+(?:->\w+|\.\w+|\[\w+\])*)"
+_EXPANDED_ASSIGN = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\s*=\s*\2\s*([+\-*|&^])\s*(" + _OPERAND + r");\s*$")
+_COMPOUND_ASSIGN = re.compile(r"(?m)^(\s*)([A-Za-z_]\w*)\s*([+\-*|&^])=\s*(" + _OPERAND + r");\s*$")
 _IDENT = re.compile(r"[A-Za-z_]\w*")
 _SAVE = re.compile(r"^sw \$s\d, ")
 _WIDTH_OPS = {"lh", "lhu", "lb", "lbu", "slt", "sltu", "slti", "sltiu", "sra", "srl", "andi"}
@@ -80,14 +85,82 @@ class Evaluation:
 
 def _function_span(source: str, name: str) -> tuple[int, int, int] | None:
     """(signature start, body start after ``{``, body end before ``}``)."""
-    found = re.search(rf"(?m)^[A-Za-z_][\w \*]*?\b{re.escape(name)}\s*\(([^;{{}}]*)\)\s*\{{", source)
+    # Keep offsets and newlines stable while hiding braces/parens in comments, literals and
+    # character constants.  Regex-only brace counting truncated bodies at strings such as
+    # p("}") and could not recognize split return types or K&R parameter declarations.
+    chars = list(source)
+    position, state = 0, "code"
+    while position < len(chars):
+        char = chars[position]
+        following = chars[position + 1] if position + 1 < len(chars) else ""
+        if state == "code" and char == "/" and following == "/":
+            chars[position] = chars[position + 1] = " "; position += 2; state = "line"; continue
+        if state == "code" and char == "/" and following == "*":
+            chars[position] = chars[position + 1] = " "; position += 2; state = "block"; continue
+        if state == "code" and char in {'"', "'"}:
+            state = "string" if char == '"' else "char"; chars[position] = " "; position += 1; continue
+        if state in {"string", "char"}:
+            if char == "\\":
+                chars[position] = " ";
+                if position + 1 < len(chars) and chars[position + 1] != "\n": chars[position + 1] = " "
+                position += 2; continue
+            closing = '"' if state == "string" else "'"
+            chars[position] = " " if char != "\n" else char
+            position += 1
+            if char == closing: state = "code"
+            continue
+        if state == "line":
+            if char == "\n": state = "code"
+            else: chars[position] = " "
+            position += 1; continue
+        if state == "block":
+            if char == "*" and following == "/":
+                chars[position] = chars[position + 1] = " "; position += 2; state = "code"; continue
+            if char != "\n": chars[position] = " "
+            position += 1; continue
+        position += 1
+    masked = "".join(chars)
+    found = re.search(rf"\b{re.escape(name)}\s*\(", masked)
     if not found:
         return None
-    depth, position = 1, found.end()
-    while position < len(source) and depth:
-        depth += {"{": 1, "}": -1}.get(source[position], 0)
+    open_paren = masked.find("(", found.start())
+    depth, position, close_paren = 1, open_paren + 1, None
+    while position < len(masked) and depth:
+        depth += (masked[position] == "(") - (masked[position] == ")")
+        if depth == 0: close_paren = position
         position += 1
-    return (found.start(), found.end(), position - 1) if depth == 0 else None
+    if close_paren is None:
+        return None
+    brace = masked.find("{", close_paren + 1, min(len(masked), close_paren + 4096))
+    if brace < 0:
+        return None
+    between = masked[close_paren + 1:brace]
+    # ANSI definitions have only whitespace/attributes before the body.  K&R definitions may
+    # have declaration statements; reject an ordinary prototype followed by another body.
+    if ";" in between:
+        params = set(_IDENT.findall(masked[open_paren + 1:close_paren]))
+        declarations = [line.strip() for line in between.splitlines() if line.strip()]
+        if not params or not declarations or any(not line.endswith(";") for line in declarations):
+            return None
+        declared = set()
+        for line in declarations:
+            declared.update(_IDENT.findall(line)[1:])
+        if not params <= declared:
+            return None
+    elif between.strip() and not re.fullmatch(r"(?:__attribute__\s*\(\([^)]*\)\)\s*)*", between.strip()):
+        return None
+    # Include a return type placed on preceding lines, but never cross another declaration or
+    # body boundary.
+    boundary = max(masked.rfind(";", 0, found.start()), masked.rfind("}", 0, found.start()),
+                   masked.rfind("{", 0, found.start()), masked.rfind("#", 0, found.start()))
+    start = boundary + 1
+    while start < found.start() and masked[start].isspace():
+        start += 1
+    depth, position = 1, brace + 1
+    while position < len(source) and depth:
+        depth += {"{": 1, "}": -1}.get(masked[position], 0)
+        position += 1
+    return (start, brace + 1, position - 1) if depth == 0 else None
 
 
 def _pure(expression: str) -> bool:
@@ -95,6 +168,16 @@ def _pure(expression: str) -> bool:
     if re.search(r"[A-Za-z_]\w*\s*\(", re.sub(r"\((?:[su](?:8|16|32)|f32|f64)\)", "", expression)):
         return False
     return not re.search(r"->|\[|(?:^|[=(,+\-*/&|<>!~?:]\s*)\*", expression)
+
+
+def _local_names(signature: str, declaration_lines: list[str]) -> set[str]:
+    """Parameters and locals: the identifiers whose values cannot be changed by a call."""
+    names = set(re.findall(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*[,)]", signature))
+    for line in declaration_lines:
+        found = re.match(r"^\s+(?:[A-Za-z_]\w*[ \*]+)+([A-Za-z_]\w*)\s*(?:\[\w*\])*\s*(?:=[^;]*)?;", line)
+        if found and "static" not in line.split() and "extern" not in line.split():
+            names.add(found.group(1))
+    return names
 
 
 def _units(lines: list[str]) -> list[tuple[int, int]]:
@@ -180,18 +263,25 @@ def variants(source: str, name: str, families=FAMILIES, reach: int = 6) -> list[
                 break
         for index, line in enumerate(lines[:last_declaration + 1]):
             found = _INIT.match(line)
-            if found and _pure(found.group(5)):
+            if found and _pure(found.group(5)) and \
+                    set(_IDENT.findall(found.group(5))) - set(INT_TYPES) - {"f32", "f64"} <= \
+                    _local_names(signature, lines[:index]):
                 changed = list(lines)
                 changed[index] = f"{found.group(1)}{found.group(2)}{found.group(3)}{found.group(4)};"
                 indent = re.match(r"\s*", found.group(1)).group(0)
                 changed.insert(last_declaration + 1, f"{indent}{found.group(4)} = {found.group(5)};")
                 emit(f"split initialiser of {found.group(4)}", "lifetime", changed)
         units = [u for u in _units(lines) if u[0] > last_declaration]
+        local_names = _local_names(signature, lines[:last_declaration + 1])
         for position, (first, last) in enumerate(units):
             found = _ASSIGN.match(lines[first]) if first == last else None
             if not found or not _pure(found.group(3)):
                 continue
             names = {found.group(2), *_IDENT.findall(found.group(3))}
+            # only values that live in registers or the frame may move: a global read moved across
+            # a call, or a global store moved past a return, is a behaviour change
+            if not (names - set(INT_TYPES) - {"f32", "f64"}) <= local_names:
+                continue
             for direction in (-1, 1):
                 crossed = position
                 for step in range(1, reach + 1):
@@ -227,7 +317,7 @@ def variants(source: str, name: str, families=FAMILIES, reach: int = 6) -> list[
             for number, found in enumerate(pattern.finditer(body)):
                 changed = body[:found.start()] + replacement(found) + body[found.end():]
                 emit(f"{label} #{number + 1}", "expression", changed.split("\n"))
-        for pattern, replacement, label in ((_NEGATE, lambda m: f"{m[1]} == 0", "negation-to-zero"),
+        for pattern, replacement, label in ((_NEGATE, lambda m: f"({m[1]} == 0)", "negation-to-zero"),
                                              (_ZERO_COMPARE, lambda m: f"!{m[1]}", "zero-to-negation")):
             for number, found in enumerate(list(pattern.finditer(body))[:32]):
                 changed = body[:found.start()] + replacement(found) + body[found.end():]
@@ -262,6 +352,10 @@ def variants(source: str, name: str, families=FAMILIES, reach: int = 6) -> list[
             for use in range(at + 1, len(changed)):
                 changed[use] = re.sub(rf"\b{re.escape(name)}\b", split_name, changed[use])
             emit(f"split variable {name}", "split", changed, semantic_review=True)
+    extension = tuple(f for f in families if f in _EXTENSION_FAMILIES)
+    if extension:
+        from . import families as extension_families      # imports this module: keep the import late
+        out += extension_families.variants(source, name, extension)
     unique, seen = [], {hashlib.sha256(source.encode()).hexdigest()}
     for item in out:
         digest = hashlib.sha256(item.source.encode()).hexdigest()
@@ -298,7 +392,8 @@ def evidence(report: dict | None) -> dict:
 
 def _family_order(report: dict | None, families) -> list[str]:
     seen = evidence(report)
-    first = []
+    from . import families as extension_families
+    first = list(extension_families.evidence_families(report))
     if seen["saved_registers_missing"] or seen["saved_registers_extra"]:
         first += ["lifetime"]
     if seen["width_or_sign_sites"]:

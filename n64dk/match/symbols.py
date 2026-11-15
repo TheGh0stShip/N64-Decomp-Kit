@@ -26,16 +26,17 @@ class SymbolMap(dict):
 
     sizes: dict[str, int]
 
-    def __init__(self, *args, **kw):
+    def __init__(self, *args, infer_names: bool = True, **kw):
         super().__init__(*args, **kw)
         self.sizes = {}
+        self.infer_names = infer_names
 
     def __contains__(self, name) -> bool:  # used by n64dk.elf.Elf.relocate
-        return dict.__contains__(self, name) or bool(INFERRED.fullmatch(str(name)))
+        return dict.__contains__(self, name) or (self.infer_names and bool(INFERRED.fullmatch(str(name))))
 
     def __missing__(self, name):
         m = INFERRED.fullmatch(str(name))
-        if m:
+        if m and self.infer_names:
             return int(m.group(1), 16)
         raise KeyError(name)
 
@@ -46,7 +47,17 @@ class SymbolMap(dict):
             return None
 
     def copy(self) -> "SymbolMap":
-        out = SymbolMap(self)
+        out = SymbolMap(self, infer_names=self.infer_names)
+        out.sizes = dict(self.sizes)
+        return out
+
+    def explicit(self) -> "SymbolMap":
+        """Copy containing only independently loaded entries.
+
+        Address-bearing names are a useful exploration convention, but their spelling is not
+        proof of an address—especially in overlays whose catalogue and link coordinates differ.
+        """
+        out = SymbolMap(self, infer_names=False)
         out.sizes = dict(self.sizes)
         return out
 

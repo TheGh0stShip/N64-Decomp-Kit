@@ -2,9 +2,15 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 from n64dk.commands.workbench import (_load_matrix, code_query, compiler_explain,
-                                      family_session_start, scheduler_plan)
+                                      address_explain, boundary_correct, family_session_start, gate_policy,
+                                      image_map_explain, scheduler_plan, tu_session_start,
+                                      tu_session_try)
+from n64dk.match.engine import Outcome
+from n64dk.match.compare import Result, SectionCompare
+from n64dk.match.pipeline import BuildSpec
 from n64dk.match.session import SessionCandidate, SessionStore
 from n64dk.match.controlflow import classify_branches, variants
 from n64dk.match.typed_explore import (declaration_context, lifetime_graph,
@@ -24,6 +30,136 @@ from n64dk.commands.workbench import _restore_worktree_snapshot, _worktree_snaps
 
 
 class WorkbenchTests(unittest.TestCase):
+    def test_translation_unit_session_is_a_real_persistent_match_session(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); unit = root / "unit.c"
+            unit.write_text("int a(void) { return 1; }\nint b(void) { return a(); }\n")
+            spec = BuildSpec("kmc+builtin", ["-O2"])
+            cfg = SimpleNamespace(project=root)
+
+            def evaluator(source, pipeline, flags, label):
+                proof = SimpleNamespace(exact=True, as_dict=lambda: {"verdict": "exact"})
+                return Outcome(label, 0x80001000, 0x20,
+                               BuildSpec(pipeline, list(flags)),
+                               result=Result(True, SectionCompare(".text", 0x80001000,
+                                                                  0x20, True),
+                                             compiled_size=0x20),
+                               proof_required=True, proof=proof)
+
+            args = Namespace(unit="unit.c", project=name, manifest_row=None, rom="image.bin",
+                addr=0x80001000, size=0x20, image_name="main", pipeline="kmc+builtin",
+                flags="-O2", config=None, toolchain_dir=None, symbols=[], include=[],
+                normalizer=None, vram_delta=None, state_root=str(root / "state"),
+                no_infer=False, strict_entry=True, jobs=1)
+            context = {"source_name": "unit.c", "source_suffix": ".c", "project": name,
+                "rom": str(root / "image.bin"), "addr": 0x80001000,
+                "catalogue_addr": 0x80001000, "size": 0x20, "vram_delta": 0x80000000,
+                "target_text_sha256": "a" * 64}
+            with mock.patch("n64dk.commands.match._setup", return_value=(cfg, object(), object(), [])), \
+                 mock.patch("n64dk.commands.match._spec", return_value=spec), \
+                 mock.patch("n64dk.commands.match._session_context", return_value=context), \
+                 mock.patch("n64dk.commands.match._session_evaluator", return_value=evaluator):
+                started = tu_session_start(args)
+                tried = tu_session_try(Namespace(group_id=started["tu_session_id"], project=name,
+                    proposal='{"hypothesis":"change one function","edits":[{"find":"return 1","replace":"return 2"}]}',
+                    jobs=1, verify_command=None))
+            self.assertTrue((root / "state" / "sessions.sqlite").is_file())
+            self.assertEqual(tried["match_session_id"], started["match_session_id"])
+            self.assertEqual(tried["regression_scope"],
+                             "complete owned TU text/data/relocations")
+
+    def test_boundary_correction_is_reversible_and_non_applying(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); (root / "config").mkdir()
+            catalogue = root / "config" / "functions.toml"
+            original = '''
+[[section]]
+name = "code"
+rom = 0
+vram = 0x80001000
+size = 24
+functions = [
+  { name = "whole", vram = 0x80001000, size = 0xc },
+  { name = "tail", vram = 0x8000100c, size = 0xc },
+]
+'''
+            catalogue.write_text(original)
+            (root / "n64dk.toml").write_text('''
+[inventory]
+catalogues = ["config/functions.toml"]
+''')
+            receipt = root / "transaction.json"
+            result = boundary_correct(Namespace(function="whole", project=name,
+                new_start=None, new_size=None, merge_with="tail", output=str(receipt)))
+            self.assertEqual(catalogue.read_text(), original)
+            self.assertEqual(result["accounting"]["functions_before"], 2)
+            self.assertEqual(result["accounting"]["functions_after"], 1)
+            self.assertEqual(result["accounting"]["decompilation_gain"], 0)
+            self.assertIn('-  { name = "tail"', result["forward_patch"])
+            self.assertIn('+  { name = "tail"', result["reverse_patch"])
+            self.assertTrue(receipt.is_file())
+
+    def test_logical_image_and_address_resolution(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name); (root / "config").mkdir()
+            image = root / "retail.bin"
+            image.write_bytes(struct.pack(">III", 0x24020001, 0x03E00008, 0))
+            (root / "config" / "functions.toml").write_text('''
+[[section]]
+name = "code"
+rom = 0
+vram = 0x80001000
+size = 12
+functions = [
+  { name = "leaf", vram = 0x80001000, size = 12 },
+]
+''')
+            (root / "n64dk.toml").write_text('''
+[images]
+main = "retail.bin"
+[inventory]
+catalogues = ["config/functions.toml"]
+''')
+            common = dict(project=name, image="main", image_file=None)
+            resolved = address_explain(Namespace(**common, address=0x80001000,
+                                                 size=12))
+            self.assertEqual(resolved["identity"], "main:0x80001000:12")
+            explained = image_map_explain(Namespace(**common, function="leaf"))
+            self.assertEqual(explained["selected"]["authority"], "raw-overlay")
+            self.assertFalse(explained["ambiguous"])
+
+    def test_gate_policy_fails_closed_and_executes_in_order(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "n64dk.toml").write_text("""
+[workbench.hooks]
+affected_gate = "printf affected"
+full_gate = "printf full"
+project_tests = "printf tests"
+[workbench.gate_policy]
+winner = ["affected_gate", "full_gate", "project_tests"]
+""")
+            inspected = gate_policy(Namespace(project=name, stage="winner", run=False,
+                                              affected_unit=None))
+            self.assertTrue(inspected["ok"])
+            executed = gate_policy(Namespace(project=name, stage="winner", run=True,
+                                             affected_unit="unit.c"))
+            self.assertTrue(executed["ok"])
+            self.assertEqual(executed["passed_hooks"],
+                             ["affected_gate", "full_gate", "project_tests"])
+            (root / "n64dk.toml").write_text("""
+[workbench.hooks]
+affected_gate = "true"
+[workbench.gate_policy]
+winner = ["affected_gate", "full_gate"]
+""")
+            missing = gate_policy(Namespace(project=name, stage="winner", run=False,
+                                            affected_unit=None))
+            self.assertEqual(missing["missing"], ["full_gate"])
+            with self.assertRaisesRegex(ValueError, "missing hooks"):
+                gate_policy(Namespace(project=name, stage="winner", run=True,
+                                      affected_unit=None))
+
     def _compiler_session(self, root):
         store = SessionStore(root); session = store.create({"source_name": "fixture.c"})
         ids = []

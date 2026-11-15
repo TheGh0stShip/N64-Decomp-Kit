@@ -139,14 +139,16 @@ def dossier(project: str | Path, inventory: dict, row: dict, image_path: str | P
     try:
         check = preflight(image_path, layout, row.get("catalogue_status", ""))
         selected_offset = int(check["selected_image_offset"], 0)
+        linked_vram = int(check["mapping"].get("linked_vram") or layout.function_vram, 0)
     except ValueError as error:
         try:
             resolved = resolve_image_map(image_path, layout)
             candidates = [{key: (f"0x{value:X}" if key == "offset" else value)
                            for key, value in item.items() if key != "code"} for item in resolved["candidates"]]
             selected_offset = resolved["selected"]["offset"]
+            linked_vram = int(resolved.get("linked_vram") or layout.function_vram, 0)
         except ValueError:
-            candidates = []; selected_offset = layout.rom
+            candidates = []; selected_offset = layout.rom; linked_vram = layout.function_vram
         check = {"ok": False, "error": str(error), "mapping": layout.as_dict(),
                  "mapping_candidates": candidates, "selected_image_offset": f"0x{selected_offset:X}",
                  "warnings": ["preflight disagreement; dossier evidence retained"], "returns": []}
@@ -155,7 +157,7 @@ def dossier(project: str | Path, inventory: dict, row: dict, image_path: str | P
     index = same.index(row)
     neighbours = [{key: item[key] for key in ("name", "vram", "size", "state", "catalogue_status")}
                   for item in same[max(0, index - 3):index + 4] if item is not row]
-    context = contextmod.bundle(image_path, layout.function_vram, layout.function_size,
+    context = contextmod.bundle(image_path, linked_vram, layout.function_size,
                                 selected_offset, neighbours)
     callers = len(context["callers"])
     returns = len(check["returns"])
@@ -166,8 +168,9 @@ def dossier(project: str | Path, inventory: dict, row: dict, image_path: str | P
         confidence -= 0.15
     confidence = max(0.0, min(1.0, confidence))
     target_context = {"rom_sha256": hashlib.sha256(data).hexdigest(),
-                      "vram_delta": layout.function_vram - selected_offset,
-                      "addr": layout.function_vram, "size": layout.function_size}
+                      "vram_delta": linked_vram - selected_offset,
+                      "addr": linked_vram, "catalogue_addr": layout.function_vram,
+                      "size": layout.function_size}
     registry = SessionRegistry(root)
     try:
         history = registry.same_target(target_context)
@@ -177,10 +180,10 @@ def dossier(project: str | Path, inventory: dict, row: dict, image_path: str | P
     if corpus_path:
         corpus = CorpusIndex(corpus_path)
         try:
-            similar = corpus.query(binary_signature(code, layout.function_vram))
+            similar = corpus.query(binary_signature(code, linked_vram))
         finally:
             corpus.close()
-    body = list(mips.instructions(code, layout.function_vram))
+    body = list(mips.instructions(code, linked_vram))
     stack = [ins.getImmediate() for ins in body[:8]
              if ins.getOpcodeName() in {"addiu", "daddiu"} and mips.reg(ins.rs) == 29 and mips.reg(ins.rt) == 29]
     likely_prototype = {"arguments_observed": sorted({mips.reg(ins.rs) - 4 for ins in body[:12]
@@ -194,6 +197,8 @@ def dossier(project: str | Path, inventory: dict, row: dict, image_path: str | P
               "callers": callers, "returns": returns,
               "handwritten_likelihood": "high" if "handwritten" in row.get("catalogue_status", "") else
                                         "medium" if layout.function_size < 24 else "low"},
+              "linked_vram": f"0x{linked_vram:08X}",
+              "catalogue_vram": f"0x{layout.function_vram:08X}",
               "likely_prototype": likely_prototype, "candidate": candidate,
               "translation_unit_declarations": _declarations(root, candidate),
               "qualified_recipes": _recipes(root, row), "session_history": history,

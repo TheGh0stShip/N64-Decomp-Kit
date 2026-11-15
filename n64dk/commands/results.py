@@ -146,7 +146,8 @@ def reproduce(args):
     for symbols in replay.get("symbol_files", []): argv += ["--symbols", symbols]
     environment = dict(os.environ); environment.update(replay.get("environment", {}))
     run = subprocess.run([sys.executable, "-m", "n64dk", "--format", "json", *argv], cwd=project,
-                         env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                         env=environment, text=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, timeout=1800)
     try: result = json.loads(run.stdout)
     except json.JSONDecodeError: result = {"output": run.stdout[-12000:]}
     reproduced = bool(run.returncode == 0 and result.get("exact") and

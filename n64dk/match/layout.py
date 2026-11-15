@@ -2,12 +2,39 @@
 from __future__ import annotations
 
 import hashlib
+import tomllib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 from .. import mips
 
 PREFLIGHT_VERSION = "image-map-v3"
+
+
+def configured_image_path(project: str | Path, image: str) -> Path:
+    """Resolve a logical image name through ``n64dk.toml`` without filename guessing."""
+    project = Path(project).expanduser().resolve()
+    config = project / "n64dk.toml"
+    if not config.is_file():
+        raise ValueError(f"logical image {image!r} has no n64dk.toml configuration")
+    entries = tomllib.loads(config.read_text()).get("images", {})
+    normalized = image.replace("_", "").replace("-", "").lower()
+    matches = [(name, value) for name, value in entries.items()
+               if name.replace("_", "").replace("-", "").lower() == normalized]
+    if len(matches) != 1:
+        available = ", ".join(sorted(entries)) or "none"
+        raise ValueError(f"logical image {image!r} resolved to {len(matches)} entries; available: {available}")
+    _name, entry = matches[0]
+    value = entry if isinstance(entry, str) else next(
+        (entry[key] for key in ("composite", "path", "raw") if entry.get(key)), None)
+    if not value:
+        raise ValueError(f"logical image {image!r} has no path/composite/raw file")
+    path = Path(value)
+    path = path if path.is_absolute() else project / path
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"configured image is missing: {path}")
+    return path
 
 
 def _digest(data: bytes) -> str:
@@ -51,10 +78,6 @@ def resolve_image_map(path: str | Path, layout: "Layout", data: bytes | None = N
     add("raw-overlay", raw_offset, layout.section_vram,
         "section_rom + (catalogue_vram - catalogue_base)", ["catalogue"],
         not composite_image)
-    naive = layout.function_vram - 0x80000400 + 0x1000
-    add("catalogue-vram-composite", naive, layout.section_vram,
-        "0x1000 + catalogue_vram - resident_vram", ["catalogue"])
-
     sibling = _raw_sibling(image_path)
     region_offset = None
     raw_target_digest = None
@@ -92,7 +115,7 @@ def resolve_image_map(path: str | Path, layout: "Layout", data: bytes | None = N
         ranked = sorted(candidates, key=lambda row: row["score"], reverse=True)
         if not ranked:
             raise ValueError("target interval is outside every image mapping")
-        if composite_image and len({row["digest"] for row in ranked}) > 1:
+        if composite_image:
             raise ValueError("ambiguous composite image mapping: no unique raw-image anchor")
         selected = ranked[0]
         if len(ranked) > 1 and ranked[0]["score"] == ranked[1]["score"] and ranked[0]["digest"] != ranked[1]["digest"]:
@@ -315,14 +338,21 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
     except ValueError as error:
         errors.append(str(error)); mapping = None
         selected_authority, selected_offset, code, candidates = "none", layout.rom, b"", []
-    decoded = list(mips.instructions(code, layout.function_vram))
+    analysis_layout = layout
+    if mapping and mapping.get("linked_base"):
+        linked_base = int(mapping["linked_base"], 0)
+        linked_function = linked_base + (layout.function_vram - layout.section_vram)
+        analysis_layout = Layout(layout.image, layout.section_rom, linked_base,
+                                 layout.section_size, linked_function,
+                                 layout.function_size, "linked-image-region")
+    decoded = list(mips.instructions(code, analysis_layout.function_vram))
     valid = sum(ins.getRaw() == 0 or (ins.isValid() and ins.isImplemented()) for ins in decoded)
     ratio = valid / len(decoded) if decoded else 0.0
     if not decoded or ratio < 0.90:
         errors.append(f"target bytes are data-like or invalid code ({valid}/{len(decoded)} valid words)")
     first = decoded[0].disassemble() if decoded else None
     last = decoded[-1].disassemble() if decoded else None
-    returns = mips.returns(code, layout.function_vram)
+    returns = mips.returns(code, analysis_layout.function_vram)
     tail = decoded[-2:] if len(decoded) >= 2 else decoded
     terminal = any(ins.isJrRa() or ins.isJrNotRa() or
                    (ins.isJumpWithAddress() and not ins.doesLink()) or
@@ -346,7 +376,7 @@ def preflight(path: str | Path, layout: Layout, catalogue_status: str = "",
                 delay["delay_slot"] = f"0x{decoded[last_index + 1].vram:08X}"
     if terminal and falls:
         warnings.append("catalogue says fall-through but target ends in a terminator")
-    entry = _entry_evidence(data, layout, selected_offset) if code else {"entry_status": "reject",
+    entry = _entry_evidence(data, analysis_layout, selected_offset) if code else {"entry_status": "reject",
                                                           "reason_codes": ["no_target_bytes"],
                                                           "confidence": 1.0}
     if strict_entry and entry["entry_status"] == "reject":

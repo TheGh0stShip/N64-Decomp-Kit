@@ -41,7 +41,11 @@ def _query_args(p):
 
 @command("corpus-query", "Find exact, relocation-only, register-renamed and opcode-shape analogues")
 def corpus_query(args):
-    data = Path(args.image).read_bytes()
+    image_path = Path(args.image).expanduser()
+    if args.project and not image_path.is_absolute():
+        image_path = Path(args.project).resolve() / image_path
+    image_path = image_path.resolve()
+    data = image_path.read_bytes()
     if args.vram_delta is None and not args.project:
         raise ValueError("--vram-delta is required without --project")
     offset = args.addr - args.vram_delta if args.vram_delta is not None else 0
@@ -50,19 +54,23 @@ def corpus_query(args):
                 if int(row["vram"], 0) == args.addr and int(row["size"]) == args.size]
         if args.image_name: rows = [row for row in rows if row["image"] == args.image_name]
         if len(rows) != 1: raise ValueError("corpus target must resolve to one catalogue interval")
-        mapping = resolve_image_map(args.image, from_inventory(rows[0])); canonical = mapping["selected"]["offset"]
+        mapping = resolve_image_map(image_path, from_inventory(rows[0])); canonical = mapping["selected"]["offset"]
         if args.vram_delta is not None and args.addr - args.vram_delta != canonical:
             raise ValueError(f"vram delta selects 0x{args.addr - args.vram_delta:X}; canonical mapping selects 0x{canonical:X}")
         offset = canonical
+        linked_vram = int(mapping.get("linked_vram") or args.addr, 0)
+    else:
+        linked_vram = args.addr
     if offset < 0 or offset + args.size > len(data):
         raise ValueError("query interval is outside the loaded image")
-    signature = binary_signature(data[offset:offset + args.size], args.addr)
+    signature = binary_signature(data[offset:offset + args.size], linked_vram)
     index = CorpusIndex(args.database)
     try:
         matches = index.query(signature, args.limit)
     finally:
         index.close()
-    return {"target": {"addr": f"0x{args.addr:08X}", "size": args.size,
+    return {"target": {"addr": f"0x{linked_vram:08X}",
+                       "catalogue_addr": f"0x{args.addr:08X}", "size": args.size,
                        "instruction_count": signature["instruction_count"]},
             "matches": matches}
 
@@ -99,7 +107,12 @@ def _investigate_args(p):
 
 @command("investigate", "Build a verified function dossier from layout, code, source, history and corpus evidence")
 def investigate(args):
-    inventory = build(args.project)
+    project = Path(args.project).resolve()
+    image_path = Path(args.image).expanduser()
+    if not image_path.is_absolute():
+        image_path = project / image_path
+    image_path = image_path.resolve()
+    inventory = build(project)
     rows = inventory["functions"]
     if args.image_name:
         rows = [row for row in rows if row["image"] == args.image_name]
@@ -113,9 +126,9 @@ def investigate(args):
         raise ValueError(f"function selector resolved to {len(rows)} catalogue rows; use --image-name")
     corpus = args.corpus
     if corpus is None:
-        conventional = Path(args.project).resolve() / ".n64dk" / "function-corpus.sqlite"
+        conventional = project / ".n64dk" / "function-corpus.sqlite"
         corpus = str(conventional) if conventional.is_file() else None
-    result = dossier(args.project, inventory, rows[0], args.image, corpus, args.all or bool(args.bundle))
+    result = dossier(project, inventory, rows[0], image_path, corpus, args.all or bool(args.bundle))
     if args.bundle:
         root = Path(args.bundle).resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -134,7 +147,7 @@ def investigate(args):
         result["bundle"] = {"directory": str(root), "assembly": str(assembly),
                             "candidate": str(candidate_out) if candidate_out else None,
                             "metadata": str(metadata)}
-    if args.output:
+    if args.output and args.output != "-":
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

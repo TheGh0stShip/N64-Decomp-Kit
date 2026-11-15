@@ -54,7 +54,8 @@ def match_iterate(args):
     unknown = set(families) - set(itermod.FAMILIES)
     if unknown:
         raise SystemExit(f"unknown families {sorted(unknown)}; choose from {', '.join(itermod.FAMILIES)}")
-    target_offset = args.addr - target.delta
+    comparison_addr = getattr(args, "_comparison_addr", args.addr)
+    target_offset = comparison_addr - target.delta
     if not 0 <= target_offset <= len(target.rom) - args.size:
         raise ValueError("resolved target range is outside the selected image")
     target_text = target.rom[target_offset:target_offset + args.size]
@@ -70,7 +71,8 @@ def match_iterate(args):
                 copy.parent.mkdir(parents=True, exist_ok=True)
                 copy.write_bytes(header.read_bytes())
             try:
-                outcome = match_source(path, spec, cfg, target, args.addr, args.size, syms, folder, None)
+                outcome = match_source(path, spec, cfg, target, comparison_addr, args.size, syms, folder, None,
+                                       strict_verification=True)
             except Exception as error:
                 return itermod.Evaluation(None, error=str(error)[-400:])
             if outcome.error or outcome.result is None:
@@ -82,7 +84,11 @@ def match_iterate(args):
                                            rank_score=0 if outcome.exact else 1,
                                            object_digest=outcome.digest, outcome=outcome.as_dict())
             else:
-                ranked = community_score(target_text, outcome.result.compiled_text[:args.size], args.addr)
+                # Score everything the candidate emitted: code past the owned size is a
+                # difference, not something to truncate away and rank as a perfect prefix.
+                built = outcome.result.compiled_text
+                used = max(args.size, (len(built.rstrip(b"\0")) + 3) & ~3)
+                ranked = community_score(target_text, built[:used], comparison_addr)
                 value = itermod.Evaluation(report.score, outcome.exact, report.as_dict(limit=4096),
                                            rank_score=ranked.total, object_digest=outcome.digest,
                                            outcome={**outcome.as_dict(), "community_score": ranked.as_dict()})
@@ -90,11 +96,11 @@ def match_iterate(args):
         result = itermod.descend(text, name, evaluate, families, args.rounds, args.jobs or 8,
                                  args.budget, args.per_round, args.beam, args.patience)
     final = result.pop("source", None)
-    if final is not None and args.out:
+    if final is not None and args.out and args.out != "-":
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(final)
         result["written"] = args.out
-    elif final is not None and args.print_source:
+    elif final is not None and (args.print_source or args.out == "-"):
         result["source"] = final
     # Persist all observations and the sensitivity ledger in the standard session store so
     # future tranches and explorers do not repeat equivalent hypotheses.

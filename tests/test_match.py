@@ -1694,24 +1694,26 @@ class BattleTanxTests(unittest.TestCase):
         units = self._rows("matching_kmc_units.tsv", n=40) + \
             self._rows("matching_kmc_units.tsv", pred=lambda u: u.spec.pipeline == "kmc+asn64", n=10)
         outs = batch(units, self.cfg, self.target, self.syms)
-        self.assertEqual([o.name for o in outs if not o.exact], [])
+        self.assertEqual([o.name for o in outs if not o.exploratory_exact], [])
+        self.assertTrue(all(o.exact or o.as_dict()["proof"]["verdict"] == "assumed" for o in outs))
         self.assertTrue(all(o.digest_ok for o in outs))
 
     def test_batch_ido_and_asm(self):
         units = self._rows("matching_units.tsv", n=40) + self._rows("matching_asm_units.tsv")
         outs = batch(units, self.cfg, self.target, self.syms)
-        self.assertEqual([o.name for o in outs if not o.exact], [])
+        self.assertEqual([o.name for o in outs if not o.exploratory_exact], [])
+        self.assertTrue(all(o.exact or o.as_dict()["proof"]["verdict"] == "assumed" for o in outs))
 
     def test_sweep_finds_asn64(self):
         src = self.root / "src/code/effects/break_object_into_debris.c"
         res = sweep(src, self.cfg, self.target, 0x800A0930, 0x1A4, self.syms,
                     ["kmc+builtin", "kmc+asn64", "kmc+as"])
-        self.assertIsNotNone(res.exact)
-        self.assertEqual(res.exact.spec.pipeline, "kmc+asn64")
-        row = manifest_row(res.exact, self.root, src, self.target, self.syms)
-        listed = [l for l in (self.root / "config/us/matching_kmc_units.tsv").read_text().splitlines()
-                  if "break_object_into_debris.c" in l]
-        self.assertEqual(row, listed[0])
+        hits = [outcome for outcome in res.tried if outcome.exploratory_exact]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].spec.pipeline, "kmc+asn64")
+        self.assertEqual(hits[0].as_dict()["proof"]["verdict"], "assumed")
+        with self.assertRaisesRegex(ValueError, "strictly verified"):
+            manifest_row(hits[0], self.root, src, self.target, self.syms)
 
     def test_rodata_and_diff(self):
         src = self.root / "src/code/audio/audio_state_helpers.c"

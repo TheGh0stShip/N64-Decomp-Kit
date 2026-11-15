@@ -21,8 +21,8 @@ from pathlib import Path
 
 from ..cli import command
 from ..match.inventory import build as build_inventory
-from ..match.layout import (boundary_proposals, from_inventory, physical_collisions, preflight,
-                            resolve_image_map)
+from ..match.layout import (boundary_proposals, configured_image_path, from_inventory,
+                            physical_collisions, preflight, resolve_image_map)
 from ..match.registry import resolve_store, standard_store
 from ..match.results import ResultIndex
 from ..match.session import MatchSession, SessionStore
@@ -57,13 +57,23 @@ def image_map_explain(args):
             if row["image"].replace("_", "") == image_key and
             (row["name"] == args.function or row["vram"].lower() == args.function.lower())]
     if len(rows) != 1: raise ValueError(f"expected one catalogue function, found {len(rows)}")
-    row = rows[0]; number = re.search(r"(\d+)$", args.image)
-    image_path = Path(args.image_file).resolve() if args.image_file else (
-        project / "build/us/audit" / f"overlay_{number.group(1)}_composite.z64" if number else
-        project / "build/us/main_unpacked.z64")
+    row = rows[0]
+    supplied = Path(args.image_file).expanduser() if args.image_file else None
+    image_path = ((project / supplied).resolve() if supplied and not supplied.is_absolute()
+                  else supplied.resolve() if supplied else configured_image_path(project, row["image"]))
     if not image_path.is_file(): raise ValueError(f"canonical image is missing: {image_path}")
     layout = from_inventory(row); mapping = resolve_image_map(image_path, layout)
-    check = preflight(image_path, layout, row.get("catalogue_status", ""))
+    preflight_error = None
+    try:
+        check = preflight(image_path, layout, row.get("catalogue_status", ""))
+    except ValueError as error:
+        preflight_error = str(error)
+        check = {"ok": False, "error": preflight_error,
+                 "mapping": {**layout.as_dict(), "linked_vram": mapping.get("linked_vram"),
+                             "linked_base": mapping.get("linked_base"),
+                             "target_digest": mapping.get("target_digest")},
+                 "entry_preflight": {"entry_status": "unknown", "call_target_evidence": []},
+                 "warnings": ["mapping resolved, but structural preflight rejected the interval"]}
     collisions = physical_collisions(image_path, layout, mapping, inventory["functions"])
     selected_collisions = [item for item in collisions
                            if item["candidate_authority"] == mapping["selected"]["authority"]]
@@ -73,19 +83,74 @@ def image_map_explain(args):
                                for item in inventory.get("splat", [])),
                   "symbols": bool(check["entry_preflight"].get("call_target_evidence")),
                   "raw_composite_digest": mapping["raw_target_digest"] == mapping["target_digest"]}
+    errors = []
+    if preflight_error:
+        errors.append(preflight_error)
     if selected_collisions:
-        raise ValueError("selected physical target collides with an existing owner: " +
-                         ", ".join(item["owner"] for item in selected_collisions))
+        errors.append("selected physical target collides with an existing owner: " +
+                      ", ".join(item["owner"] for item in selected_collisions))
     return {"function": row["name"], "image": args.image, "mapping": {
                 key: value for key, value in mapping.items() if key not in {"selected", "candidates"}},
             "selected": {key: value for key, value in mapping["selected"].items() if key != "code"},
             "candidates": [{key: value for key, value in item.items() if key != "code"}
                            for item in mapping["candidates"]],
             "agreements": agreements, "competing_mapping_collisions": collisions,
-            "preflight": check, "ambiguous": False}
+            "preflight": check, "ambiguous": False, "safe": not errors,
+            "errors": errors}
 
 
 image_map_explain.arguments = _image_map_args
+
+
+@command("image-resolve", "Resolve one logical image/function to an authoritative coordinate tuple")
+def image_resolve(args):
+    return image_map_explain(args)
+
+
+image_resolve.arguments = _image_map_args
+
+
+def _address_explain_args(p):
+    p.add_argument("address", type=lambda value: int(value, 0))
+    p.add_argument("--project", default=".")
+    p.add_argument("--image", required=True)
+    p.add_argument("--size", type=lambda value: int(value, 0))
+    p.add_argument("--image-file")
+
+
+@command("address-explain", "Explain a catalogue or linked VRAM in a logical image")
+def address_explain(args):
+    project = Path(args.project).resolve(); inventory = build_inventory(project)
+    normalized = args.image.replace("_", "").replace("-", "").lower()
+    rows = [row for row in inventory["functions"]
+            if row["image"].replace("_", "").replace("-", "").lower() == normalized
+            and (args.size is None or int(row["size"]) == args.size)]
+    supplied = Path(args.image_file).expanduser() if args.image_file else None
+    image_path = ((project / supplied).resolve() if supplied and not supplied.is_absolute()
+                  else supplied.resolve() if supplied else configured_image_path(project, args.image))
+    matches = []
+    for row in rows:
+        try:
+            mapping = resolve_image_map(image_path, from_inventory(row))
+        except ValueError:
+            # An unrelated bad catalogue interval must not hide a unique valid resolution.
+            continue
+        if int(row["vram"], 0) == args.address:
+            matches.append((row, mapping, "catalogue_vram")); continue
+        if mapping.get("linked_vram") and int(mapping["linked_vram"], 0) == args.address:
+            matches.append((row, mapping, "linked_vram"))
+    if len(matches) != 1:
+        raise ValueError(f"address resolved to {len(matches)} intervals in logical image {args.image}")
+    row, mapping, space = matches[0]
+    return {"identity": f"{row['image']}:{mapping['linked_vram']}:{int(row['size'])}",
+            "matched_space": space, "function": row["name"], "image": row["image"],
+            "coordinates": mapping["coordinates"], "catalogue_vram": mapping["catalogue_vram"],
+            "linked_vram": mapping["linked_vram"], "raw_rom": mapping["raw_rom"],
+            "target_digest": mapping["target_digest"],
+            "mapping_authority": mapping["selected"]["authority"], "ambiguous": False}
+
+
+address_explain.arguments = _address_explain_args
 
 
 def _project_workbench_config(project: Path) -> dict:
@@ -102,14 +167,14 @@ def _python_path(value: str | os.PathLike[str] | None = None) -> str:
 
 def _worktree_snapshot(project: Path) -> tuple[dict[str, bytes], set[str]]:
     tracked_run = subprocess.run(["git", "ls-files", "-z"], cwd=project,
-                                 stdout=subprocess.PIPE, check=True)
+                                 stdout=subprocess.PIPE, check=True, timeout=60)
     tracked = {}
     for raw in tracked_run.stdout.split(b"\0"):
         if not raw: continue
         name = os.fsdecode(raw); path = project / name
         tracked[name] = path.read_bytes() if path.is_file() else b""
     untracked_run = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
-                                   cwd=project, stdout=subprocess.PIPE, check=True)
+                                   cwd=project, stdout=subprocess.PIPE, check=True, timeout=60)
     untracked = {os.fsdecode(raw) for raw in untracked_run.stdout.split(b"\0") if raw}
     for name in untracked:
         path = project / name
@@ -123,7 +188,8 @@ def _restore_worktree_snapshot(project: Path, tracked: dict[str, bytes], untrack
         if not path.is_file() or path.read_bytes() != content:
             path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(content)
     current = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
-                             cwd=project, stdout=subprocess.PIPE, check=True).stdout.split(b"\0")
+                             cwd=project, stdout=subprocess.PIPE, check=True,
+                             timeout=60).stdout.split(b"\0")
     for raw in current:
         if not raw: continue
         name = os.fsdecode(raw)
@@ -137,7 +203,7 @@ def _transaction_diff(project: Path, before: dict[str, bytes], prior_untracked: 
     names = set(before)
     now_untracked = {os.fsdecode(raw) for raw in subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=project,
-        stdout=subprocess.PIPE, check=True).stdout.split(b"\0") if raw}
+        stdout=subprocess.PIPE, check=True, timeout=60).stdout.split(b"\0") if raw}
     names.update(now_untracked - prior_untracked)
     for name in sorted(names):
         old = before.get(name, b""); path = project / name
@@ -297,7 +363,8 @@ def doctor(args):
         if not executable: continue
         for package in import_probes:
             probe = subprocess.run([executable, "-c", f"import {package}; print(getattr({package}, '__version__', 'ok'))"],
-                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=30)
             interpreter_probes.append({"interpreter": label, "python": str(Path(executable).resolve()),
                 "package": package, "ok": probe.returncode == 0,
                 "output": (probe.stdout or probe.stderr)[-500:]})
@@ -316,7 +383,7 @@ def doctor(args):
         executable = selected_pythons[python_key]
         for package in packages:
             probe = subprocess.run([executable, "-c", f"import {package}"], text=True,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
             add("project-test dependencies" if group == "project_test" else "optional " + group,
                 package, probe.returncode == 0, executable,
                 f"{executable} -m pip install {package}", required=group == "project_test")
@@ -555,17 +622,62 @@ def _tu_start_args(p):
     p.add_argument("unit")
     p.add_argument("--project", default=".")
     p.add_argument("--manifest-row", help="manifest row text or path:line")
+    p.add_argument("--rom", help="physical image; defaults to configured logical --image-name")
+    p.add_argument("--addr", type=lambda value: int(value, 0), required=True,
+                   help="catalogue VRAM for the complete translation-unit text interval")
+    p.add_argument("--size", type=lambda value: int(value, 0), required=True)
+    p.add_argument("--image-name", required=True)
+    p.add_argument("--pipeline")
+    p.add_argument("--flags")
+    p.add_argument("--config")
+    p.add_argument("--toolchain-dir")
+    p.add_argument("--symbols", action="append", default=[])
+    p.add_argument("-I", "--include", action="append", default=[])
+    p.add_argument("--normalizer")
+    p.add_argument("--vram-delta", type=lambda value: int(value, 0))
+    p.add_argument("--state-root")
+    p.add_argument("--no-infer", action="store_true")
+    p.add_argument("--strict-entry", action="store_true", default=True)
+    p.add_argument("--jobs", type=int, default=1)
 
 
 @command("tu-session-start", "Create a translation-unit session preserving source and manifest context")
 def tu_session_start(args):
+    from .match import _session_context, _session_evaluator, _setup, _spec
+    from ..match.registry import SessionRegistry
     project = Path(args.project).resolve(); unit = Path(project, args.unit).resolve()
+    if not unit.is_file():
+        raise FileNotFoundError(unit)
+    cfg, target, _symbols, symbol_files = _setup(args)
+    spec = _spec(args, cfg); source = unit.read_bytes()
+    context = _session_context(args, cfg, target, symbol_files, unit, spec, source)
+    context.update({"translation_unit": str(unit.relative_to(project)),
+                    "manifest_row": args.manifest_row,
+                    "comparison_scope": "complete owned TU text/data/relocations",
+                    "inventory_image": args.image_name})
+    store_root = Path(args.state_root).resolve() if args.state_root else standard_store(project)
+    store = SessionStore(store_root)
+    try:
+        session_id, baseline = MatchSession(store, _session_evaluator(context, strict=True)).create(
+            context, source, spec.pipeline, tuple(spec.flags))
+        registry = SessionRegistry(project)
+        try:
+            registry.register(session_id, store_root, context, baseline.source_digest,
+                              "translation-unit")
+        finally:
+            registry.close()
+    finally:
+        store.close()
     payload = {"project": str(project), "unit": str(unit), "unit_digest": _digest(unit),
-               "manifest_row": args.manifest_row, "kind": "translation-unit"}
+               "manifest_row": args.manifest_row, "kind": "translation-unit",
+               "match_session_id": session_id, "state_root": str(store_root),
+               "image": args.image_name, "catalogue_vram": f"0x{args.addr:08X}",
+               "linked_vram": f"0x{context['addr']:08X}", "size": args.size}
     group_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:20]
     db = _group_db(project); db.execute("INSERT OR REPLACE INTO groups VALUES (?,?,?,?)",
         (group_id, "translation-unit", json.dumps(payload), time.time_ns())); db.commit(); db.close()
-    return {"tu_session_id": group_id, **payload, "regression_policy": "compare every owned interval and relocation"}
+    return {"tu_session_id": group_id, **payload, "baseline": baseline.summary(True),
+            "regression_policy": "strictly compare complete owned TU text/data/relocations"}
 
 
 tu_session_start.arguments = _tu_start_args
@@ -592,7 +704,8 @@ def code_query(args):
     if rg:
         cmd = [rg, "--json", "-n", "--glob", "!build/**", "--glob", "!.git/**", query,
                *map(str, roots)]
-        run = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        run = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             timeout=120)
         for line in run.stdout.splitlines():
             try: value = json.loads(line)
             except json.JSONDecodeError: continue
@@ -693,16 +806,63 @@ def _boundary_correct_args(p):
 def boundary_correct(args):
     inventory = build_inventory(args.project); rows = [x for x in inventory["functions"] if x["name"] == args.function]
     if len(rows) != 1: raise ValueError("function selector is ambiguous")
-    before = inventory["summary"]; denominator_delta = -1 if args.merge_with else 0
+    project = Path(args.project).resolve(); row = rows[0]
+    merge = None
+    if args.merge_with:
+        merge_rows = [item for item in inventory["functions"]
+                      if item["name"] == args.merge_with and item["image"] == row["image"]]
+        if len(merge_rows) != 1: raise ValueError("merge target is missing or ambiguous in the same image")
+        merge = merge_rows[0]
+    starts = [int(row["vram"], 0)] + ([int(merge["vram"], 0)] if merge else [])
+    ends = [int(row["vram"], 0) + int(row["size"])] + \
+           ([int(merge["vram"], 0) + int(merge["size"])] if merge else [])
+    new_start = args.new_start if args.new_start is not None else min(starts)
+    new_size = args.new_size if args.new_size is not None else max(ends) - new_start
+    if new_start % 4 or new_size <= 0 or new_size % 4:
+        raise ValueError("corrected function interval must be positive and 4-byte aligned")
+    evidence = next((value for value in row.get("mapping_evidence", []) if value.startswith("catalogue:")), None)
+    if not evidence: raise ValueError("inventory row has no authoritative catalogue source")
+    relative = evidence.split(":", 2)[1]; catalogue = project / relative
+    before_text = catalogue.read_text(); after_lines = []
+    target_seen = merge_seen = False
+    for line in before_text.splitlines(keepends=True):
+        if re.search(rf'\bname\s*=\s*"{re.escape(row["name"])}"', line):
+            line = re.sub(r"vram\s*=\s*0x[0-9A-Fa-f]+", f"vram = 0x{new_start:x}", line)
+            line = re.sub(r"size\s*=\s*0x[0-9A-Fa-f]+", f"size = 0x{new_size:x}", line)
+            target_seen = True
+        if merge and re.search(rf'\bname\s*=\s*"{re.escape(merge["name"])}"', line):
+            merge_seen = True
+            continue
+        after_lines.append(line)
+    if not target_seen or (merge and not merge_seen):
+        raise ValueError("catalogue row text could not be located for a reversible edit")
+    after_text = "".join(after_lines)
+    forward = "".join(difflib.unified_diff(before_text.splitlines(True), after_text.splitlines(True),
+                                            fromfile=str(relative), tofile=str(relative)))
+    reverse = "".join(difflib.unified_diff(after_text.splitlines(True), before_text.splitlines(True),
+                                            fromfile=str(relative), tofile=str(relative)))
+    affected_manifests = sorted({part.split(":", 2)[1] for item in ([row] + ([merge] if merge else []))
+                                 for part in item.get("mapping_evidence", []) if part.startswith("manifest:")})
+    before = inventory["summary"]; denominator_delta = -1 if merge else 0
     transaction = {"function": rows[0], "requested": {"new_start": args.new_start,
                    "new_size": args.new_size, "merge_with": args.merge_with},
+                   "resolved_interval": {"start": f"0x{new_start:X}", "size": f"0x{new_size:X}",
+                                         "end": f"0x{new_start + new_size:X}"},
                    "accounting": {"functions_before": before["functions"],
                                   "functions_after": before["functions"] + denominator_delta,
                                   "matched_before": before["covered"], "matched_after": before["covered"],
                                   "denominator_delta": denominator_delta,
+                                  "code_bytes_before": sum(int(item["size"]) for item in ([row] + ([merge] if merge else []))),
+                                  "code_bytes_after": new_size,
                                   "decompilation_gain": 0}, "apply": False,
-                   "affected": ["catalogue", "manifests", "progress", "sessions", "Splat review"]}
-    Path(args.output).write_text(json.dumps(transaction, indent=2) + "\n")
+                   "catalogue": str(relative), "catalogue_sha256": hashlib.sha256(before_text.encode()).hexdigest(),
+                   "forward_patch": forward, "reverse_patch": reverse,
+                   "affected_manifests": affected_manifests,
+                   "affected": ["catalogue", "manifests", "progress", "ownership ledger",
+                                "sessions", "Splat review"]}
+    if args.output != "-":
+        output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(transaction, indent=2) + "\n")
     return transaction
 
 
@@ -719,7 +879,8 @@ def self_test(args):
     kit = Path(__file__).resolve().parents[2]
     cmd = [sys.executable, "-m", "unittest", "discover", "-s", str(kit / "tests"), "-t", str(kit), "-v"]
     if args.pattern: cmd += ["-p", args.pattern]
-    run = subprocess.run(cmd, cwd=kit, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    run = subprocess.run(cmd, cwd=kit, text=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, timeout=1800)
     return {"ok": run.returncode == 0, "exit_code": run.returncode, "command": cmd,
             "output": run.stdout[-16000:]}
 
@@ -764,7 +925,7 @@ def family_session_try(args):
     verification = None
     if args.verify_command:
         run = subprocess.run(args.verify_command, cwd=project, shell=True, text=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800)
         verification = {"exit_code": run.returncode, "output": run.stdout[-12000:]}
     return {"group_id": args.group_id, "results": results, "verification": verification,
             "shared_hypothesis": proposal.get("hypothesis")}
@@ -783,18 +944,37 @@ def tu_session_try(args):
         old, new = edit["find"], edit.get("replace", "")
         if old not in source: raise ValueError(f"TU edit text not found: {old[:40]}")
         source = source.replace(old, new, 1)
-    with tempfile.TemporaryDirectory(prefix="n64dk-tu-") as name:
-        staged = Path(name) / unit.name; staged.write_text(source)
-        verification = None
-        if args.verify_command:
+    if _digest(unit) != payload["unit_digest"]:
+        raise RuntimeError("translation unit changed since session start; start a new TU session")
+    session_id = payload.get("match_session_id")
+    if not session_id:
+        raise RuntimeError("legacy plan-only TU session has no strict matching session; recreate it")
+    from .match import _session_evaluator
+    store = SessionStore(Path(payload["state_root"]))
+    try:
+        transaction = MatchSession(store, _session_evaluator(store.context(session_id), strict=True)).try_proposal(
+            session_id, {"source": source, "hypothesis": proposal.get("hypothesis",
+                "translation-unit context experiment"), "variants": [{"label": "tu-candidate"}]},
+            args.jobs, True)
+    finally:
+        store.close()
+    best = transaction.get("transaction_best")
+    verification = {"strict": True, "transaction_best": best,
+                    "all_owned_sections_exact": bool(best and best.get("exact")),
+                    "candidate_count": len(transaction.get("transaction_results", []))}
+    if args.verify_command:
+        with tempfile.TemporaryDirectory(prefix="n64dk-tu-hook-") as name:
+            staged = Path(name) / unit.name; staged.write_text(source)
             env = dict(os.environ); env["N64DK_CANDIDATE_SOURCE"] = str(staged)
             run = subprocess.run(args.verify_command, cwd=project, shell=True, env=env, text=True,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            verification = {"exit_code": run.returncode, "output": run.stdout[-12000:]}
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+            verification["project_hook"] = {"exit_code": run.returncode,
+                                             "output": run.stdout[-12000:]}
     return {"tu_session_id": args.group_id, "original_digest": payload["unit_digest"],
             "candidate_digest": hashlib.sha256(source.encode()).hexdigest(),
-            "verification": verification, "project_mutated": False,
-            "regression_scope": "all owned text, data and relocations"}
+            "match_session_id": session_id, "verification": verification,
+            "transaction": transaction, "project_mutated": False,
+            "regression_scope": "complete owned TU text/data/relocations"}
 
 
 tu_session_try.arguments = _family_try_args
@@ -919,8 +1099,11 @@ def frontier_synthesize(args):
             "toolchain_root": str(cfg.toolchain_root) if cfg.toolchain_root else None,
             "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
             "include": [str(value) for value in cfg.include], "symbols": [str(value) for value in cfg.symbols],
-            "normalizer": cfg.normalizer, "vram_delta": layout.function_vram - int(check["selected_image_offset"], 0),
-            "addr": layout.function_vram, "size": layout.function_size, "infer_externals": True,
+            "normalizer": cfg.normalizer,
+            "vram_delta": int(check["mapping"].get("linked_vram") or layout.function_vram, 0) - int(check["selected_image_offset"], 0),
+            "addr": int(check["mapping"].get("linked_vram") or layout.function_vram, 0),
+            "catalogue_addr": layout.function_vram,
+            "size": layout.function_size, "infer_externals": True,
             "inventory_name": args.function, "inventory_image": rows[0]["image"], "layout_preflight": check,
             "target_text_sha256": check["mapping"].get("target_digest")}
         sources = [Path(row["live_validity"]["resolved_source"]).read_bytes() for row in selected]
@@ -1070,8 +1253,9 @@ def integrate_winner(args):
         if row is None or not row.exact: raise ValueError("candidate is not a retained exact result")
         project = Path(args.project).resolve(); context = store.context(args.session); source = store.cache.get(row.source_digest)
         inventory = build_inventory(project)
+        catalogue_addr = context.get("catalogue_addr", context["addr"])
         mapping_rows = [item for item in inventory["functions"]
-                        if int(item["vram"], 0) == context["addr"] and int(item["size"]) == context["size"]
+                        if int(item["vram"], 0) == catalogue_addr and int(item["size"]) == context["size"]
                         and (not context.get("inventory_image") or item["image"] == context["inventory_image"])]
         if len(mapping_rows) != 1: raise ValueError("winner target does not resolve to one authoritative catalogue interval")
         inventory_row = mapping_rows[0]; layout = from_inventory(inventory_row)
@@ -1095,13 +1279,15 @@ def integrate_winner(args):
         if context_digest and context_digest != canonical_map["target_digest"]:
             raise ValueError("winner target digest disagrees with the current canonical physical interval")
         from .match import _session_evaluator
-        evaluator = _session_evaluator(context); receipts = []
+        evaluator = _session_evaluator(context, strict=True); receipts = []
         for index in range(2):
             result = evaluator(source, row.pipeline, row.flags, f"integration-verification-{index + 1}")
             receipts.append(result.as_dict())
-            if not result.exact: raise RuntimeError("fresh independent verification failed")
+            if not result.exact:
+                verdict = result.as_dict().get("proof", {}).get("verdict", "missing")
+                raise RuntimeError(f"fresh independent strict verification failed ({verdict})")
         root = Path(args.output).resolve(); root.mkdir(parents=True, exist_ok=True)
-        candidate = root / context.get("source_name", "winner.c"); candidate.write_bytes(source)
+        candidate = root / f"{inventory_row['name']}.c"; candidate.write_bytes(source)
         manifest_row = None
         if args.destination:
             destination = Path(args.destination)
@@ -1133,28 +1319,41 @@ def integrate_winner(args):
         if args.destination:
             transaction["image_mapping"] = {"raw_rom": f"0x{raw_rom:X}",
                 "composite_rom": f"0x{canonical_map['selected']['offset']:X}",
-                "vram": f"0x{context['addr']:08X}", "image": context.get("inventory_image")}
+                "linked_vram": f"0x{context['addr']:08X}",
+                "catalogue_vram": f"0x{catalogue_addr:08X}",
+                "image": context.get("inventory_image")}
         transaction["project_hooks"] = {"regeneration": regeneration, "affected_gate": affected_gate,
                                          "full_gate": full_gate, "project_tests": project_tests}
+        policy = _resolved_gate_policy(project, "integration")
+        # Explicit command-line hooks participate in the same named policy without weakening
+        # any other required stage.
+        policy["commands"].update({"affected_gate": affected_gate, "full_gate": full_gate,
+                                   "project_tests": project_tests})
+        policy["missing"] = [name for name in policy["required_hooks"]
+                             if not policy["commands"].get(name)]
+        transaction["gate_policy"] = policy
         if affected_gate:
             gate_env = _canonical_env(); gate_env["N64DK_CANDIDATE_SOURCE"] = str(candidate)
             if manifest_row: gate_env["N64DK_MANIFEST_ROW"] = manifest_row
             focused = subprocess.run(affected_gate, cwd=project, shell=True, text=True, env=gate_env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     timeout=1800)
             transaction["preintegration_gate"] = {"command": affected_gate,
                 "exit_code": focused.returncode, "output": focused.stdout[-12000:]}
             if focused.returncode: raise RuntimeError("focused preintegration project gate failed")
             transaction["states"][7] = "affected_gate_passed"
         receipt = root / "integration-transaction.json"; receipt.write_text(json.dumps(transaction, indent=2) + "\n")
         if args.apply:
-            if not (args.destination and args.manifest and affected_gate and full_gate and project_tests):
-                raise ValueError("--apply requires destination/manifest and configured affected, full and project-test hooks")
+            if not (args.destination and args.manifest) or policy["missing"]:
+                raise ValueError("--apply requires destination/manifest and a complete integration gate policy; missing: "
+                                 + ", ".join(policy["missing"]))
             destination = Path(args.destination)
             if not destination.is_absolute(): destination = project / destination
             manifest = Path(args.manifest)
             if not manifest.is_absolute(): manifest = project / manifest
             dirty = subprocess.run(["git", "status", "--porcelain", "--", str(destination), str(manifest)],
-                                   cwd=project, text=True, stdout=subprocess.PIPE).stdout.strip()
+                                   cwd=project, text=True, stdout=subprocess.PIPE,
+                                   timeout=60).stdout.strip()
             if dirty: raise ValueError("integration targets contain pre-existing edits; transaction refused")
             tracked_before, untracked_before = _worktree_snapshot(project)
             old_destination = destination.read_bytes() if destination.exists() else None
@@ -1166,14 +1365,16 @@ def integrate_winner(args):
                 gates = []
                 for index, command_text in enumerate(regeneration):
                     run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=_canonical_env(),
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         timeout=1800)
                     gates.append({"gate": f"regeneration-{index + 1}", "exit_code": run.returncode,
                                   "output": run.stdout[-12000:]})
                     if run.returncode: raise RuntimeError("regeneration hook failed")
                 for label, command_text in (("affected", affected_gate), ("full", full_gate),
                                             ("project-tests", project_tests)):
                     run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=_canonical_env(),
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         timeout=1800)
                     gates.append({"gate": label, "exit_code": run.returncode, "output": run.stdout[-12000:]})
                     if run.returncode: raise RuntimeError(f"{label} gate failed")
                 transaction["applied"] = True; transaction["gates"] = gates
@@ -1271,7 +1472,7 @@ def project_gate(args):
     command_text = hooks.get(args.hook)
     if not command_text: raise ValueError(f"workbench.hooks.{args.hook} is not configured")
     run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=_canonical_env(),
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800)
     artifact_dir = project / ".n64dk" / "gate-artifacts"; artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact = artifact_dir / f"{args.hook}-{time.time_ns()}.log"; artifact.write_text(run.stdout)
     lines = run.stdout.splitlines(); failures = [line for line in lines if re.search(r"\b(FAIL|ERROR|DIFF)\b", line)]
@@ -1287,6 +1488,68 @@ def project_gate(args):
 
 
 project_gate.arguments = _project_gate_args
+
+
+_DEFAULT_GATE_POLICY = {
+    "claim": ["affected_gate"],
+    "winner": ["affected_gate", "full_gate", "project_tests"],
+    "integration": ["attack", "report", "progress", "affected_gate", "full_gate", "project_tests"],
+    "boundary": ["attack", "report", "progress", "full_gate", "project_tests"],
+}
+
+
+def _resolved_gate_policy(project: Path, stage: str) -> dict:
+    config = _project_workbench_config(project)
+    configured = config.get("gate_policy", {})
+    requested = configured.get(stage, _DEFAULT_GATE_POLICY.get(stage))
+    if not isinstance(requested, list) or not requested:
+        raise ValueError(f"workbench.gate_policy.{stage} must be a non-empty hook list")
+    hooks = config.get("hooks", {})
+    missing = [name for name in requested if not hooks.get(name)]
+    payload = {"stage": stage, "required_hooks": requested,
+               "commands": {name: hooks.get(name) for name in requested}, "missing": missing}
+    payload["policy_digest"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return payload
+
+
+def _gate_policy_args(p):
+    p.add_argument("--project", default=".")
+    p.add_argument("--stage", choices=tuple(_DEFAULT_GATE_POLICY), default="winner")
+    p.add_argument("--run", action="store_true")
+    p.add_argument("--affected-unit")
+
+
+@command("gate-policy", "Inspect or execute the fail-closed gate policy for a state transition")
+def gate_policy(args):
+    project = Path(args.project).resolve(); policy = _resolved_gate_policy(project, args.stage)
+    policy["ok"] = not policy["missing"]
+    policy["executed"] = False; policy["results"] = []
+    if not args.run:
+        return policy
+    if policy["missing"]:
+        raise ValueError("gate policy is incomplete; missing hooks: " + ", ".join(policy["missing"]))
+    artifact_root = project / ".n64dk" / "gate-artifacts" / policy["policy_digest"][:16]
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    env = _canonical_env()
+    if args.affected_unit:
+        env["N64DK_AFFECTED_UNIT"] = args.affected_unit
+    for hook in policy["required_hooks"]:
+        command_text = policy["commands"][hook]
+        run = subprocess.run(command_text, cwd=project, shell=True, text=True, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800)
+        artifact = artifact_root / f"{len(policy['results']) + 1:02d}-{hook}.log"
+        artifact.write_text(run.stdout)
+        policy["results"].append({"hook": hook, "exit_code": run.returncode,
+                                  "artifact": str(artifact), "tail": run.stdout[-4000:]})
+        if run.returncode:
+            policy["ok"] = False
+            break
+    policy["executed"] = True
+    policy["passed_hooks"] = [row["hook"] for row in policy["results"] if row["exit_code"] == 0]
+    return policy
+
+
+gate_policy.arguments = _gate_policy_args
 
 
 def _scheduler_args(p):
@@ -1356,13 +1619,19 @@ def source_scaffold(args):
         if row["name"] == args.function and (not args.image_name or row["image"] == args.image_name)]
     if len(rows) != 1: raise ValueError(f"function resolved to {len(rows)} catalogue intervals")
     row = rows[0]; mapping = resolve_image_map(args.image, from_inventory(row)); data = Path(args.image).read_bytes()
-    offset = mapping["selected"]["offset"]; source, evidence = scaffold(
-        row["name"], data[offset:offset + int(row["size"])], int(row["vram"], 0))
-    output = Path(args.output).resolve() if args.output else None
+    offset = mapping["selected"]["offset"]
+    linked_vram = int(mapping.get("linked_vram") or row["vram"], 0)
+    source, evidence = scaffold(
+        row["name"], data[offset:offset + int(row["size"])], linked_vram)
+    evidence["coordinates"] = {"catalogue_vram": row["vram"],
+                               "linked_vram": f"0x{linked_vram:X}",
+                               "selected_image_offset": f"0x{offset:X}"}
+    output = Path(args.output).resolve() if args.output and args.output != "-" else None
     if output:
         output.parent.mkdir(parents=True, exist_ok=True); output.write_text(source)
         output.with_suffix(output.suffix + ".evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
-    return {"source": source if not output else str(output), "evidence": evidence,
+    return {"source": source if not output else str(output), "output": "stdout" if args.output == "-" else str(output) if output else None,
+            "evidence": evidence,
             "ordinary_c": True, "compile_ready": True}
 
 
@@ -1442,8 +1711,10 @@ def workbench_snapshot(args):
     project = Path(args.project).resolve(); inventory = build_inventory(project)
     rows = [row for row in inventory["functions"] if row["name"] == args.function]
     if len(rows) != 1: raise ValueError("function selector is ambiguous")
-    git = subprocess.run(["git", "status", "--short"], cwd=project, text=True, stdout=subprocess.PIPE)
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=project, text=True, stdout=subprocess.PIPE)
+    git = subprocess.run(["git", "status", "--short"], cwd=project, text=True,
+                         stdout=subprocess.PIPE, timeout=60)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=project, text=True,
+                          stdout=subprocess.PIPE, timeout=60)
     result = {"function": {k: rows[0].get(k) for k in ("name", "image", "vram", "size", "state", "ownership_state", "owner", "reason")},
               "git": {"head": head.stdout.strip(), "dirty_files": len(git.stdout.splitlines())}}
     if args.image:
@@ -1543,8 +1814,11 @@ def control_flow_explore(args):
                                  (args.session_id, result["candidate_id"]))
         store.db.commit()
         accepted = [row for row in transaction["transaction_results"] if row["eligible_frontier"]]
-        transaction["transaction_best"] = min(accepted, key=lambda row: row.get("score", 1 << 30),
-                                              default=None)
+        transaction["transaction_best"] = min(
+            accepted,
+            key=lambda row: row.get("score") if row.get("score") is not None else 1 << 30,
+            default=None,
+        )
         transaction["rejected_unrelated_cfg"] = sum(not row["eligible_frontier"]
                                                      for row in transaction["transaction_results"])
         transaction["branch_targets"] = branch_evidence

@@ -72,8 +72,12 @@ def prepare(source: Path, symbols: symmod.SymbolMap, includes: list[Path], funct
                 func_name = cname
     stripped = ASM_LABEL.sub("", raw)
     defines = ["-D__attribute__(x)=", "-D__extension__=", "-D__inline__=inline", "-D__asm__(x)="]
-    proc = subprocess.run(["cpp", "-P", "-nostdinc", "-undef", *defines, *[f"-I{p}" for p in includes],
-                           "-I", str(Path(source).parent), "-"], input=stripped, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["cpp", "-P", "-nostdinc", "-undef", *defines, *[f"-I{p}" for p in includes],
+                               "-I", str(Path(source).parent), "-"], input=stripped,
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("preprocessing timed out after 120s") from error
     if proc.returncode:
         raise RuntimeError("preprocessing failed: " + proc.stderr.strip()[-400:])
     if func_name is None:

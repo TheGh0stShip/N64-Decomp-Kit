@@ -118,6 +118,12 @@ class SessionStore:
                 payload TEXT NOT NULL, created_ns INTEGER NOT NULL,
                 PRIMARY KEY (session_id, signature)
             );
+            CREATE TABLE IF NOT EXISTS candidate_attempts (
+                session_id TEXT NOT NULL, candidate_id TEXT NOT NULL, attempt_ns INTEGER NOT NULL,
+                status TEXT NOT NULL, exact INTEGER NOT NULL, score INTEGER, error TEXT,
+                outcome TEXT NOT NULL,
+                PRIMARY KEY (session_id, candidate_id, attempt_ns)
+            );
         """)
         self.db.commit()
 
@@ -133,8 +139,9 @@ class SessionStore:
         return session_id
 
     def context(self, session_id: str) -> dict:
-        row = self.db.execute("SELECT context FROM sessions WHERE session_id = ?",
-                              (session_id,)).fetchone()
+        with self._lock:
+            row = self.db.execute("SELECT context FROM sessions WHERE session_id = ?",
+                                  (session_id,)).fetchone()
         if not row:
             raise KeyError(f"unknown matching session {session_id}")
         return json.loads(row[0])
@@ -142,10 +149,22 @@ class SessionStore:
     def append(self, session_id: str, candidate: SessionCandidate) -> bool:
         before = self.db.total_changes
         self.db.execute("""
-            INSERT OR IGNORE INTO session_candidates
+            INSERT OR IGNORE INTO candidate_attempts
+            (session_id, candidate_id, attempt_ns, status, exact, score, error, outcome)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (session_id, candidate.candidate_id, candidate.created_ns, candidate.status,
+              int(candidate.exact), candidate.score, candidate.error, _canonical(candidate.outcome)))
+        self.db.execute("""
+            INSERT INTO session_candidates
             (session_id, candidate_id, parent_id, source_digest, label, hypothesis,
              pipeline, flags, status, exact, score, counts, outcome, error, created_ns)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, candidate_id) DO UPDATE SET
+              parent_id=excluded.parent_id, label=excluded.label, hypothesis=excluded.hypothesis,
+              status=excluded.status, exact=excluded.exact, score=excluded.score,
+              counts=excluded.counts, outcome=excluded.outcome, error=excluded.error,
+              created_ns=excluded.created_ns
+            WHERE session_candidates.status='failed'
         """, (session_id, candidate.candidate_id, candidate.parent_id,
               candidate.source_digest, candidate.label, candidate.hypothesis,
               candidate.pipeline, _canonical(candidate.flags), candidate.status,
@@ -379,10 +398,17 @@ class MatchSession:
                   label: str, hypothesis: str, pipeline: str,
                   flags: tuple[str, ...]) -> SessionCandidate:
         source_digest = self.store.cache.put(source)
+        context = self.store.context(session_id)
         candidate_id = _identity({"session": session_id, "source": source_digest,
-                                  "pipeline": pipeline, "flags": flags})[:24]
+                                  "pipeline": pipeline, "flags": flags,
+                                  "toolchain": context.get("toolchain_digest"),
+                                  "includes": context.get("include_closure_digest"),
+                                  "target": context.get("target_text_sha256")})[:24]
         existing = self.store.get(session_id, candidate_id)
-        if existing is not None:
+        # Successful observations are immutable.  Failures may be transient (lock, OOM,
+        # compiler crash) and are deliberately retried while every attempt remains in the
+        # append-only candidate_attempts ledger.
+        if existing is not None and existing.status != "failed":
             return existing
         try:
             outcome = self.evaluator(source, pipeline, flags, label)

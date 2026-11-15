@@ -120,6 +120,17 @@ class IncludeClosureTest(unittest.TestCase):
             forced.write_text("#define VALUE 2\n")
             self.assertNotEqual(first, _include_closure_digest(source, (root,), ("forced.h",)))
 
+    def test_command_line_computed_include_is_in_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); source = root / "candidate.c"; header = root / "selected.h"
+            source.write_text("#include HEADER\nint f(void) { return VALUE; }\n")
+            header.write_text("#define VALUE 1\n")
+            macros = {"HEADER": (b'"', b"selected.h")}
+            first = _include_closure_digest(source, (root,), command_macros=macros)
+            header.write_text("#define VALUE 2\n")
+            self.assertNotEqual(first, _include_closure_digest(source, (root,),
+                                                               command_macros=macros))
+
 
 if __name__ == "__main__":
     unittest.main()

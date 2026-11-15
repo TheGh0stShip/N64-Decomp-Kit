@@ -28,9 +28,6 @@ _PAIR = {
     ("divu", "div"): ("signed-divide", "division/modulo operands are signed", "any"),
     ("mult", "multu"): ("unsigned-multiply", "multiplication operands are unsigned", "any"),
     ("multu", "mult"): ("signed-multiply", "multiplication operands are signed", "any"),
-    ("addiu", "ori"): ("unsigned-constant", "constant is unsigned/>= 0x8000 (`li` expanded as ori): "
-                       "use a U suffix or an unsigned variable", "any"),
-    ("ori", "addiu"): ("signed-constant", "constant is a signed 16-bit value", "any"),
     ("beq", "bne"): ("inverted-branch", "condition is inverted: swap the if/else arms, use an early "
                      "return/continue, or negate the test", "any"),
     ("bne", "beq"): ("inverted-branch", "condition is inverted: swap the if/else arms, use an early "
@@ -64,6 +61,11 @@ def _norm(text: str) -> str:
     return " ".join(text.split())
 
 
+def _three_operands(text: str) -> tuple[str, str, str] | None:
+    parts = re.split(r"\s+|\s*,\s*", text, maxsplit=3)
+    return tuple(parts[1:4]) if len(parts) == 4 else None
+
+
 def hints(report, family: str = "any") -> list[dict]:
     """``report`` is a ``diff.Report`` or its ``as_dict()``; ``family`` is ``ido``/``gcc``/``any``."""
     data = report if isinstance(report, dict) else report.as_dict(limit=10 ** 6)
@@ -86,6 +88,19 @@ def hints(report, family: str = "any") -> list[dict]:
         if c and r and (cm, rm) in _PAIR:
             key, text, fam = _PAIR[(cm, rm)]
             add(key, text, fam, off, 0.85)
+        if c and r and {cm, rm} == {"addiu", "ori"}:
+            operands = _three_operands(r)
+            if operands and operands[1] == "$zero":
+                if rm == "ori":
+                    add("unsigned-constant", "constant is materialized with `ori $zero`: use an unsigned "
+                        "constant/type (especially for values >= 0x8000)", "any", off, 0.85)
+                else:
+                    add("signed-constant", "constant is materialized with `addiu $zero`: use a signed "
+                        "16-bit constant/type", "any", off, 0.85)
+            else:
+                desired = "bitwise `|`" if rm == "ori" else "addition `+`"
+                add("operator-add-or", f"operator differs: retail uses {desired}; inspect `x | k` versus "
+                    "`x + k` (this is not a constant-signedness issue)", "any", off, 0.95)
         if c and r:
             a, b = _SP.match(c), _SP.match(r)
             if a and b and int(a.group(1), 0) < 0:

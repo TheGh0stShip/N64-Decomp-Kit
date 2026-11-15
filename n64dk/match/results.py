@@ -66,7 +66,9 @@ class ResultIndex:
     def __init__(self, database: str | Path):
         self.path = Path(database)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path)
+        self.db = sqlite3.connect(self.path, timeout=60)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=60000")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,

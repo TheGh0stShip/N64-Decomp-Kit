@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import random
+import shlex
 import sqlite3
 import threading
 import time
@@ -102,7 +103,7 @@ def match_inventory(args):
                   "items": [] if args.count_only or args.summary_only else page,
                   "next_cursor": args.offset + len(page) if args.offset + len(page) < total else None,
                   "truncated": args.offset + len(page) < total}
-    if args.output:
+    if args.output and args.output != "-":
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -139,10 +140,11 @@ def context_bundle(args):
     if len(rows) != 1:
         raise ValueError(f"function selector resolved to {len(rows)} catalogue rows")
     row = rows[0]
-    start = int(row["vram"], 0)
+    catalogue_start = int(row["vram"], 0)
     layout = from_inventory(row)
     layout_check = preflight(args.image, layout, row.get("catalogue_status", ""))
     offset = int(layout_check["selected_image_offset"], 0)
+    start = int(layout_check["mapping"].get("linked_vram") or catalogue_start, 0)
     canonical_delta = start - offset
     if args.vram_delta is not None and args.vram_delta != canonical_delta:
         raise ValueError(f"--vram-delta 0x{args.vram_delta:X} conflicts with canonical image "
@@ -153,8 +155,10 @@ def context_bundle(args):
                   for item in same[max(0, index - 2):index + 3] if item is not row]
     result = contextmod.bundle(args.image, start, row["size"], offset, neighbours)
     result["inventory"] = row
+    result["coordinates"] = {"linked_vram": f"0x{start:08X}",
+                             "catalogue_vram": f"0x{catalogue_start:08X}"}
     result["layout_preflight"] = layout_check
-    if args.output:
+    if args.output and args.output != "-":
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -187,6 +191,7 @@ def _sweep_args(p):
                    help="use m2c to create transient starter C for verified source-less intervals")
     p.add_argument("--m2c-context", help="preprocessed declarations/types supplied to m2c drafts")
     p.add_argument("--details", action="store_true", help="include every tranche item")
+    p.add_argument("--events", help="append durable JSONL progress events")
 
 
 def _state(root: Path) -> sqlite3.Connection:
@@ -210,7 +215,7 @@ def _state(root: Path) -> sqlite3.Connection:
                  "historical_score": "INTEGER", "comparison": "TEXT", "updated_ns": "INTEGER",
                  "phase": "TEXT", "worker_id": "TEXT", "started_ns": "INTEGER",
                  "heartbeat_ns": "INTEGER", "finished_ns": "INTEGER", "recipe": "TEXT",
-                 "timing": "TEXT", "source_digest": "TEXT"}
+                 "timing": "TEXT", "source_digest": "TEXT", "resolver_case": "TEXT"}
     for name, kind in additions.items():
         if name not in columns:
             try:
@@ -219,6 +224,20 @@ def _state(root: Path) -> sqlite3.Connection:
                 if "duplicate column" not in str(error).lower(): raise
     db.commit()
     return db
+
+
+def _event_writer(path: str | None):
+    """Return a thread-safe append-only JSONL progress sink."""
+    if not path:
+        return lambda _event: None
+    output = Path(path).expanduser().resolve(); output.parent.mkdir(parents=True, exist_ok=True)
+    lock = threading.Lock()
+
+    def emit(event: dict):
+        with lock, output.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"time": round(time.time(), 3), **event}, sort_keys=True) + "\n")
+            stream.flush()
+    return emit
 
 
 @contextlib.contextmanager
@@ -265,6 +284,10 @@ def _launch_one(args, context_cache: ProjectContext, row: dict, phase=None):
         return function_id, "recipe_unknown", None, None, {}, None, None, "blocked", recipe["evidence"], recipe, {}
     pipeline, flags = recipe["pipeline"], recipe["flags"]
     image = context_cache.image(row["image"]); cfg = context_cache.config
+    linked_vram = int(check["mapping"].get("linked_vram") or row["vram"], 0)
+    selected_offset = int(check["selected_image_offset"], 0)
+    catalogue_base = int(row["section_vram"], 0)
+    linked_base = int(check["mapping"].get("linked_base") or row["section_vram"], 0)
     phase("compilation")
     context = {
         "source_name": source_path.name, "source_suffix": source_path.suffix or ".c",
@@ -273,8 +296,10 @@ def _launch_one(args, context_cache: ProjectContext, row: dict, phase=None):
         "toolchains": {key: str(value) for key, value in cfg.toolchains.items()},
         "include": [str(value) for value in cfg.include],
         "symbols": [str(value) for value in context_cache.symbol_files], "normalizer": cfg.normalizer,
-        "vram_delta": layout.function_vram - int(check["selected_image_offset"], 0),
-        "addr": layout.function_vram, "size": layout.function_size,
+        "vram_delta": linked_vram - selected_offset,
+        "addr": linked_vram, "catalogue_addr": layout.function_vram,
+        "catalogue_base": catalogue_base, "linked_base": linked_base,
+        "section_size": int(row["section_size"]), "size": layout.function_size,
         "infer_externals": True, "default_pipeline": pipeline, "default_flags": flags,
         "inventory_id": function_id, "inventory_image": row["image"], "layout_preflight": check,
         "inventory_name": row["name"],
@@ -326,7 +351,8 @@ def _draft_missing_source(args, context_cache: ProjectContext, row: dict, check:
     image = context_cache.image(row["image"])
     offset = int(check["selected_image_offset"], 0)
     size = int(row["size"])
-    vram = int(row["vram"], 0)
+    catalogue_vram = int(row["vram"], 0)
+    vram = int(check["mapping"].get("linked_vram") or row["vram"], 0)
     if offset < 0 or offset + size > len(image.data):
         return {"ok": False, "state": "draft_failed", "reason": "verified interval is outside loaded image"}
     delta = vram - offset
@@ -338,7 +364,8 @@ def _draft_missing_source(args, context_cache: ProjectContext, row: dict, check:
     with tempfile.TemporaryDirectory(prefix="n64dk-autodraft-build-") as work:
         def evaluate(path, address, length):
             return match_source(path, spec, context_cache.config, target, address, length,
-                                context_cache.symbols, Path(work), None)
+                                context_cache.symbols, Path(work), None,
+                                strict_verification=True)
 
         draft = autodraft.draft_one(row["name"], vram, size, image.data[offset:offset + size],
                                     lambda _address: None, evaluate, root,
@@ -355,13 +382,16 @@ def _draft_missing_source(args, context_cache: ProjectContext, row: dict, check:
     path.write_text(source)
     return {"ok": True, "state": "ready_verified", "path": str(path), "digest": digest,
             "draft_status": draft.status, "draft_score": draft.score,
-            "jump_tables": draft.jump_tables, "repairs": draft.repairs}
+            "jump_tables": draft.jump_tables, "repairs": draft.repairs,
+            "coordinates": {"catalogue_vram": f"0x{catalogue_vram:08X}",
+                            "linked_vram": f"0x{vram:08X}"}}
 
 
 @command("quickwin-sweep", "Create or resume a persistent interval-aware cross-function tranche")
 def quickwin_sweep(args):
     overall_started = time.monotonic()
     compile_seconds = 0.0; database_seconds = 0.0
+    emit = _event_writer(getattr(args, "events", None))
     if args.run_ready_only and not args.resume:
         raise ValueError("--run-ready-only requires --resume")
     db = _state(Path(args.state_root)); mappings = dict(value.split("=", 1)
@@ -396,14 +426,14 @@ def quickwin_sweep(args):
         inventory = context_cache.inventory
         selected = None if args.all_images or not args.image else set(args.image)
         candidates = invmod.rank(inventory, len(inventory["functions"]), selected)
-        ranked = []; valid_targets = 0; exclusion_counts = {}; exclusion_examples = {}
+        ranked = []; ready_targets = 0; exclusion_counts = {}; exclusion_examples = {}
         for row in candidates:
             if args.limit <= 0: break
             planned = dict(row); excluded = False
             if row["image"] not in mappings:
                 planned["planned_status"] = "mapping_ambiguous"
                 planned["planned_reason"] = f"missing image mapping {row['image']}=PATH"
-                excluded = bool(mappings)
+                excluded = True
             else:
                 try:
                     planned["layout_preflight"] = context_cache.preflight(row, True)
@@ -438,7 +468,9 @@ def quickwin_sweep(args):
                     else:
                         planned["planned_status"] = "ready_verified"
                         planned["planned_reason"] = "ownership, boundary, mapping, recipe and source identity verified"
-                    valid_targets += 1
+                        ready_targets += 1
+                    if planned.get("planned_status") != "ready_verified":
+                        excluded = True
             if excluded:
                 state = planned["planned_status"]
                 exclusion_counts[state] = exclusion_counts.get(state, 0) + 1
@@ -449,7 +481,8 @@ def quickwin_sweep(args):
                                      "boundary_proposals": planned.get("boundary_proposals", [])})
             else:
                 ranked.append(planned)
-            if valid_targets >= max(0, args.limit) or (not mappings and len(ranked) >= max(0, args.limit)): break
+            if ready_targets >= max(0, args.limit):
+                break
         planning_exclusions = {"counts": exclusion_counts, "examples": exclusion_examples}
         stable_inventory = {key: value for key, value in inventory.items() if key != "source_index"}
         digest = hashlib.sha256(json.dumps(stable_inventory, sort_keys=True).encode()).hexdigest()
@@ -458,6 +491,8 @@ def quickwin_sweep(args):
         now = time.time_ns()
         tranche_id = tranche_id or hashlib.sha256(
             f"{inventory['project']}:{digest}:{now}".encode()).hexdigest()[:20]
+        emit({"event": "tranche-planned", "tranche_id": tranche_id,
+              "inventory_digest": digest, "requested_ready": args.limit})
         existing = db.execute("SELECT inventory_digest FROM tranches WHERE tranche_id = ?",
                               (tranche_id,)).fetchone()
         if existing and existing[0] != digest:
@@ -511,6 +546,9 @@ def quickwin_sweep(args):
                                    (phase, status, worker or threading.current_thread().name, now_ns, now_ns,
                                     int(finished), now_ns, now_ns, tranche_id, function_id))
                     database_seconds += time.monotonic() - db_started
+                emit({"event": "item-phase", "tranche_id": tranche_id,
+                      "function_id": function_id, "phase": phase, "status": status,
+                      "worker": worker or threading.current_thread().name})
             def launch(function_id: str):
                 with write_lock:
                     with _immediate(db):
@@ -570,6 +608,9 @@ def quickwin_sweep(args):
                                   json.dumps(timing, sort_keys=True), time.time_ns(),
                                   time.time_ns(), time.time_ns(), tranche_id, function_id))
                             database_seconds += time.monotonic() - db_started
+                        emit({"event": "item-complete", "tranche_id": tranche_id,
+                              "function_id": function_id, "status": status,
+                              "session_id": session_id, "score": score, "reason": reason})
                 except KeyboardInterrupt:
                     cancel_event.set()
                     for future in futures: future.cancel()
@@ -591,6 +632,9 @@ def quickwin_sweep(args):
         counts = {status: sum(item["status"] == status for item in items)
                   for status in sorted({item["status"] for item in items})}
         result = {"tranche_id": tranche_id, "inventory_digest": digest, "jobs": max(1, args.jobs),
+                  "requested_ready": args.limit, "ready_selected": counts.get("ready_verified", 0)
+                      + counts.get("running", 0) + counts.get("exact", 0) + counts.get("near_match", 0)
+                      + counts.get("build_failed", 0),
                   "selected": len(items), "status": counts,
                   "preflight_exclusions": planning_exclusions,
                   "next": [item for item in items if item["status"] != "exact"][:20],
@@ -615,6 +659,8 @@ def quickwin_sweep(args):
         from ..match.pipeline import object_cache_stats, pipeline_stats
         result["object_cache"] = object_cache_stats()
         result["pipeline_timing"] = pipeline_stats()
+        emit({"event": "tranche-complete", "tranche_id": tranche_id,
+              "status": counts, "timing": result["timing"]})
         return result
     finally:
         if context_cache is not None:
@@ -724,6 +770,99 @@ def quickwin_sweep_status(args):
 quickwin_sweep_status.arguments = _sweep_status_args
 
 
+def _resolve_tranche_cases(args, tranche_id: str, db: sqlite3.Connection,
+                           events: str) -> list[dict]:
+    """Escalate unresolved tranche rows through the durable strict resolution ladder."""
+    if args.resolve_hard_top <= 0:
+        return []
+    from argparse import Namespace
+    import tempfile
+    from ..match.engine import Target
+    from ..match.resolve import CaseStore, resolve
+    from .resolve import _Runner
+
+    mappings = dict(value.split("=", 1) for value in args.image_file if "=" in value)
+    context = ProjectContext(args.project, mappings)
+    inventory_by_id = {row["id"]: row for row in context.inventory["functions"]}
+    selected = db.execute("""SELECT function_id,candidate_source,recipe,status,best_score
+        FROM tranche_items WHERE tranche_id=? AND status IN
+        ('near_match','source_missing','draft_failed','build_failed','recipe_unknown')
+        ORDER BY best_score IS NULL,best_score,rank LIMIT ?""",
+        (tranche_id, args.resolve_hard_top)).fetchall()
+    case_store = CaseStore(Path(args.project).resolve() / ".n64dk" / "resolve")
+    emit = _event_writer(events)
+    results = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="n64dk-tranche-resolve-") as work:
+            for function_id, candidate_source, recipe_json, old_status, old_score in selected:
+                row = inventory_by_id.get(function_id)
+                if row is None or row["image"] not in mappings:
+                    continue
+                try:
+                    check = context.preflight(row, True)
+                    image = context.image(row["image"])
+                    offset = int(check["selected_image_offset"], 0)
+                    linked_vram = int(check["mapping"].get("linked_vram") or row["vram"], 0)
+                    target = Target(image.data, linked_vram - offset, (0, len(image.data)))
+                    recipe = json.loads(recipe_json) if recipe_json else context.infer_recipe(
+                        row, args.pipeline, args.flags)
+                    recipe_flags = recipe.get("flags") or []
+                    runner_args = Namespace(pipeline=recipe["pipeline"],
+                        flags=(shlex.join(recipe_flags) if isinstance(recipe_flags, list)
+                               else str(recipe_flags)), context=args.m2c_context)
+                    runner = _Runner(runner_args, context.config, target, context.symbols,
+                                     Path(work) / function_id)
+                    runner.work.mkdir(parents=True, exist_ok=True)
+                    source_path = Path(candidate_source) if candidate_source else None
+                    if source_path and not source_path.is_absolute():
+                        source_path = Path(args.project).resolve() / source_path
+                    source = source_path.read_text() if source_path and source_path.is_file() else None
+                    filename = source_path.name if source_path else f"{row['name']}.c"
+                    evaluate = runner.evaluator(linked_vram, int(row["size"]), filename)
+                    catalogue_base = int(row["section_vram"], 0)
+                    linked_base = int(check["mapping"].get("linked_base") or row["section_vram"], 0)
+                    shift = catalogue_base - linked_base
+                    neighbours = {int(item["vram"], 0) - shift
+                                  for item in context.inventory["functions"]
+                                  if item["image"] == row["image"]}
+                    names = {address - shift if catalogue_base <= address < catalogue_base + int(row["section_size"])
+                             else address: name for name, address in context.symbols.items()}
+
+                    def case_event(value):
+                        emit({"tranche_id": tranche_id, "function_id": function_id, **value})
+
+                    case = resolve(case_store, row["image"], row["name"], linked_vram,
+                                   image.data[offset:offset + int(row["size"])], evaluate,
+                                   source=source,
+                                   draft=runner.drafter(row["name"], linked_vram, int(row["size"]),
+                                                       evaluate, names),
+                                   flow=runner.flow(linked_vram, int(row["size"])),
+                                   neighbours=neighbours, budget=args.resolve_budget,
+                                   jobs=max(1, min(args.jobs, 8)), emit=case_event,
+                                   pipeline=recipe["pipeline"],
+                                   recipes=runner.recipes(linked_vram, int(row["size"]), filename))
+                    status = "exact" if case.status == "exact" else f"resolver_{case.status}"
+                    reason = case.next or case.top_cause or case.status
+                    db.execute("""UPDATE tranche_items SET status=?,phase='resolver-complete',
+                        best_score=?,reason=?,resolver_case=?,finished_ns=?,updated_ns=?
+                        WHERE tranche_id=? AND function_id=?""",
+                        (status, case.best_score, reason, json.dumps(case.as_dict(), sort_keys=True),
+                         time.time_ns(), time.time_ns(), tranche_id, function_id))
+                    db.commit()
+                    results.append({"function": row["name"], "case": case.case_id,
+                                    "status": case.status, "best_score": case.best_score,
+                                    "builds": case.builds, "top_cause": case.top_cause,
+                                    "strict_proof": case.proof})
+                except Exception as error:
+                    emit({"event": "case-error", "tranche_id": tranche_id,
+                          "function_id": function_id, "error": str(error)[-500:]})
+                    results.append({"function": row["name"], "status": "error",
+                                    "error": str(error)[-500:]})
+    finally:
+        case_store.close(); context.close()
+    return results
+
+
 def _tranche_run_args(p):
     p.add_argument("--project", default=".")
     p.add_argument("--limit", type=int, default=500)
@@ -745,6 +884,10 @@ def _tranche_run_args(p):
     p.add_argument("--pipeline")
     p.add_argument("--flags")
     p.add_argument("--report")
+    p.add_argument("--events", help="JSONL progress path (default: STATE_ROOT/tranche-events.jsonl)")
+    p.add_argument("--resolve-hard-top", type=int, default=0,
+                   help="run the durable resolution ladder on the best N unresolved rows")
+    p.add_argument("--resolve-budget", type=int, default=128)
 
 
 @command("tranche-run", "Run cached planning, verified baselines, bounded exploration and winner preparation")
@@ -752,13 +895,14 @@ def tranche_run(args):
     from argparse import Namespace
     if args.checkpoint_every != 1:
         raise ValueError("durable tranche execution requires --checkpoint-every 1")
+    events = args.events or str(Path(args.state_root) / "tranche-events.jsonl")
     sweep_args = Namespace(project=args.project, all_images=args.all_images, image=args.image,
         limit=args.limit, jobs=args.jobs, state_root=args.state_root, resume=None, report=args.report,
         run=args.run_ready, image_file=args.image_file, pipeline=args.pipeline, flags=args.flags,
         refresh_sources=False, run_ready_only=False, details=False, format=getattr(args, "format", "json"),
-        draft_missing=args.draft_missing, m2c_context=args.m2c_context)
+        draft_missing=args.draft_missing, m2c_context=args.m2c_context, events=events)
     result = quickwin_sweep(sweep_args); tranche_id = result["tranche_id"]
-    db = _state(Path(args.state_root)); explored = []; prepared = []
+    db = _state(Path(args.state_root)); explored = []; prepared = []; resolved = []
     try:
         if args.explore_top:
             sessions = db.execute("""SELECT session_id,name,image FROM tranche_items WHERE tranche_id=?
@@ -780,6 +924,7 @@ def tranche_run(args):
                                       WHERE tranche_id=? AND session_id=?""",
                                    (value["best_score"], time.time_ns(), tranche_id, session_id)); db.commit()
                 except Exception as error: explored.append({"function": name, "error": str(error)})
+        resolved = _resolve_tranche_cases(args, tranche_id, db, events)
         if args.prepare_exact:
             exact = db.execute("SELECT session_id,name,image FROM tranche_items WHERE tranche_id=? AND status='exact'",
                                (tranche_id,)).fetchall()
@@ -789,7 +934,8 @@ def tranche_run(args):
         counts = dict(db.execute("SELECT status,COUNT(*) FROM tranche_items WHERE tranche_id=? GROUP BY status",
                                  (tranche_id,)).fetchall())
     finally: db.close()
-    result.update({"exploration": explored, "exact_winner_queue": prepared,
+    result.update({"exploration": explored, "resolution": resolved,
+        "exact_winner_queue": prepared, "events": events,
         "gate_state": "commands-prepared" if args.gate_exact else "not-requested",
         "performance": {**result.get("timing", {}),
             "exact_matches_per_wall_hour": round(counts.get("exact", 0) * 3600 /

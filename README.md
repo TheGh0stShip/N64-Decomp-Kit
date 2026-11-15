@@ -135,6 +135,12 @@ export, and proof boundaries.
 | `frontier-synthesize` / `compiler-explain` / `residual-attribution` | Synthesize complementary candidates and explain one candidate or a causal pairwise compiler/residual difference |
 | `code-query` / `asm-query` / `negatives-query` | Search source, manifests, historical failures and structural assembly without shell pipelines |
 | `boundary-audit` / `boundary-correct` | Audit CFG/Splat/ownership evidence and prepare denominator-safe corrections |
+| `entry-audit` / `abi-solve` / `structure-context` | Produce CFG/liveness/frame, prototype, and cross-function structure-layout evidence |
+| `manifest-verify` | Rebuild manifest units and issue strict `exact`, `assumed`, or `mismatch` verdicts |
+| `resolve-case` / `resolve-hard` / `hard-queue` | Persist digest-pinned hard cases and run the bounded boundary/draft/recipe/diagnose/iterate/proof ladder |
+| `ownership-ledger` / `progress-reconcile` | Partition authoritative byte ownership and explain numerator/denominator changes without granting unverified credit |
+| `exact-reconcile` / `workspace-audit` / `workspace-clean` | Find reproducible unintegrated winners and audit or remove only known generated artifacts |
+| `address-explain` / `gate-policy` | Explain logical/catalogue/linked coordinates and inspect fail-closed transition-gate policy |
 | `integrate-winner` / `integration-audit` / `gate-delta` | Verify exact winners twice and prepare reviewable integration/gate transactions |
 | `project-gate` | Run project-defined gates with compact image and failure summaries |
 | `scheduler-plan` / `scheduler-status` | Persist separate discovery, exploitation, recovery, boundary, family and verification lanes |
@@ -144,6 +150,10 @@ export, and proof boundaries.
 | `match-job-status JOB_ID` | Inspect job state, best result, failures and candidate lineage |
 | `match-job-export JOB_ID OUTPUT` | Export a candidate and non-proof-grade evidence without editing project source |
 | `match-diagnose COMPILED TARGET` | Rank boundary/toolchain/semantic/type/regalloc/reload/scheduling causes |
+| `gcc27-regalloc FILE.lreg [--global-dump FILE.greg]` | Explain GCC 2.7.x pseudo priorities, ties and hard-register assignments |
+| `toolchain-fingerprint --profile P --file ROLE=PATH...` | Content-hash the real compiler/assembler/linker identity |
+| `provenance-audit SOURCE...` | Reject assembly escapes, unproven assembly and non-proof-grade credit |
+| `research-audit SOURCES.tsv FINDINGS.tsv` | Reject unindexed, search-only or low-quality evidence before automation |
 
 `match-iterate` never edits its input. It validates the project image and strict function entry,
 compiles variants concurrently, deduplicates equivalent objects, and stores the complete run under
@@ -159,10 +169,13 @@ n64dk --format json match-iterate candidate.c --project . --rom overlay_composit
 Use `--families lifetime,order,expression` to restrict the run to behavior-preserving forms.
 `m2c-draft` and preflighted `draft-sweep` reject explicit raw/composite deltas that disagree with
 the authoritative project mapping.
-| `gcc27-regalloc FILE.lreg [--global-dump FILE.greg]` | Explain GCC 2.7.x pseudo priorities, ties and hard-register assignments |
-| `toolchain-fingerprint --profile P --file ROLE=PATH...` | Content-hash the real compiler/assembler/linker identity |
-| `provenance-audit SOURCE...` | Reject assembly escapes, unproven assembly and non-proof-grade credit |
-| `research-audit SOURCES.tsv FINDINGS.tsv` | Reject unindexed, search-only or low-quality evidence before automation |
+
+Exploratory `compare_object` exactness is intentionally permissive and is not proof. Credit,
+winner queues, inventory numerators, and integration require a current `strict_compare` verdict
+of `exact`; `assumed` results remain research evidence only. See
+[Round 4 integration and adversarial verification](docs/round4-integration.md), the durable
+[goal and invariants](docs/durable-goal.md), and the paste-ready
+[Madden operator handoff](docs/MADDEN_ROUND4_HANDOFF.md).
 
 Run `n64dk COMMAND --help` for every option.
 

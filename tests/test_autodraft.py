@@ -103,26 +103,48 @@ class RepairTest(unittest.TestCase):
 class MappingTest(unittest.TestCase):
     def test_composite_delta_disagreement_fails_closed(self):
         args = Namespace(project=".", addr=0x800A2078, size=0xF8,
-                         image="overlay_2_composite.z64", vram_delta=0x80000000)
-        row = {"id": "target", "image": "overlay2", "vram": "0x800A2078", "size": 0xF8}
+                         image="overlay_2_composite.z64", image_name=None,
+                         vram_delta=0x80000000)
+        row = {"id": "target", "image": "overlay2", "vram": "0x800A2078", "size": 0xF8,
+               "section_vram": "0x8008B8E0", "section_size": 0x32000}
         with patch("n64dk.match.inventory.build", return_value={"functions": [row]}), \
              patch("n64dk.match.layout.from_inventory", return_value=object()), \
              patch("n64dk.match.layout.resolve_image_map",
                    return_value={"selected": {"offset": 0xA2C78,
-                                                "authority": "anchored-composite-region"}}):
+                                                "authority": "anchored-composite-region"},
+                                 "linked_vram": "0x800A2078", "linked_base": "0x8008B8E0"}):
             with self.assertRaisesRegex(ValueError, "conflicts|project mapping"):
                 _draft_mapping(args)
 
     def test_canonical_composite_delta_records_authority(self):
         args = Namespace(project=".", addr=0x800A2078, size=0xF8,
-                         image="overlay_2_composite.z64", vram_delta=0x7FFFF400)
-        row = {"id": "target", "image": "overlay2", "vram": "0x800A2078", "size": 0xF8}
+                         image="overlay_2_composite.z64", image_name=None,
+                         vram_delta=0x7FFFF400)
+        row = {"id": "target", "image": "overlay2", "vram": "0x800A2078", "size": 0xF8,
+               "section_vram": "0x8008B8E0", "section_size": 0x32000}
         with patch("n64dk.match.inventory.build", return_value={"functions": [row]}), \
              patch("n64dk.match.layout.from_inventory", return_value=object()), \
              patch("n64dk.match.layout.resolve_image_map",
                    return_value={"selected": {"offset": 0xA2C78,
-                                                "authority": "anchored-composite-region"}}):
+                                                "authority": "anchored-composite-region"},
+                                 "linked_vram": "0x800A2078", "linked_base": "0x8008B8E0"}):
             self.assertEqual(_draft_mapping(args)["authority"], "anchored-composite-region")
+
+    def test_shifted_catalogue_address_normalizes_to_linked_vram(self):
+        args = Namespace(project=".", addr=0x800E0B58, size=0x20,
+                         image="overlay_4_composite.z64", image_name="overlay4",
+                         vram_delta=0x7FFE4C48)
+        row = {"id": "target", "image": "overlay4", "vram": "0x800E0B58", "size": 0x20,
+               "section_vram": "0x800C77E8", "section_size": 0x21000}
+        resolved = {"selected": {"offset": 0xFA670, "authority": "anchored-composite-region"},
+                    "linked_vram": "0x800DF2B8", "linked_base": "0x800C5F48"}
+        with patch("n64dk.match.inventory.build", return_value={"functions": [row]}), \
+             patch("n64dk.match.layout.from_inventory", return_value=object()), \
+             patch("n64dk.match.layout.resolve_image_map", return_value=resolved):
+            mapping = _draft_mapping(args)
+        self.assertEqual(args.addr, 0x800DF2B8)
+        self.assertEqual(mapping["catalogue_vram"], "0x800E0B58")
+        self.assertEqual(mapping["linked_vram"], "0x800DF2B8")
 
 
 if __name__ == "__main__":

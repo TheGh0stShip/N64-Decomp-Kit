@@ -20,8 +20,8 @@ _ROW = re.compile(
 )
 _IMAGE = re.compile(r"functions_(.+)\.toml$")
 _MANIFEST = re.compile(r"matching_(.+?)_(?:asm_|kmc_|ido[^_]*_|sn_)?units\.tsv$")
-_EXCLUDED_WORDS = {"fragment", "shared", "tail", "epilogue", "padding", "data",
-                   "handwritten", "stub", "offset", "call"}
+_STRUCTURAL_KINDS = {"fragment", "shared_tail", "shared-epilogue", "epilogue", "padding",
+                     "data", "handwritten", "assembly-fragment", "delay-slot"}
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class Interval:
     source: str
     kind: str
     manifest: str = ""
+    declared_digest: str | None = None
 
     def covers(self, start: int, end: int) -> bool:
         return self.start <= start and self.end >= end
@@ -66,8 +67,42 @@ class InventoryFunction:
         return value
 
 
+def _inventory_config(project: Path) -> dict:
+    path = project / "n64dk.toml"
+    if not path.is_file():
+        return {}
+    try:
+        return tomllib.loads(path.read_text()).get("inventory", {})
+    except tomllib.TOMLDecodeError:
+        return {}
+
+
 def _catalogues(project: Path) -> list[Path]:
-    return sorted(project.glob("config/**/functions_*.toml"))
+    configured = _inventory_config(project).get("catalogues", [])
+    if configured:
+        return sorted((project / value).resolve() for value in configured)
+    conventional = set(project.glob("config/**/functions_*.toml"))
+    # Game-agnostic fallback: accept TOML files that actually contain section/function tables,
+    # while excluding kit/progress configuration by content rather than filename convention.
+    candidates = list(project.glob("config/**/*.toml")) + list(project.glob("analysis/**/functions.toml"))
+    if (project / "functions.toml").is_file():
+        candidates.append(project / "functions.toml")
+    for path in candidates:
+        try:
+            text = path.read_text()
+            if "[[section]]" in text and "functions" in text:
+                conventional.add(path)
+        except OSError:
+            continue
+    return sorted(conventional)
+
+
+def _image_name(path: Path) -> str:
+    match = _IMAGE.search(path.name)
+    if match:
+        return match.group(1)
+    stem = path.stem.removeprefix("functions_")
+    return "main" if stem == "functions" else stem
 
 
 def _sections(path: Path) -> list[tuple[int, int, int]]:
@@ -80,14 +115,18 @@ def _sections(path: Path) -> list[tuple[int, int, int]]:
 def _manifest_intervals(project: Path, image: str,
                         sections: list[tuple[int, int, int]]) -> list[Interval]:
     result: list[Interval] = []
-    patterns = list(project.glob(f"config/**/matching_{image}_*units.tsv"))
+    configured = _inventory_config(project).get("manifests", {})
+    configured_rows = configured.get(image, []) if isinstance(configured, dict) else []
+    patterns = [(project / value).resolve() for value in configured_rows]
+    patterns += list(project.glob(f"config/**/matching_{image}_*units.tsv"))
     patterns += list(project.glob(f"config/**/matching_{image}_units.tsv"))
     # The resident/main image commonly predates image-qualified manifest names.
     # Include only generic compiler/assembler manifests, never overlay/loader/data rows.
     if image in {"resident", "main"}:
         for path in project.glob("config/**/matching_*units.tsv"):
             stem = path.name.removeprefix("matching_").removesuffix("_units.tsv")
-            if stem in {"kmc", "ido", "asm"} or stem.startswith("ido"):
+            if (stem in {"kmc", "ido", "asm"} or stem.startswith("ido")) \
+                    and not any(word in stem for word in ("data", "asset", "rodata")):
                 patterns.append(path)
 
     def number(value: str) -> int:
@@ -98,8 +137,6 @@ def _manifest_intervals(project: Path, image: str,
             return int(value, 16)
 
     for path in sorted(set(patterns)):
-        qualified = path.name.startswith(f"matching_{image}_")
-        resident_rom_bias = 0x1000 if image in {"resident", "main"} and not qualified else 0
         with path.open(newline="") as stream:
             for row in csv.reader((line for line in stream if line.strip() and not line.startswith("#")),
                                   delimiter="\t"):
@@ -115,15 +152,20 @@ def _manifest_intervals(project: Path, image: str,
                     source = row[0]
                 else:
                     source = row[2]
-                    rom -= resident_rom_bias
                     section = next((s for s in sections if s[1] <= rom < s[1] + s[2]), None)
                     if section is None:
+                        # A row outside every declared coordinate space is retained as a
+                        # contradiction rather than silently shifted by a game-specific bias.
+                        result.append(Interval(-1, -1, source, "unmapped",
+                                               str(path.relative_to(project)),
+                                               row[4] if len(row) > 4 and re.fullmatch(r"[0-9a-fA-F]{64}", row[4]) else None))
                         continue
                     vram = section[0] + rom - section[1]
                 suffix = Path(source).suffix.lower()
                 kind = "assembly" if suffix in {".s", ".asm"} else "source"
                 result.append(Interval(vram, vram + size, source, kind,
-                                       str(path.relative_to(project))))
+                                       str(path.relative_to(project)),
+                                       next((value for value in row[3:] if re.fullmatch(r"[0-9a-fA-F]{64}", value)), None)))
     return result
 
 
@@ -172,15 +214,20 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
     source_index = SourceIndex(root)
     source_stats = source_index.refresh() if refresh_sources or source_index.empty() else {
         "scanned": 0, "hashed": 0, "elapsed_seconds": 0.0, "cache_hit": True}
+    from .toolchain import load_config
+    from .verification_store import current as current_verifications
+    cfg = load_config(root)
+    receipts = current_verifications(root, cfg)
     functions: list[InventoryFunction] = []
     images = []
+    unmapped_claims = []
     for catalogue in _catalogues(root):
-        match = _IMAGE.search(catalogue.name)
-        if not match:
-            continue
-        image = match.group(1)
+        image = _image_name(catalogue)
         sections = _sections(catalogue)
         claims = _manifest_intervals(root, image, sections)
+        unmapped_claims += [{"image": image, "manifest": claim.manifest, "source": claim.source}
+                            for claim in claims if claim.kind == "unmapped"]
+        claims = [claim for claim in claims if claim.kind != "unmapped"]
         image_rows = []
         comments = {}
         for line in catalogue.read_text().splitlines():
@@ -210,8 +257,14 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             intersecting = list(active_claims)
             owners = [claim for claim in intersecting if claim.covers(start, end)]
             partial = [claim for claim in intersecting if not claim.covers(start, end)]
-            clipped = sorted((max(start, claim.start), min(end, claim.end), claim)
-                             for claim in intersecting)
+            clipped = sorted(
+                ((max(start, claim.start), min(end, claim.end), claim)
+                 for claim in intersecting),
+                key=lambda item: (
+                    item[0], item[1], item[2].start, item[2].end,
+                    item[2].kind, item[2].source, item[2].manifest,
+                ),
+            )
             cursor = start
             for left, right, _claim in clipped:
                 if left > cursor: break
@@ -221,17 +274,18 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                 in zip(clipped, clipped[1:]))
             source_owners = [claim for claim in owners if claim.kind == "source"]
             asm_owners = [claim for claim in owners if claim.kind == "assembly"]
-            words = set(re.findall(r"[a-z]+", f"{name} {status}".lower()))
-            structural = words & _EXCLUDED_WORDS
-            if size < 12:
-                structural.add("undersized")
+            normalized_status = re.sub(r"[\s-]+", "_", status.strip().lower())
+            structural = {normalized_status} & {value.replace("-", "_") for value in _STRUCTURAL_KINDS}
             candidate = _candidate_source(root, name, start, source_index)
             # A catalogue comment and a discovered source file are evidence, not proof of
             # coverage.  Only an exact matching manifest may remove an interval from work.
-            padding_partition = (partitioned and len([claim for claim in intersecting if claim.kind == "source"]) == 1
+            padding_partition = (partitioned and any("padding" in claim.source.lower() for claim in intersecting)
+                                 and len([claim for claim in intersecting if claim.kind == "source"]) == 1
                                  and all(claim.kind == "source" or "padding" in claim.source.lower()
                                          for claim in intersecting))
-            if padding_partition:
+            verified_owners = [claim for claim in source_owners
+                               if (claim.source, claim.start, claim.end - claim.start) in receipts]
+            if padding_partition and next((claim for claim in intersecting if claim.kind == "source"), None) in verified_owners:
                 claim = next(claim for claim in intersecting if claim.kind == "source")
                 state, reason, owner = "covered", "C unit plus explicit padding partition owns catalogue interval", claim.source
                 ownership_state, coverage_authority, rank = "manifest_exact_member", "manifest", None
@@ -242,13 +296,25 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             elif partial:
                 state, reason, owner = "conflict", "manifest boundary partially overlaps catalogue interval", None
                 ownership_state, coverage_authority, rank = "boundary_conflict", None, None
-            elif source_owners:
+            elif verified_owners:
                 state, reason = "covered", "covered by a C translation-unit interval"
-                owner = source_owners[0].source if source_owners else None
-                claim = source_owners[0]
+                owner = verified_owners[0].source
+                claim = verified_owners[0]
                 ownership_state = ("manifest_exact_unit" if claim.start == start and claim.end == end
                                    else "manifest_exact_member")
                 coverage_authority = "manifest"
+                rank = None
+            elif source_owners:
+                claim = source_owners[0]
+                source_path = Path(claim.source)
+                source_path = source_path if source_path.is_absolute() else root / source_path
+                digest_ok = (claim.declared_digest is not None and source_path.is_file())
+                state = "claimed"
+                reason = ("manifest ownership claim awaits strict rebuild verification" if source_path.is_file()
+                          else "manifest ownership claim references missing source")
+                owner = claim.source
+                ownership_state = "manifest_nonexact"
+                coverage_authority = "manifest-claim"
                 rank = None
             elif structural and not candidate:
                 state, reason = "excluded", "non-independent interval: " + ", ".join(sorted(structural))
@@ -288,6 +354,7 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
         images.append({"name": image, "catalogue": str(catalogue.relative_to(root)),
                        "functions": len(image_rows),
                        "covered": sum(row.state == "covered" for row in image_rows),
+                       "claimed": sum(row.state == "claimed" for row in image_rows),
                        "remaining": sum(row.state == "remaining" for row in image_rows),
                        "assembly": sum(row.state == "assembly" for row in image_rows),
                        "excluded": sum(row.state == "excluded" for row in image_rows),
@@ -335,12 +402,16 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                     "declared_functions": declared_functions,
                     "denominator_delta": denominator_delta,
                     "covered": sum(row.state == "covered" for row in functions),
+                    "claimed": sum(row.state == "claimed" for row in functions),
                     "remaining": sum(row.state == "remaining" for row in functions),
                     "assembly": sum(row.state == "assembly" for row in functions),
                     "excluded": sum(row.state == "excluded" for row in functions),
                     "conflicts": len(conflicts), "unowned": len(unowned)},
-        "consistency": {"ok": not conflicts and not unowned and denominator_delta in (None, 0),
+        "consistency": {"ok": bool(functions) and not conflicts and not unowned and not unmapped_claims
+                              and denominator_delta in (None, 0),
+                        "reason": "no catalogue functions discovered" if not functions else None,
                         "conflicts": [row.id for row in conflicts],
+                        "unmapped_manifest_rows": unmapped_claims,
                         "missing_ownership": [row.id for row in unowned],
                         "denominator_mismatch": ({"catalogue_functions": len(functions),
                                                    "declared_functions": declared_functions,

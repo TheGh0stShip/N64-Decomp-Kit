@@ -50,15 +50,27 @@ class Outcome:
     error: str | None = None
     digest: str | None = None
     digest_ok: bool | None = None
+    proof_required: bool = False
+    proof: object | None = None
     defined: dict[str, int] = field(default_factory=dict)   # global symbols the object defines
 
     @property
     def exact(self) -> bool:
-        return self.error is None and self.result is not None and self.result.exact and self.digest_ok is not False
+        exploratory = (self.error is None and self.result is not None and self.result.exact
+                       and self.digest_ok is not False)
+        return exploratory and (not self.proof_required or bool(self.proof and self.proof.exact))
+
+    @property
+    def exploratory_exact(self) -> bool:
+        return (self.error is None and self.result is not None and self.result.exact
+                and self.digest_ok is not False)
 
     def as_dict(self) -> dict:
         out = {"name": self.name, "vram": f"0x{self.vram:08X}", "size": f"0x{self.size:X}",
-               "pipeline": self.spec.pipeline, "flags": " ".join(self.spec.flags), "exact": self.exact}
+               "pipeline": self.spec.pipeline, "flags": " ".join(self.spec.flags), "exact": self.exact,
+               "exploratory_exact": self.exploratory_exact,
+               "proof_required": self.proof_required,
+               "proof": self.proof.as_dict() if self.proof is not None else {"verdict": "not-run"}}
         if self.digest is not None:
             out["sha256_text"] = self.digest
             out["digest_ok"] = self.digest_ok if self.digest_ok is not None else self.exact
@@ -76,8 +88,11 @@ def match_source(source: Path, spec: BuildSpec, cfg: Config, target: Target, vra
                  size: int | None, symbols: symmod.SymbolMap, workdir: Path,
                  includes: list[Path] | None = None, infer_externals: bool = True,
                  expected_digest: str | None = None, section_sizes: dict[str, int] | None = None,
-                 name: str | None = None, with_diff: bool = True) -> Outcome:
-    out = Outcome(name or str(source), vram or 0, size or 0, spec)
+                 name: str | None = None, with_diff: bool = True,
+                 strict_verification: bool = False,
+                 function_starts: set[int] | None = None) -> Outcome:
+    out = Outcome(name or str(source), vram or 0, size or 0, spec,
+                  proof_required=strict_verification)
     try:
         obj = build(source, spec, cfg, workdir, includes)
     except (BuildError, RuntimeError, OSError) as exc:
@@ -94,16 +109,29 @@ def match_source(source: Path, spec: BuildSpec, cfg: Config, target: Target, vra
         if not candidates:
             out.error = "compiled .text not found in the ROM"
             return out
+    found_exact = []
+    searching = vram is None
     for vram in candidates:
         out.vram = vram
         _compare_at(out, elf, source, spec, target, vram, size, symbols, infer_externals,
-                    expected_digest, section_sizes, with_diff and len(candidates) == 1)
-        if out.exact:
+                    expected_digest, section_sizes, with_diff and len(candidates) == 1,
+                    strict_verification and not searching, function_starts)
+        if out.exploratory_exact:
+            found_exact.append(vram)
+        if out.exact and not searching:
             break
-    if not out.exact and len(candidates) > 1 and with_diff:
-        out.vram = candidates[0]
-        _compare_at(out, elf, source, spec, target, candidates[0], size, symbols, infer_externals,
-                    expected_digest, section_sizes, True)
+    if searching:
+        if len(found_exact) != 1:
+            out.error = ("compiled .text has ambiguous exact locations: " +
+                         ", ".join(f"0x{value:08X}" for value in found_exact[:16])
+                         if found_exact else "compiled .text did not compare exactly at any located position")
+            out.result = None
+        else:
+            out.error = None
+            out.vram = found_exact[0]
+            _compare_at(out, elf, source, spec, target, found_exact[0], size, symbols,
+                        infer_externals, expected_digest, section_sizes, with_diff,
+                        strict_verification, function_starts)
     try:
         obj.unlink()
     except OSError:
@@ -113,13 +141,18 @@ def match_source(source: Path, spec: BuildSpec, cfg: Config, target: Target, vra
 
 def _compare_at(out: Outcome, elf: Elf, source: Path, spec: BuildSpec, target: Target, vram: int,
                 size: int | None, symbols: symmod.SymbolMap, infer_externals: bool,
-                expected_digest: str | None, section_sizes: dict[str, int] | None, with_diff: bool) -> None:
-    syms = symbols.copy()
+                expected_digest: str | None, section_sizes: dict[str, int] | None, with_diff: bool,
+                strict_verification: bool = False, function_starts: set[int] | None = None) -> None:
+    # Keep the proof authority separate from exploration conveniences.  A candidate may
+    # contain LDSYM markers or address-bearing aliases to make a draft link, but candidate
+    # text is not independent evidence and therefore cannot establish strict exactness.
+    declared_syms = symbols.copy()
+    declared_syms.update(spec.symbols)
+    syms = declared_syms.copy()
     try:
         syms.update(symmod.from_source(Path(source).read_text(errors="replace"), syms))
     except OSError:
         pass
-    syms.update(spec.symbols)
     res = cmp.compare_object(elf, target.rom, target.vram_to_rom, vram, size, syms, spec.section_bases,
                       infer=True, infer_externals=infer_externals, rom_window=target.window,
                       to_vram=target.rom_to_vram, section_sizes=section_sizes, with_diff=with_diff)
@@ -138,6 +171,10 @@ def _compare_at(out: Outcome, elf: Elf, source: Path, spec: BuildSpec, target: T
         out.digest = f"error: {exc}"
     if expected_digest is not None:
         out.digest_ok = out.digest == expected_digest
+    if strict_verification and size is not None:
+        from .verify import strict_compare
+        out.proof = strict_compare(elf, target.rom, target.vram_to_rom, vram, size, declared_syms,
+                                   spec.section_bases, section_sizes, function_starts)
 
 
 def _with(syms: symmod.SymbolMap, extra: dict[str, int]) -> symmod.SymbolMap:
@@ -152,27 +189,30 @@ def batch(units: list[Unit], cfg: Config, target: Target, symbols: symmod.Symbol
     jobs = jobs or os.cpu_count() or 1
     with tempfile.TemporaryDirectory(prefix="n64dk-match-") as tmp:
         work = Path(tmp)
+        function_starts = {unit.vram for unit in units}
 
         def one(unit: Unit) -> Outcome:
             unit_dir = work / f"u{unit.line}"
             unit_dir.mkdir(exist_ok=True)
             o = match_source(unit.source, unit.spec, cfg, target, unit.vram, unit.size, symbols, unit_dir,
                              infer_externals=infer_externals, expected_digest=unit.digest,
-                             section_sizes=unit.section_sizes, name=unit.name)
+                             section_sizes=unit.section_sizes, name=unit.name,
+                             strict_verification=True, function_starts=function_starts)
             if progress:
                 progress(o)
             return o
 
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             outs = list(pool.map(one, units))
-            # Second pass: symbols defined by other units of the batch (link-time resolution).
-            retry = [i for i, o in enumerate(outs) if o.result is not None and o.result.error
-                     and "undefined symbol" in o.result.error]
+            # Second pass: text symbols defined by peer units are independent link evidence.
+            # Never import data definitions whose section base came from the target bytes.
+            retry = [i for i, o in enumerate(outs) if o.exploratory_exact and not o.exact]
             if retry:
                 symbols = symbols.copy()
                 for o in outs:
                     for k, v in o.defined.items():
-                        symbols.setdefault(k, v)
+                        if o.vram <= v < o.vram + o.size:
+                            symbols.setdefault(k, v)
                 for i, o in zip(retry, pool.map(one, [units[i] for i in retry])):
                     outs[i] = o
             return outs
@@ -293,7 +333,7 @@ def sweep(source: Path, cfg: Config, target: Target, vram: int, size: int | None
         for i in range(0, len(specs), jobs):
             chunk = specs[i:i + jobs]
             outs = list(pool.map(lambda s: match_source(source, s, cfg, target, vram, size, symbols, Path(tmp),
-                                                        includes), chunk))
+                                                        includes, strict_verification=size is not None), chunk))
             res.tried += outs
             hit = next((o for o in outs if o.exact), None)
             if hit is not None:
@@ -305,6 +345,8 @@ def sweep(source: Path, cfg: Config, target: Target, vram: int, size: int | None
 
 def manifest_row(outcome: Outcome, project: Path, source: Path, target: Target, symbols: symmod.SymbolMap) -> str:
     """BattleTanx-style ``ROM_START SIZE SOURCE FLAGS SHA256`` row for an exact outcome."""
+    if not outcome.exact:
+        raise ValueError("manifest rows require a strictly verified exact outcome")
     spec = BuildSpec(outcome.spec.pipeline, list(outcome.spec.flags), dict(outcome.spec.section_bases),
                      dict(outcome.spec.symbols), list(outcome.spec.normalizer_args))
     res = outcome.result

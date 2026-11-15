@@ -661,6 +661,33 @@ class MatchSessionTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_residual_explorer_accepts_empty_insertion_deletion_diff_sides(self):
+        from types import SimpleNamespace
+
+        class Outcome:
+            exact = False
+            error = None
+            result = SimpleNamespace(diff=SimpleNamespace(score=5, counts={"instruction": 1}))
+
+            def as_dict(self):
+                return {"exact": False, "diff": {"entries": [
+                    {"compiled": "", "retail": "jal func_80001000"},
+                    {"compiled": "nop", "retail": ""},
+                ]}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(tmp)
+            try:
+                session = MatchSession(store, lambda *_args: Outcome())
+                session_id, _ = session.create(
+                    {"layout_preflight": {"ok": True}},
+                    b"int f(int x) { return x; }\n", "kmc+as", ("-O2",))
+                result = explore(store, session, session_id, jobs=1, rounds=1,
+                                 variants_per_round=2)
+                self.assertEqual(result["rounds"], 1)
+            finally:
+                store.close()
+
 
 class ProfileTests(unittest.TestCase):
     def test_open_set_abstains_on_weak_or_tied_evidence(self):

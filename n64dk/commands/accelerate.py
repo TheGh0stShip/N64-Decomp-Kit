@@ -143,6 +143,9 @@ def _draft_inputs(args):
     names, sizes = {}, {}
     for path in args.symbols:
         for name, vram, size in load_catalogue(Path(path)):
+            transform = getattr(args, "_coordinate_transform", None)
+            if transform and transform["catalogue_base"] <= vram < transform["catalogue_end"]:
+                vram -= transform["shift"]
             names[vram] = name
             if size:
                 sizes[vram] = size
@@ -168,29 +171,49 @@ def _draft_inputs(args):
 
 
 def _draft_mapping(args) -> dict | None:
-    """Fail closed when an explicit offset disagrees with authoritative project mapping."""
+    """Resolve a draft target without filename guessing and normalize it to linked VRAM."""
     try:
         from ..match import inventory as invmod
         from ..match.layout import from_inventory, resolve_image_map
 
         inventory = invmod.build(args.project)
         rows = [row for row in inventory.get("functions", [])
-                if int(row["vram"], 0) == args.addr
-                and (args.size is None or int(row["size"]) == args.size)]
-        image_number = re.search(r"overlay[_-]?(\d+)", Path(args.image).name, re.I)
-        if image_number:
-            rows = [row for row in rows if row["image"].replace("_", "") == "overlay" + image_number.group(1)]
-        if len(rows) != 1:
+                if args.size is None or int(row["size"]) == args.size]
+        if getattr(args, "image_name", None):
+            rows = [row for row in rows if row["image"] == args.image_name]
+        resolved_rows = []
+        for row in rows:
+            try:
+                resolved = resolve_image_map(args.image, from_inventory(row))
+            except ValueError:
+                continue
+            catalogue = int(row["vram"], 0)
+            linked = int(resolved.get("linked_vram") or row["vram"], 0)
+            if args.addr in {catalogue, linked}:
+                resolved_rows.append((row, resolved, catalogue, linked))
+        if not resolved_rows:
             return None
-        resolved = resolve_image_map(args.image, from_inventory(rows[0]))
-        canonical_delta = args.addr - resolved["selected"]["offset"]
+        if len(resolved_rows) != 1:
+            choices = ", ".join(sorted({row["image"] for row, *_rest in resolved_rows}))
+            raise ValueError(f"draft target is ambiguous across images ({choices}); pass --image-name")
+        row, resolved, catalogue, linked = resolved_rows[0]
+        canonical_delta = linked - resolved["selected"]["offset"]
         if canonical_delta != args.vram_delta:
             raise ValueError(f"explicit vram_delta 0x{args.vram_delta:X} selects file offset "
                              f"0x{args.addr - args.vram_delta:X}, but project mapping selects "
                              f"0x{resolved['selected']['offset']:X} (delta 0x{canonical_delta:X})")
+        catalogue_base = int(row["section_vram"], 0)
+        linked_base = int(resolved.get("linked_base") or row["section_vram"], 0)
+        args._catalogue_addr = catalogue
+        args.addr = linked
+        args._coordinate_transform = {"catalogue_base": catalogue_base,
+                                      "catalogue_end": catalogue_base + int(row["section_size"]),
+                                      "shift": catalogue_base - linked_base}
         return {"authority": resolved["selected"].get("authority"),
                 "selected_offset": f"0x{resolved['selected']['offset']:X}",
-                "vram_delta": f"0x{canonical_delta:X}", "inventory_id": rows[0].get("id")}
+                "vram_delta": f"0x{canonical_delta:X}", "inventory_id": row.get("id"),
+                "image": row["image"], "catalogue_vram": f"0x{catalogue:X}",
+                "linked_vram": f"0x{linked:X}"}
     except ValueError:
         raise
     except Exception:
@@ -199,6 +222,12 @@ def _draft_mapping(args) -> dict | None:
 
 @command("m2c-draft", "Emit symbolized assembly for a function and, when m2c is installed, a first C draft")
 def m2c_draft(args):
+    image = Path(args.image)
+    if not image.is_absolute():
+        candidate = Path(args.project).expanduser().resolve() / image
+        if candidate.is_file():
+            image = candidate
+    args.image = str(image.resolve())
     mapping = _draft_mapping(args)
     code, names, name, tables = _draft_inputs(args)
     if args.asm_only:
@@ -237,6 +266,7 @@ def m2c_draft(args):
 def _m2c_args(p):
     p.add_argument("image")
     p.add_argument("--project", default=".", help="project used to validate raw/composite image mapping")
+    p.add_argument("--image-name", help="logical inventory image identity; required when addresses overlap")
     p.add_argument("--vram-delta", type=_int, required=True, help="VRAM minus file offset of the image")
     p.add_argument("--addr", type=_int, required=True)
     p.add_argument("--size", type=_int, help="bytes (default: the --symbols catalogue entry at --addr)")
@@ -306,8 +336,9 @@ def draft_sweep(args):
         syms = symmod.load(symbol_files); _files = symbol_files
     spec = split_flags(shlex.split(args.flags), args.pipeline)
     covered = [(start, size) for start, size, _src in _manifest_intervals(args.manifest)]
+    catalogue_functions = load_catalogue(Path(args.catalogue))
     functions = [(name, vram - args.catalogue_shift, size)
-                 for name, vram, size in load_catalogue(Path(args.catalogue))]
+                 for name, vram, size in catalogue_functions]
     todo = [function for function in functions
             if not any(start <= target.vram_to_rom(function[1]) < start + size
                        for start, size in covered)]
@@ -320,8 +351,11 @@ def draft_sweep(args):
         by_key = {(row["name"], int(row["vram"], 0)): row for row in inventory["functions"]}
         verified = []
         canonical_deltas = set()
+        coordinate_sections = set()
+        catalogue_by_name = {(name, size): vram for name, vram, size in catalogue_functions}
         for function in todo:
-            row = by_key.get((function[0], function[1]))
+            catalogue_vram = catalogue_by_name.get((function[0], function[2]), function[1])
+            row = by_key.get((function[0], catalogue_vram))
             if row is None:
                 rejected.append({"name": function[0], "reason": "not present in project inventory"})
                 continue
@@ -330,23 +364,32 @@ def draft_sweep(args):
                 # delta, preflight would otherwise inspect unrelated bytes and merely reject
                 # every row as a bad boundary instead of exposing the mapping error.
                 resolved = resolve_image_map(args.rom, from_inventory(row))
-                canonical_delta = function[1] - int(resolved["selected"]["offset"])
+                linked_vram = int(resolved.get("linked_vram") or row["vram"], 0)
+                canonical_delta = linked_vram - int(resolved["selected"]["offset"])
                 canonical_deltas.add(canonical_delta)
-                if canonical_delta != target.delta:
-                    raise ValueError(f"selected vram_delta 0x{target.delta:X} conflicts with "
-                                     f"canonical project image mapping 0x{canonical_delta:X}")
                 check = preflight(args.rom, from_inventory(row), row.get("catalogue_status", ""), strict_entry=True)
+                coordinate_sections.add((int(row["section_vram"], 0),
+                                         int(resolved.get("linked_base") or row["section_vram"], 0),
+                                         int(row["section_size"])))
             except (OSError, ValueError) as error:
                 rejected.append({"name": function[0], "reason": str(error)})
             else:
-                verified.append(function)
+                verified.append((function[0], linked_vram, function[2]))
         todo = verified
         if len(canonical_deltas) > 1:
             raise ValueError("catalogue resolves to multiple image mappings; split the sweep by image region")
-        if canonical_deltas and target.delta not in canonical_deltas:
+        if canonical_deltas:
             canonical = next(iter(canonical_deltas))
-            raise ValueError(f"selected vram_delta 0x{target.delta:X} conflicts with canonical "
-                             f"project image mapping 0x{canonical:X}")
+            target = Target(target.rom, canonical, target.window)
+        if coordinate_sections:
+            adjusted = syms.copy()
+            for catalogue_base, linked_base, section_size in coordinate_sections:
+                shift = catalogue_base - linked_base
+                if shift:
+                    for symbol, address in list(adjusted.items()):
+                        if catalogue_base <= address < catalogue_base + section_size:
+                            adjusted[symbol] = address - shift
+            syms = adjusted
     todo.sort(key=lambda function: function[2])
     if args.limit:
         todo = todo[:args.limit]
@@ -354,7 +397,8 @@ def draft_sweep(args):
     names = {vram: name for name, vram, _size in functions}
     with tempfile.TemporaryDirectory(prefix="n64dk-draft-sweep-") as work:
         def evaluate(path, vram, size):
-            return match_source(path, spec, cfg, target, vram, size, syms, Path(work), None)
+            return match_source(path, spec, cfg, target, vram, size, syms, Path(work), None,
+                                strict_verification=True)
 
         report = autodraft.sweep(todo, target.rom, target.delta, evaluate, out,
                                  jobs=args.jobs or 8, compiler=args.pipeline, names=names,

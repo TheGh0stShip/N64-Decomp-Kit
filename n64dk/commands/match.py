@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -16,10 +17,12 @@ from ..cli import command
 from ..match import manifest as manmod
 from ..match import symbols as symmod
 from ..match.engine import Target, batch, default_pipelines, manifest_row, match_source, sweep
-from ..match.pipeline import PIPELINES, BuildSpec, split_flags, scratch_dir
+from ..match.pipeline import (PIPELINES, BuildSpec, dependency_digest, split_flags,
+                              scratch_dir, toolchain_digest)
 from ..match.session import MatchSession, SessionStore
 from ..match.registry import SessionRegistry, resolve_store, standard_store
-from ..match.layout import Layout, from_inventory, preflight, resolve_image_map
+from ..match.layout import (Layout, configured_image_path, from_inventory, preflight,
+                            resolve_image_map)
 from ..match.toolchain import Config, PROFILES, load_config
 from ..match import inventory as inventorymod
 from ..rom import Rom
@@ -30,14 +33,15 @@ def _exact_project_evidence(cfg, args, outcome, source, spec, target):
         return {}
     try:
         inventory = inventorymod.build(cfg.project)
-        rows = [row for row in inventory["functions"] if int(row["vram"], 0) == outcome.vram
+        catalogue_vram = getattr(args, "_catalogue_addr", outcome.vram)
+        rows = [row for row in inventory["functions"] if int(row["vram"], 0) == catalogue_vram
                 and int(row["size"]) == outcome.size]
     except Exception:
         rows = []
     selected = None
     for row in rows:
         try:
-            check = preflight(args.rom, from_inventory(row), row.get("catalogue_status", ""))
+            check = preflight(cfg.rom, from_inventory(row), row.get("catalogue_status", ""))
         except Exception:
             continue
         if int(check["selected_image_offset"], 0) == outcome.vram - target.delta:
@@ -59,9 +63,11 @@ def _exact_project_evidence(cfg, args, outcome, source, spec, target):
         for relative_name in PROFILES[profile_key].required:
             compiler_hasher.update(relative_name.encode()); compiler_hasher.update(hashlib.sha256((compiler_root / relative_name).read_bytes()).digest())
     compiler_digest = compiler_hasher.hexdigest() if compiler_root else None
+    catalogue_vram = getattr(args, "_catalogue_addr", outcome.vram)
     return {"image_mapping": {"raw_rom": f"0x{layout.rom:X}",
                               "composite_rom": check.get("selected_image_offset") if check else None,
-                              "vram": f"0x{outcome.vram:08X}", "image": row["image"]},
+                              "linked_vram": f"0x{outcome.vram:08X}",
+                              "catalogue_vram": f"0x{catalogue_vram:08X}", "image": row["image"]},
             "project_manifest_row": project_row,
             "exact_evidence": {"target_text_sha256": target_digest,
                                "complete_owned_sections": all(section.match for section in outcome.result.sections) if outcome.result else True,
@@ -94,8 +100,9 @@ def _replay_record(cfg, args, outcome, source: Path, spec: BuildSpec, target: Ta
 
 
 def _common(p, rom_required: bool):
-    p.add_argument("--rom", required=rom_required, help="retail ROM image"
-                   + ("" if rom_required else " (default: n64dk.toml [match] rom or baserom*.z64 in the project)"))
+    p.add_argument("--rom", help="physical retail/composite image (may be omitted when --image-name "
+                   "selects a configured [images] entry)" + ("" if rom_required else
+                   " (otherwise defaults to n64dk.toml [match] rom or baserom*.z64)"))
     p.add_argument("--project", help="project directory: working directory for builds, "
                    "default include/, .toolchain/ and symbol files (default: current directory)")
     p.add_argument("--config", help="n64dk.toml (default: <project>/n64dk.toml)")
@@ -105,6 +112,7 @@ def _common(p, rom_required: bool):
     p.add_argument("-I", "--include", action="append", default=[], help="include directory (repeatable)")
     p.add_argument("--normalizer", help="assembly normalizer hook, e.g. 'python3 tools/norm.py {input} {output}'")
     p.add_argument("--vram-delta", type=lambda s: int(s, 0), help="VRAM - ROM offset of the code segment")
+    p.add_argument("--image-name", help="logical image identity for overlapping overlay address spaces")
     p.add_argument("--jobs", type=int, default=None, help="parallel builds (default: CPU count)")
 
 
@@ -114,37 +122,63 @@ def _setup(args):
         cfg.normalizer = args.normalizer
     if args.include:
         cfg.include = list(dict.fromkeys([Path(cfg.project, i).resolve() for i in args.include] + cfg.include))
-    rom_path = args.rom or cfg.find_rom()
+    rom_path = args.rom
+    if rom_path is None and getattr(args, "image_name", None):
+        rom_path = configured_image_path(cfg.project, args.image_name)
+    if rom_path is None:
+        rom_path = cfg.find_rom()
     if rom_path is None:
         raise SystemExit("no ROM: pass --rom or set [match] rom in n64dk.toml")
     image = Rom.load(rom_path)
+    cfg.rom = Path(rom_path).expanduser().resolve()
+    # Downstream commands must see the concrete immutable image, not the optional spelling
+    # supplied by the caller.  This also makes replay/session identity identical whether the
+    # image was selected by --rom or by a logical [images] entry.
+    args.rom = str(cfg.rom)
     if image.checksum_ok() is False:
         raise SystemExit(f"{rom_path}: header checksum mismatch; not a clean base image")
     selected_delta = args.vram_delta if args.vram_delta is not None else cfg.vram_delta
     if getattr(args, "addr", None) is not None and getattr(args, "size", None) is not None:
-        try:
-            inventory = inventorymod.build(cfg.project)
-            rows = [row for row in inventory["functions"] if int(row["vram"], 0) == args.addr
-                    and int(row["size"]) == args.size]
-            image_number = re.search(r"overlay[_-]?(\d+)", Path(rom_path).name, re.I)
-            if image_number:
-                rows = [row for row in rows if row["image"].replace("_", "") == "overlay" + image_number.group(1)]
-            if len(rows) == 1:
-                resolved = resolve_image_map(rom_path, from_inventory(rows[0]))
-                canonical_delta = args.addr - resolved["selected"]["offset"]
-                if args.vram_delta is not None and args.vram_delta != canonical_delta:
-                    raise ValueError(f"explicit vram_delta 0x{args.vram_delta:X} conflicts with canonical "
-                                     f"image mapping 0x{canonical_delta:X}")
-                selected_delta = canonical_delta
-                args._resolved_mapping = resolved
-                args._resolved_inventory_row = rows[0]
-        except ValueError:
-            raise
-        except Exception:
-            pass
+        inventory = inventorymod.build(cfg.project)
+        rows = [row for row in inventory["functions"] if int(row["vram"], 0) == args.addr
+                and int(row["size"]) == args.size]
+        if args.image_name:
+            rows = [row for row in rows if row["image"] == args.image_name]
+        if len(rows) > 1:
+            choices = ", ".join(sorted({row["image"] for row in rows}))
+            raise ValueError(f"target interval is ambiguous across images ({choices}); pass --image-name")
+        if len(rows) == 1:
+            resolved = resolve_image_map(rom_path, from_inventory(rows[0]))
+            comparison_addr = (int(resolved["linked_vram"], 0) if resolved.get("linked_vram")
+                               else args.addr)
+            canonical_delta = comparison_addr - resolved["selected"]["offset"]
+            if args.vram_delta is not None and args.vram_delta != canonical_delta:
+                raise ValueError(f"explicit vram_delta 0x{args.vram_delta:X} conflicts with canonical "
+                                 f"image mapping 0x{canonical_delta:X}")
+            selected_delta = canonical_delta
+            args._resolved_mapping = resolved
+            args._resolved_inventory_row = rows[0]
+            args._catalogue_addr = args.addr
+            args._comparison_addr = comparison_addr
     target = Target.from_rom(image, selected_delta)
     sym_files = [Path(s) for s in args.symbols] or cfg.symbols or symmod.discover(cfg.project)
     syms = symmod.load(sym_files)
+    resolved = getattr(args, "_resolved_mapping", None)
+    row = getattr(args, "_resolved_inventory_row", None)
+    if resolved and row and resolved.get("linked_base"):
+        catalogue_base = int(row["section_vram"], 0)
+        linked_base = int(resolved["linked_base"], 0)
+        shift = catalogue_base - linked_base
+        section_end = catalogue_base + int(row["section_size"])
+        if shift:
+            adjusted = syms.copy()
+            for name, address in list(adjusted.items()):
+                if catalogue_base <= address < section_end:
+                    adjusted[name] = address - shift
+            syms = adjusted
+            args._coordinate_transform = {"catalogue_base": f"0x{catalogue_base:X}",
+                                          "linked_base": f"0x{linked_base:X}",
+                                          "catalogue_to_linked": f"-{shift:#x}"}
     return cfg, target, syms, sym_files
 
 
@@ -186,9 +220,11 @@ def match(args):
     if args.sweep:
         pipes = args.pipelines.split(",") if args.pipelines else None
         base = split_flags(shlex.split(args.flags), "kmc+builtin") if args.flags else None
-        res = sweep(source, cfg, target, args.addr, args.size, syms, pipes, args.jobs,
+        comparison_addr = getattr(args, "_comparison_addr", args.addr)
+        res = sweep(source, cfg, target, comparison_addr, args.size, syms, pipes, args.jobs,
                     stop_at_first=not args.all, base_spec=base, extended_flags=args.extended_flags)
-        out = {"source": str(source), "vram": f"0x{(res.exact.vram if res.exact else args.addr or 0):08X}",
+        out = {"source": str(source), "vram": f"0x{(res.exact.vram if res.exact else comparison_addr or 0):08X}",
+               "catalogue_vram": f"0x{args.addr:08X}" if args.addr is not None else None,
                "tried": len(res.tried),
                "pipelines": pipes or default_pipelines(cfg), "exact": res.exact is not None}
         if res.exact is not None:
@@ -210,9 +246,16 @@ def match(args):
         return out
     spec = _spec(args, cfg)
     with scratch_dir() as tmp:
-        o = match_source(source, spec, cfg, target, args.addr, args.size, syms, Path(tmp),
-                         infer_externals=not args.no_infer)
-    payload = o.as_dict(); payload["replay"] = _replay_record(cfg, args, o, source, spec, target)
+        comparison_addr = getattr(args, "_comparison_addr", args.addr)
+        o = match_source(source, spec, cfg, target, comparison_addr, args.size, syms, Path(tmp),
+                         infer_externals=not args.no_infer,
+                         strict_verification=args.addr is not None and args.size is not None)
+    payload = o.as_dict()
+    if getattr(args, "_catalogue_addr", None) is not None:
+        payload["catalogue_vram"] = f"0x{args._catalogue_addr:08X}"
+        payload["linked_vram"] = f"0x{o.vram:08X}"
+        payload["coordinate_transform"] = getattr(args, "_coordinate_transform", None)
+    payload["replay"] = _replay_record(cfg, args, o, source, spec, target)
     if o.exact:
         payload["manifest_row"] = manifest_row(o, cfg.project, source, target, syms)
         payload.update(_exact_project_evidence(cfg, args, o, source, spec, target))
@@ -231,8 +274,11 @@ def match(args):
                 source.stem if re.fullmatch(r"func_[0-9A-Fa-f]{8}", source.stem) else None,
                 "valid_current_target" if target_digest else "unknown_provenance")
         finally: history.close()
-    except Exception:
-        pass  # matching remains available when the optional history store is unavailable
+        payload["history"] = "recorded"
+    except (sqlite3.Error, OSError) as error:
+        # A match remains useful when history is unavailable, but losing the observation must
+        # be visible to both humans and automation rather than silently swallowed.
+        payload["history"] = f"not recorded: {error}"
     if args.format == "json":
         return payload
     lines = [f"{'MATCH' if o.exact else 'DIFF'} {source.name} @ 0x{o.vram:08X} "
@@ -280,6 +326,7 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
             toolchain_hasher.update(relative.encode()); toolchain_hasher.update(hashlib.sha256(binary.read_bytes()).digest())
     context = {
         "source_name": source.name,
+        "source_path": str(source.resolve()),
         "source_suffix": source.suffix or ".c",
         "rom": str(rom_path),
         "rom_sha256": hashlib.sha256(target.rom).hexdigest(),
@@ -290,7 +337,8 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
         "symbols": [str(Path(value).resolve()) for value in sym_files],
         "normalizer": cfg.normalizer,
         "vram_delta": target.delta,
-        "addr": args.addr,
+        "addr": getattr(args, "_comparison_addr", args.addr),
+        "catalogue_addr": getattr(args, "_catalogue_addr", args.addr),
         "size": args.size,
         "infer_externals": not args.no_infer,
         "default_pipeline": spec.pipeline,
@@ -298,6 +346,8 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "compiler_recipe": {"pipeline": spec.pipeline, "flags": list(spec.flags)},
         "toolchain_digest": toolchain_hasher.hexdigest(),
+        "pipeline_toolchain_digest": toolchain_digest(cfg, spec.pipeline),
+        "include_closure_digest": dependency_digest(source, spec, cfg),
     }
     if args.addr is not None and args.size is not None:
         layout = (from_inventory(args._resolved_inventory_row)
@@ -305,11 +355,19 @@ def _session_context(args, cfg, target, sym_files, source: Path, spec: BuildSpec
                   Layout("standalone", 0, target.delta, len(target.rom), args.addr, args.size,
                          "standalone-explicit-range"))
         context["layout_preflight"] = preflight(rom_path, layout, strict_entry=args.strict_entry)
-        rom_offset = args.addr - target.delta
+        rom_offset = context["addr"] - target.delta
         target_bytes = target.rom[rom_offset:rom_offset + args.size]
         context["target_text_sha256"] = hashlib.sha256(target_bytes).hexdigest()
         context["image_identity"] = rom_path.name
         context["catalogue_boundary_revision"] = None
+        resolved_row = getattr(args, "_resolved_inventory_row", None)
+        resolved_mapping = getattr(args, "_resolved_mapping", None)
+        if resolved_row and resolved_mapping:
+            context.update({"catalogue_base": int(resolved_row["section_vram"], 0),
+                            "linked_base": int(resolved_mapping.get("linked_base") or
+                                               resolved_row["section_vram"], 0),
+                            "section_size": int(resolved_row["section_size"]),
+                            "inventory_image": resolved_row["image"]})
     return context
 
 
@@ -329,12 +387,32 @@ def _session_runtime(context: dict):
         vram_delta=context["vram_delta"],
         rom=rom_path,
     )
+    source_path = Path(context.get("source_path", ""))
+    if source_path.is_file():
+        spec = BuildSpec(context["default_pipeline"], tuple(context.get("default_flags", ())))
+        current_dependencies = dependency_digest(source_path, spec, cfg)
+        if current_dependencies != context.get("include_closure_digest"):
+            raise RuntimeError("session include closure changed; start a new matching session")
+    current_toolchain = toolchain_digest(cfg, context["default_pipeline"])
+    if current_toolchain != context.get("pipeline_toolchain_digest"):
+        raise RuntimeError("session compiler toolchain changed; start a new matching session")
     target = Target.from_rom(image, context["vram_delta"])
     syms = symmod.load([Path(value) for value in context.get("symbols", [])])
+    catalogue_base = context.get("catalogue_base")
+    linked_base = context.get("linked_base")
+    section_size = context.get("section_size")
+    if catalogue_base is not None and linked_base is not None and section_size is not None:
+        shift = int(catalogue_base) - int(linked_base)
+        if shift:
+            adjusted = syms.copy()
+            for name, address in list(adjusted.items()):
+                if int(catalogue_base) <= address < int(catalogue_base) + int(section_size):
+                    adjusted[name] = address - shift
+            syms = adjusted
     return cfg, target, syms
 
 
-def _session_evaluator(context: dict):
+def _session_evaluator(context: dict, strict: bool = True):
     cfg, target, syms = _session_runtime(context)
 
     def evaluate(source: bytes, pipeline: str, flags: tuple[str, ...], label: str):
@@ -348,7 +426,7 @@ def _session_evaluator(context: dict):
             outcome = match_source(
                 source_path, spec, cfg, target, context.get("addr"), context.get("size"),
                 syms, workdir, infer_externals=context.get("infer_externals", True),
-                name=label,
+                name=label, strict_verification=strict,
             )
             artifact_dir = context.get("artifact_dir")
             if artifact_dir:
@@ -540,9 +618,13 @@ def match_session_export(args):
                      if args.candidate_id else store.best(args.session_id))
         if candidate is None:
             raise ValueError("candidate does not exist in this session")
+        source_bytes = store.cache.get(candidate.source_digest)
+        if args.output == "-":
+            return {"output": "stdout", "source": source_bytes.decode("utf-8", "replace"),
+                    "evidence": candidate.as_dict(), "candidate": candidate.as_dict()}
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(store.cache.get(candidate.source_digest))
+        output.write_bytes(source_bytes)
         evidence = output.with_suffix(output.suffix + ".evidence.json")
         evidence.write_text(json.dumps(candidate.as_dict(), indent=2, sort_keys=True) + "\n")
         return {"output": str(output), "evidence": str(evidence),
@@ -572,14 +654,15 @@ def match_session_prepare_winner(args):
             raise ValueError("integration preparation requires an exact retained candidate")
         context = store.context(args.session_id)
         source = store.cache.get(candidate.source_digest)
-        verified = _session_evaluator(context)(source, candidate.pipeline, candidate.flags,
+        verified = _session_evaluator(context, strict=True)(source, candidate.pipeline, candidate.flags,
                                                "independent-winner-verification")
         if not verified.exact:
             raise RuntimeError("independent recompilation did not reproduce the exact match")
         root = Path(args.output_dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
         canonical_name = (f"{context.get('inventory_name')}.c" if context.get("inventory_name") else
-                          f"func_{int(context['addr']):08X}.c" if context.get("addr") is not None else "winner.c")
+                          f"func_{int(context.get('catalogue_addr', context['addr'])):08X}.c"
+                          if context.get("addr") is not None else "winner.c")
         source_path = root / canonical_name
         source_path.write_bytes(source)
         receipt = {
@@ -590,7 +673,8 @@ def match_session_prepare_winner(args):
             "pipeline": candidate.pipeline,
             "flags": list(candidate.flags),
             "target": {key: context.get(key) for key in
-                       ("rom_sha256", "vram_delta", "addr", "size", "inventory_id", "inventory_image")},
+                       ("rom_sha256", "vram_delta", "addr", "catalogue_addr", "size",
+                        "inventory_id", "inventory_image")},
             "outcome": verified.as_dict(),
             "project_edits_applied": False,
             "historical_source_name": context.get("source_name"),
@@ -727,13 +811,46 @@ def match_batch(args):
             print(f"\r{done[0]}/{len(units)}", end="", file=sys.stderr, flush=True)
 
     outs = batch(units, cfg, target, syms, args.jobs, args.infer_externals, progress)
+    from ..match.verification_store import record as record_verification
+    # Verification receipts are consumed by catalogue-space inventory.  Batch units build at
+    # linked VRAM, which differs for shifted overlays, so retain the explicit coordinate
+    # transform instead of making inventory guess from a filename or applying a game bias.
+    catalogue_vrams = {}
+    wanted = {(unit.vram, unit.size) for unit in units}
+    if wanted:
+        inventory = inventorymod.build(cfg.project)
+        candidates: dict[tuple[int, int], list[int]] = {}
+        section_shifts: dict[tuple[str, str, int], int] = {}
+        for row in inventory.get("functions", []):
+            if args.image_name and row["image"] != args.image_name:
+                continue
+            try:
+                section_key = (row["image"], row["section_vram"], int(row["section_size"]))
+                if section_key not in section_shifts:
+                    mapping = resolve_image_map(cfg.rom, from_inventory(row), data=target.rom)
+                    section_shifts[section_key] = (int(row["vram"], 0) -
+                        int(mapping.get("linked_vram") or row["vram"], 0))
+                linked = int(row["vram"], 0) - section_shifts[section_key]
+            except (OSError, ValueError):
+                continue
+            key = (linked, int(row["size"]))
+            if key in wanted:
+                candidates.setdefault(key, []).append(int(row["vram"], 0))
+        ambiguous = {key: values for key, values in candidates.items() if len(set(values)) != 1}
+        if ambiguous:
+            raise ValueError("batch target coordinates are ambiguous; pass --image-name")
+        catalogue_vrams = {key: values[0] for key, values in candidates.items() if values}
+    receipts = record_verification(cfg.project, cfg, target, units, outs,
+                                   getattr(args, "image_name", None), catalogue_vrams)
     exact = [o for o in outs if o.exact]
     by_pipe: dict[str, list[int]] = {}
     for o in outs:
         by_pipe.setdefault(o.spec.pipeline, [0, 0])
         by_pipe[o.spec.pipeline][0] += 1
         by_pipe[o.spec.pipeline][1] += o.exact
-    summary = {"units": len(outs), "exact": len(exact), "failed": len(outs) - len(exact),
+    assumed = [o for o in outs if o.exploratory_exact and not o.exact]
+    summary = {"units": len(outs), "exact": len(exact), "assumed": len(assumed),
+               "failed": len(outs) - len(exact), "verification_receipts": receipts,
                "text_bytes": sum(o.size for o in exact),
                "data_bytes": sum(s.size for o in exact for s in (o.result.sections if o.result else [])),
                "by_pipeline": {k: f"{v[1]}/{v[0]}" for k, v in sorted(by_pipe.items())},
@@ -743,7 +860,7 @@ def match_batch(args):
         return summary
     if sys.stderr.isatty():
         print(file=sys.stderr)
-    lines = [f"{'MATCH' if o.exact else 'FAIL '} [{o.spec.pipeline}] {o.name}: 0x{o.vram:08X} (0x{o.size:X} bytes)"
+    lines = [f"{'MATCH' if o.exact else 'ASSUM' if o.exploratory_exact else 'FAIL '} [{o.spec.pipeline}] {o.name}: 0x{o.vram:08X} (0x{o.size:X} bytes)"
              + ("" if o.exact else " -- " + (o.error or (o.result.error if o.result and o.result.error else "")
                                              or (o.result.diff.summary() if o.result and o.result.diff else
                                                  "digest mismatch" if o.digest_ok is False else "section mismatch")))
@@ -782,20 +899,29 @@ def match_permute(args):
         raise SystemExit("pycparser is not importable; install it or add it to PYTHONPATH")
     cfg, target, syms, _files = _setup(args)
     spec = _spec(args, cfg)
+    comparison_addr = getattr(args, "_comparison_addr", args.addr)
     if args.proposal_log:
         if args.parent_score is None:
             raise SystemExit("--proposal-log requires --parent-score")
         generated = permuter.generate_pool(
-            Path(args.source).resolve(), syms, cfg.include, args.function, args.addr,
+            Path(args.source).resolve(), syms, cfg.include, args.function, comparison_addr,
             args.iterations, args.seed, args.max_mutations, args.parent_score,
             Path(args.proposal_log))
         return {"generated": generated, "proposal_log": args.proposal_log,
                 "compiled": 0}
-    res = permuter.permute(Path(args.source).resolve(), spec, cfg, target, args.addr, args.size, syms,
+    res = permuter.permute(Path(args.source).resolve(), spec, cfg, target, comparison_addr, args.size, syms,
                            cfg.include, args.function, args.iterations, args.jobs or 4, args.seed,
                            args.max_mutations, args.temperature, Path(args.out) if args.out else None,
                            Path(args.replay_log) if args.replay_log else None)
-    return {"base_score": res.base_score, "best_score": res.best_score, "exact": res.exact,
+    strict = None
+    if res.exact:
+        with tempfile.TemporaryDirectory(prefix="n64dk-permute-verify-") as name:
+            source = Path(name) / "best.c"; source.write_text(res.best_source)
+            strict = match_source(source, spec, cfg, target, comparison_addr, args.size, syms,
+                                  Path(name) / "build", strict_verification=True)
+    return {"base_score": res.base_score, "best_score": res.best_score,
+            "exploratory_exact": res.exact, "exact": bool(strict and strict.exact),
+            "strict_verification": strict.as_dict() if strict else None,
             "iterations": res.iterations, "improvements": res.history,
             **({"best_source": res.best_source} if args.format == "json" else {})}
 
