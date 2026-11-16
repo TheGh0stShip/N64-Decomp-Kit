@@ -377,9 +377,11 @@ class MatchSession:
     """Persistent session using a caller-supplied authentic match evaluator."""
 
     def __init__(self, store: SessionStore,
-                 evaluator: Callable[[bytes, str, tuple[str, ...], str], Outcome]):
+                 evaluator: Callable[[bytes, str, tuple[str, ...], str], Outcome],
+                 environment: Callable[[bytes, str, tuple[str, ...]], str] | None = None):
         self.store = store
         self.evaluator = evaluator
+        self.environment = environment or getattr(evaluator, "environment", None)
 
     def create(self, context: dict, source: bytes, pipeline: str,
                flags: tuple[str, ...]) -> tuple[str, SessionCandidate]:
@@ -399,11 +401,18 @@ class MatchSession:
                   flags: tuple[str, ...]) -> SessionCandidate:
         source_digest = self.store.cache.put(source)
         context = self.store.context(session_id)
-        candidate_id = _identity({"session": session_id, "source": source_digest,
-                                  "pipeline": pipeline, "flags": flags,
-                                  "toolchain": context.get("toolchain_digest"),
-                                  "includes": context.get("include_closure_digest"),
-                                  "target": context.get("target_text_sha256")})[:24]
+        identity = {"session": session_id, "source": source_digest,
+                    "pipeline": pipeline, "flags": flags,
+                    "toolchain": context.get("toolchain_digest"),
+                    "includes": context.get("include_closure_digest"),
+                    "target": context.get("target_text_sha256")}
+        if self.environment is not None:
+            try:
+                identity["environment"] = self.environment(source, pipeline, tuple(flags))
+            except Exception as error:
+                # Unknown external state must never reuse a stale candidate.
+                identity["environment"] = f"unavailable:{time.time_ns()}:{error}"
+        candidate_id = _identity(identity)[:24]
         existing = self.store.get(session_id, candidate_id)
         # Successful observations are immutable.  Failures may be transient (lock, OOM,
         # compiler crash) and are deliberately retried while every attempt remains in the

@@ -1665,7 +1665,7 @@ class ManifestTests(unittest.TestCase):
     def test_sweep_order(self):
         specs = sweep_specs(["kmc+builtin", "ido5.3"])
         self.assertEqual(specs[0].flags, ["-O2", "-G0", "-mips3", "-mgp32", "-mfp32"])
-        self.assertEqual(len(specs), 48)
+        self.assertEqual(len(specs), 50)                        # 24 per pipeline, and IDO's two -mips1 settings last
         self.assertEqual(specs[24].pipeline, "ido5.3")
         self.assertEqual(non_axis_flags(["-O2", "-G", "0", "-DX", "-mips2", "-nostdinc", "-g"]), ["-DX", "-nostdinc"])
         extended = sweep_specs(["kmc+builtin"], extended=True)

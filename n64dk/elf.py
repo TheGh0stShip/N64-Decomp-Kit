@@ -5,7 +5,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-R_MIPS_32, R_MIPS_26, R_MIPS_HI16, R_MIPS_LO16 = 2, 4, 5, 6
+R_MIPS_32, R_MIPS_26, R_MIPS_HI16, R_MIPS_LO16, R_MIPS_PC16 = 2, 4, 5, 6, 10
 
 
 @dataclass
@@ -128,6 +128,16 @@ class Elf:
                     struct.pack_into(">I", buf, hoff, (hword & 0xFFFF0000) | (((full + 0x8000) >> 16) & 0xFFFF))
                 value = (word & 0xFFFF0000) | ((s + lo) & 0xFFFF)
                 struct.pack_into(">I", buf, off, value)
+            elif rtype == R_MIPS_PC16:
+                # a branch to a label outside the object (hand-written code branches between routines):
+                # the field holds the word offset from the delay slot, with the addend stored in place
+                held = word & 0xFFFF
+                held = (held - 0x10000 if held & 0x8000 else held) << 2 if addend is None else addend
+                place = bases.get(name, 0) + off
+                distance = s + held - place
+                if distance & 3 or not -0x20000 <= distance < 0x20000:
+                    raise ValueError(f"branch out of range at 0x{off:X} in {name}")
+                struct.pack_into(">I", buf, off, (word & 0xFFFF0000) | ((distance >> 2) & 0xFFFF))
             else:
                 raise ValueError(f"unsupported relocation type {rtype} at 0x{off:X} in {name}")
         if pending_hi:

@@ -53,6 +53,7 @@ class Outcome:
     proof_required: bool = False
     proof: object | None = None
     defined: dict[str, int] = field(default_factory=dict)   # global symbols the object defines
+    ambiguous_addresses: list[int] = field(default_factory=list)
 
     @property
     def exact(self) -> bool:
@@ -79,6 +80,8 @@ class Outcome:
         if self.result is not None:
             out.update(self.result.as_dict())
             out["exact"] = self.exact
+        if self.ambiguous_addresses:
+            out["ambiguous_addresses"] = [f"0x{value:08X}" for value in self.ambiguous_addresses]
         if self.error:
             out["error"] = self.error
         return out
@@ -122,8 +125,10 @@ def match_source(source: Path, spec: BuildSpec, cfg: Config, target: Target, vra
             break
     if searching:
         if len(found_exact) != 1:
-            out.error = ("compiled .text has ambiguous exact locations: " +
-                         ", ".join(f"0x{value:08X}" for value in found_exact[:16])
+            out.ambiguous_addresses = sorted(set(found_exact))
+            out.error = (("compiled .text is exact at more than one ROM location: " +
+                          ", ".join(f"0x{value:08X}" for value in found_exact[:16]) +
+                          "; pass --addr to choose one")
                          if found_exact else "compiled .text did not compare exactly at any located position")
             out.result = None
         else:
@@ -270,6 +275,10 @@ def sweep_specs(pipelines: list[str], extended: bool = False) -> list[BuildSpec]
             else:
                 flags += [*_l(G), *_l(isa)]
             out.append(BuildSpec(pipe, flags))
+        if pipe.startswith("ido"):
+            # some titles were built for the first instruction set (seen in published settings of
+            # finished decompilations); last, because it is rare
+            out += [BuildSpec(pipe, [opt, "-mips1", *IDO_FIXED, "-G", "0"]) for opt in ("-O2", "-O1")]
     if extended:
         additions = []
         for spec in out:

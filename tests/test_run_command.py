@@ -100,5 +100,51 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(option, buffer.getvalue())
 
 
+class DeclareAssumedTest(unittest.TestCase):
+    def test_only_self_describing_addresses_are_declared_and_the_verifier_decides(self):
+        import argparse
+        import shutil
+        import tempfile
+        from n64dk.commands import run as runmod
+        from n64dk.match import resolve as resolvemod
+        root = Path(tempfile.mkdtemp(prefix="n64dk-declare-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        store = resolvemod.CaseStore(root / "state")
+        for index, assumption in enumerate([
+                {"kind": "symbol", "name": "D_80046354", "address": "0x80046354"},
+                {"kind": "symbol", "name": "gPlayer", "address": "0x80050000"},          # a claim, not a restatement
+                {"kind": "symbol", "name": "D_80046354", "address": "0x80046358"},      # name and address disagree
+                {"kind": "section", "name": ".rodata", "address": "0x80060000"}]):
+            case = resolvemod.Case(resolvemod.case_id("main", 0x80001000 + 0x40 * index, 0x20), "main", f"f{index}",
+                                   0x80001000 + 0x40 * index, 0x20, "digest", status="assumed",
+                                   strict={"verdict": "assumed", "assumptions": [assumption]})
+            store.put(case)
+        store.close()
+        seen = {}
+
+        def fake_resolve_hard(options):
+            seen["symbols"], seen["only"], seen["refine"] = options.symbols, options.only_statuses, options.refine
+            return {"statuses": {"exact": 1, "assumed": 3}}
+
+        def options(**overrides):
+            return argparse.Namespace(symbols=["symbol_addrs.txt"], **overrides)
+        result = runmod.declare_assumed(fake_resolve_hard, options, root / "state", "main", root / "main", {})
+        declared = (root / "main" / "declared_symbols.txt").read_text()
+        self.assertEqual(declared, "D_80046354 = 0x80046354;\n")
+        self.assertEqual((result["declared"], result["waiting"], result["promoted"], result["still_assumed"]), (1, 4, 1, 3))
+        self.assertEqual(seen["symbols"], ["symbol_addrs.txt", str(root / "main" / "declared_symbols.txt")])
+        self.assertEqual((seen["only"], seen["refine"]), (("assumed",), None))
+
+    def test_nothing_to_declare_runs_nothing(self):
+        import shutil
+        import tempfile
+        from n64dk.commands import run as runmod
+        root = Path(tempfile.mkdtemp(prefix="n64dk-declare-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        result = runmod.declare_assumed(lambda options: self.fail("no pass expected"), None, root / "state", "main",
+                                        root / "main", {})
+        self.assertEqual(result, {"declared": 0, "promoted": 0, "waiting": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

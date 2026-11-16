@@ -12,11 +12,20 @@ use instead of assuming "ROM 0x1000.. copied to the header entry".
 Instructions are translated once per address into small Python functions (cached until
 the page holding them is written), which keeps long decompression loops affordable.
 
-Out of scope by design: interrupts, TLB, FPU arithmetic, RSP/RDP.  Execution stops with
-a reason when it reaches any of these.
+Floating point is computed (a loader may scale a size or a time before it unpacks anything);
+the rounding mode is always to nearest and no floating-point exception is raised.  A branch or
+jump to itself ends the run (``idle loop``): without interrupts nothing can follow it.
+
+Mapped addresses go through the translation entries the program itself writes (``tlbwi``,
+``tlbwr``): a loader may unpack the game, map it at a low address and jump there.  An address
+no entry maps stops the run.
+
+Out of scope by design: interrupts, RSP/RDP.  Execution stops with a reason when it reaches
+either.
 """
 from __future__ import annotations
 
+import math
 import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -66,6 +75,35 @@ def _sext(v: int, bits: int) -> int:
     return (v - (1 << bits)) & M64 if v >> (bits - 1) else v
 
 
+_F32, _F64 = struct.Struct(">f"), struct.Struct(">d")
+_I32, _I64 = struct.Struct(">I"), struct.Struct(">Q")
+SR_FR = 0x04000000
+
+
+def _float_bits(value: float, double: bool) -> int:
+    if double:
+        return _I64.unpack(_F64.pack(value))[0]
+    try:
+        return _I32.unpack(_F32.pack(value))[0]
+    except OverflowError:                                    # too large for a single: infinity
+        return 0xFF800000 if value < 0 else 0x7F800000
+
+
+def _bits_float(bits: int, double: bool) -> float:
+    return _F64.unpack(_I64.pack(bits & M64))[0] if double else _F32.unpack(_I32.pack(bits & M32))[0]
+
+
+def _to_integer(value: float, how: int, bits: int) -> int:
+    """``value`` as a ``bits``-wide integer: ``how`` 0 nearest (ties to even), 1 toward zero,
+    2 up, 3 down.  What does not fit gives the largest value, as the processor does."""
+    limit = (1 << (bits - 1)) - 1
+    try:
+        result = (round(value), int(value), math.ceil(value), math.floor(value))[how]
+    except (OverflowError, ValueError):                      # infinity or not a number
+        return limit
+    return result & ((1 << bits) - 1) if -limit - 1 <= result <= limit else limit
+
+
 def _tdiv(x: int, y: int) -> int:
     q = abs(x) // abs(y)
     return q if (x < 0) == (y < 0) else -q
@@ -107,6 +145,36 @@ class EmuResult:
     image_reads: list[tuple[int, int]] = field(default_factory=list)     # RAM read (track_reads only)
     image_executed: list[tuple[int, int]] = field(default_factory=list)  # RAM lines executed
     first_args: dict[int, tuple] = field(default_factory=dict)  # call target -> ($a0..$a3, $sp, step) on entry
+    mappings: list[tuple[int, int, int]] = field(default_factory=list)  # (virtual, size, physical) at the image
+
+    def physical(self, vaddr: int) -> int | None:
+        """Where ``vaddr`` was in RAM when the image was taken; None for an address nothing maps."""
+        v = vaddr & M32
+        if 0x80000000 <= v < 0xC0000000:
+            return v & 0x1FFFFFFF
+        for virtual, size, physical in self.mappings:
+            if virtual <= v < virtual + size:
+                return physical + v - virtual
+        return None
+
+    def linear(self, vaddr: int, lo: int, hi: int) -> tuple[int, int, int]:
+        """The part of physical ``[lo, hi)`` that is mapped in one straight run around ``vaddr``:
+        ``(virtual address of its start, physical start, physical end)``.  For a directly
+        mapped address that is all of it."""
+        v = vaddr & M32
+        here = self.physical(v)
+        if here is None or not lo <= here < hi or 0x80000000 <= v < 0xC0000000:
+            return lo | 0x80000000, lo, hi
+        shift = v - here                                     # along the run, virtual = physical + shift
+        runs: list[list[int]] = []
+        for start, end in sorted((p, p + n) for virtual, n, p in self.mappings if virtual - p == shift):
+            if runs and start <= runs[-1][1]:
+                runs[-1][1] = max(runs[-1][1], end)
+            else:
+                runs.append([start, end])
+        start, end = next((run for run in runs if run[0] <= here < run[1]), (here, here + 1))
+        start, end = max(lo, start), min(hi, end)
+        return (start + shift) & M32, start, end
 
     def pieces(self, at: str = "image") -> list[tuple[int, int, str, int | None]]:
         """Written RAM as (phys start, phys end, kind, ROM source) runs; see :meth:`segments`."""
@@ -179,8 +247,11 @@ class Machine:
         self.ram_size = ram_size
         self.gpr = [0] * 32
         self.fpr = [0] * 32
+        self.fcc = False                         # the floating-point condition flag
         self.hi = self.lo = 0
         self.cop0 = [0] * 32
+        self.tlb: list[tuple[int, int, int, int, int] | None] = [None] * 32   # (mask, vpn2, page size, lo0, lo1)
+        self.tlb_next = 31                       # the entry tlbwr writes next
         self.count = 0
         self.pi = [0] * 16
         self.sp_mem = bytearray(0x2000)
@@ -219,7 +290,46 @@ class Machine:
         v = vaddr & M32
         if 0x80000000 <= v < 0xC0000000:
             return v & 0x1FFFFFFF
+        for entry in self.tlb:
+            if entry is not None and v & entry[0] == entry[1]:
+                half = entry[3] if v & entry[2] else entry[4]
+                if half & 2:                                 # valid
+                    return ((((half >> 6) & 0xFFFFFF) << 12) & ~(entry[2] - 1) & 0xFFFFFFFF) | (v & (entry[2] - 1))
         raise Stop(f"unmapped address 0x{v:08X} (TLB)", self.pc)
+
+    def tlb_op(self, fn: int) -> None:
+        """``tlbr`` (1), ``tlbwi`` (2), ``tlbwr`` (6), ``tlbp`` (8)."""
+        c = self.cop0
+        if fn in (2, 6):
+            index = c[0] & 31 if fn == 2 else self.tlb_next
+            if fn == 6:
+                self.tlb_next = 31 if self.tlb_next <= (c[6] & 31) else self.tlb_next - 1
+            spread = (c[5] & 0x01FFE000) | 0x1FFF            # PageMask plus the bits inside a page pair
+            size = (spread + 1) >> 1
+            # (compare mask, tag, page size, the odd page, the even page)
+            self.tlb[index] = (~spread & M32, c[10] & ~spread & M32, size, c[3] & M32, c[2] & M32)
+            self.decoded.clear()                             # what an address means has changed
+            self.code_pages.clear()
+        elif fn == 8:
+            tag = c[10] & M32
+            hit = next((i for i, e in enumerate(self.tlb) if e is not None and tag & e[0] == e[1]), None)
+            c[0] = 0x80000000 if hit is None else hit
+        elif fn == 1:
+            entry = self.tlb[c[0] & 31]
+            if entry is not None:
+                c[5], c[10], c[3], c[2] = (~entry[0] & 0x01FFE000), entry[1], entry[3], entry[4]
+
+    def mappings(self) -> list[tuple[int, int, int]]:
+        """Valid translations as ``(virtual, size, physical)``, in address order."""
+        out = []
+        for entry in self.tlb:
+            if entry is None:
+                continue
+            _mask, tag, size, odd, even = entry
+            for half, virtual in ((even, tag), (odd, tag + size)):
+                if half & 2:
+                    out.append((virtual, size, (((half >> 6) & 0xFFFFFF) << 12) & ~(size - 1) & 0xFFFFFFFF))
+        return sorted(out)
 
     def read(self, vaddr: int, size: int) -> int:
         p = self._phys(vaddr)
@@ -313,6 +423,65 @@ class Machine:
             return self.count
         return self.cop0[reg]
 
+    # ---- floating point ----------------------------------------------------------
+    def fget(self, index: int, double: bool) -> int:
+        """Raw bits of a register.  With the FR bit clear a double is a pair of registers."""
+        if not double:
+            return self.fpr[index] & M32
+        if self.cop0[12] & SR_FR:
+            return self.fpr[index] & M64
+        return ((self.fpr[index | 1] & M32) << 32) | (self.fpr[index & ~1] & M32)
+
+    def fset(self, index: int, bits: int, double: bool) -> None:
+        if not double:
+            self.fpr[index] = bits & M32
+        elif self.cop0[12] & SR_FR:
+            self.fpr[index] = bits & M64
+        else:
+            self.fpr[index & ~1], self.fpr[index | 1] = bits & M32, (bits >> 32) & M32
+
+    def fpu(self, fmt: int, fn: int, fs: int, ft: int, fd: int) -> None:
+        """One COP1 computation: ``fmt`` 16 single, 17 double, 20 word, 21 long."""
+        wide = fmt in (17, 21)
+        if fmt in (20, 21):                                  # an integer source: conversions only
+            raw = self.fget(fs, wide)
+            value = float(_s64(raw) if wide else _s32(raw))
+            if fn in (32, 33):
+                self.fset(fd, _float_bits(value, fn == 33), fn == 33)
+                return
+            raise Stop("FPU arithmetic on an integer format", self.pc)
+        x = _bits_float(self.fget(fs, wide), wide)
+        if fn >= 48:                                         # compare: bit 0 unordered, 1 equal, 2 less
+            y = _bits_float(self.fget(ft, wide), wide)
+            if x != x or y != y:
+                self.fcc = bool(fn & 1)
+            else:
+                self.fcc = bool((fn & 2 and x == y) or (fn & 4 and x < y))
+            return
+        if fn < 4:
+            y = _bits_float(self.fget(ft, wide), wide)
+            try:
+                result = (x + y, x - y, x * y, x / y if fn == 3 else 0.0)[fn]
+            except ZeroDivisionError:
+                result = math.nan if x == 0 or x != x else math.copysign(math.inf, x) * math.copysign(1.0, y)
+            except OverflowError:
+                result = math.inf
+            self.fset(fd, _float_bits(result, wide), wide)
+        elif fn == 4:
+            self.fset(fd, _float_bits(math.sqrt(x) if x >= 0 else math.nan, wide), wide)
+        elif fn in (5, 6, 7):                                # abs, mov, neg: on the bits
+            raw = self.fget(fs, wide)
+            sign = 1 << (63 if wide else 31)
+            self.fset(fd, (raw & ~sign, raw, raw ^ sign)[fn - 5], wide)
+        elif 8 <= fn <= 15:                                  # round/trunc/ceil/floor to long, then to word
+            self.fset(fd, _to_integer(x, fn & 3, 64 if fn < 12 else 32), fn < 12)
+        elif fn in (36, 37):                                 # cvt.w, cvt.l: the current mode, nearest
+            self.fset(fd, _to_integer(x, 0, 64 if fn == 37 else 32), fn == 37)
+        elif fn in (32, 33) and (fn == 33) != wide:          # cvt.s from double, cvt.d from single
+            self.fset(fd, _float_bits(x, fn == 33), fn == 33)
+        else:
+            raise Stop(f"unimplemented COP1 function 0x{fn:02X}", self.pc)
+
     def eret(self, pc: int) -> int:
         target = self.cop0[14] & M32
         self.cop0[12] &= ~2
@@ -338,7 +507,7 @@ class Machine:
             fn = ns["f"]
             self._templates[key] = fn
         self.decoded[pc] = fn
-        self.code_pages.setdefault((pc & 0x1FFFFFFF) >> 12, []).append(pc)
+        self.code_pages.setdefault(self._phys(pc) >> 12, []).append(pc)
         return fn
 
     RETURN_TRAP = 0x80000010   # inside the TLB-miss vector: never a call's legitimate return address
@@ -362,10 +531,14 @@ class Machine:
         if self.snapshot is None:
             executed = bytearray(len(self.dirty))
             for pc in self.decoded:
-                p = pc & 0x1FFFFFFF
+                try:
+                    p = self._phys(pc)
+                except Stop:
+                    continue
                 if p < self.ram_size:
                     executed[p >> LINE] = 1
-            self.snapshot = (steps, bytes(self.ram), bytes(self.dirty), bytes(self.reads), bytes(executed))
+            self.snapshot = (steps, bytes(self.ram), bytes(self.dirty), bytes(self.reads), bytes(executed),
+                             self.mappings())
 
     # ---- execution -------------------------------------------------------------
     def run(self, max_steps: int = 50_000_000, stop_after_handoff: int = 200_000,
@@ -384,7 +557,11 @@ class Machine:
         steps = self.steps
         try:
             while steps < deadline:
-                line = (pc & 0x1FFFFFFF) >> LINE
+                if pc >> 30 == 2:
+                    line = (pc & 0x1FFFFFFF) >> LINE
+                else:                                        # a mapped address: where it really is
+                    self.pc = pc
+                    line = self._phys(pc) >> LINE
                 if line != cur_line:
                     cur_line = line
                     if line < nlines and dirty[line] and line >> (12 - LINE) not in seen:
@@ -435,13 +612,15 @@ class Machine:
                 reason = "ran past the first handoff"
         except Stop as stop:
             reason = stop.reason  # pc still holds the faulting instruction
+            if reason == "idle loop" and (handoffs or self.erets):
+                reason = "ran past the first handoff"
         self.steps, self.pc = steps, pc
         res = EmuResult(steps, reason, pc & M32, self.dmas, _line_ranges(dirty), handoffs, self.erets,
                         _ranges(self.cart_pages), list(self.probes), dict(self.calls), self.ram)
         res.first_args = dict(self.first_args)
         if self.snapshot is not None:
-            step, ram, written, reads, executed = self.snapshot
-            res.image_step, res.image_ram = step, ram
+            step, ram, written, reads, executed, mappings = self.snapshot
+            res.image_step, res.image_ram, res.mappings = step, ram, mappings
             res.image_written = _line_ranges(bytearray(written))
             res.image_reads = _line_ranges(bytearray(reads))
             res.image_executed = _line_ranges(bytearray(executed))
@@ -529,11 +708,15 @@ def _translate(pc: int, word: int, track_reads: bool = False) -> str:
         dest = ((pc + 4) & 0xF0000000) | ((word & 0x3FFFFFF) << 2)
         body = [f"g[31] = {sx32(pc + 8)}", f"calls[{dest}] += 1", f"m.last_call = {dest}"] if op == 3 else []
         body.append(f"return {dest}")
+        if op == 2 and dest == pc:
+            body = stop("idle loop")
     elif op in (4, 5, 6, 7, 20, 21, 22, 23):
         base = op & ~16
         cond = {4: f"{A} == {B}", 5: f"{A} != {B}", 6: f"({A} >> 63) or not {A}",
                 7: f"not ({A} >> 63) and {A} != 0"}[base]
         body = branch(cond, op >= 20)
+        if op == 4 and rs == rt and target == pc:
+            body = stop("idle loop")
     elif op in (8, 9):
         body = setr(rt, f"X({A} + {simm})")
     elif op in (24, 25):
@@ -557,25 +740,29 @@ def _translate(pc: int, word: int, track_reads: bool = False) -> str:
             body = [f"m.cop0[{rd}] = {B} & M32"]
         elif rs == 16 and fn == 0x18:
             body = [f"return m.eret({pc})"]
+        elif rs == 16 and fn in (1, 2, 6, 8):
+            body = [f"m.tlb_op({fn})"]
         else:
-            body = []  # TLB maintenance, wait
-    elif op == 17:  # COP1: moves and condition branches only
+            body = []  # wait
+    elif op == 17:  # COP1
         if rs == 0:
             body = setr(rt, f"X(m.fpr[{rd}])")
         elif rs == 1:
-            body = setr(rt, f"m.fpr[{rd}] & M64")
+            body = setr(rt, f"m.fget({rd}, True)")
         elif rs == 2:
-            body = setr(rt, "0")
+            body = setr(rt, "int(m.fcc) << 23")
         elif rs == 4:
             body = [f"m.fpr[{rd}] = {B} & M32"]
         elif rs == 5:
-            body = [f"m.fpr[{rd}] = {B}"]
+            body = [f"m.fset({rd}, {B}, True)"]
         elif rs == 6:
             body = []
-        elif rs == 8:  # bc1f/bc1t/bc1fl/bc1tl with the condition flag clear
-            body = branch("True" if not rt & 1 else "False", bool(rt & 2))
+        elif rs == 8:  # bc1f/bc1t/bc1fl/bc1tl
+            body = branch("m.fcc" if rt & 1 else "not m.fcc", bool(rt & 2))
+        elif rs in (16, 17, 20, 21):
+            body = [f"m.pc = {pc}", f"m.fpu({rs}, {fn}, {rd}, {rt}, {sa})"]
         else:
-            body = stop("FPU arithmetic")
+            body = stop("unimplemented COP1 format")
     elif op == 47:
         body = []  # cache
     elif op in (32, 33, 35, 36, 37, 39, 55, 48, 49, 53):
@@ -583,7 +770,7 @@ def _translate(pc: int, word: int, track_reads: bool = False) -> str:
         fast = {1: "ram[p]", 2: "U16(ram, p)[0]", 4: "U32(ram, p)[0]", 8: "U64(ram, p)[0]"}[size]
         conv = {32: "sext(v, 8)", 33: "sext(v, 16)", 35: "X(v)", 48: "X(v)"}.get(op, "v")
         if op in (49, 53):
-            dst = f"m.fpr[{rt}] = v"
+            dst = f"m.fset({rt}, v, {op == 53})"
         else:
             dst = f"g[{rt}] = {conv}" if rt else "pass"
         body = [f"a = ({A} + {simm}) & M32", "p = a & 0x1FFFFFFF",
@@ -594,7 +781,7 @@ def _translate(pc: int, word: int, track_reads: bool = False) -> str:
         body = [f"a = ({A} + {simm}) & M32", f"v = m.lwlr({op}, a, {B})"] + setr(rt, "v")
     elif op in (40, 41, 43, 63, 57, 61, 56):
         size = {40: 1, 41: 2, 43: 4, 56: 4, 57: 4, 63: 8, 61: 8}[op]
-        src = f"m.fpr[{rt}]" if op in (57, 61) else B
+        src = f"m.fget({rt}, {op == 61})" if op in (57, 61) else B
         mask = {1: "0xFF", 2: "0xFFFF", 4: "M32", 8: "M64"}[size]
         pack = {1: "P8", 2: "P16", 4: "P32", 8: "P64"}[size]
         body = [f"a = ({A} + {simm}) & M32", "p = a & 0x1FFFFFFF", f"v = {src} & {mask}",

@@ -39,6 +39,7 @@ import tomllib
 from pathlib import Path
 
 from ..cli import command
+from ..resources import plan_jobs
 from ..match import images as imagemod
 from ..match import resolve as resolvemod
 
@@ -76,6 +77,49 @@ def _identity(**values) -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
 
 
+CALIBRATION_SIZES = (0x18, 0x80)      # small enough to match from a draft, large enough to depend on the recipe
+
+
+RECIPE_DOUBT = 0.4         # share of an image whose marks contradict its configured recipe that triggers calibration
+DOUBT_SAMPLE = 96
+
+
+def calibrate_recipe(resolve_hard, resolve_options, state: Path, image: str, rows, skip, sample: int,
+                     delta: int | None = None) -> dict:
+    """Resolve a spread sample of small functions with every available recipe tried on each, and
+    return the recipe most of the byte-identical ones were built with.
+
+    A title's compiler and optimisation level are not known in advance, and the configured recipe
+    is a guess (for a project made by ``decompile-init``, a fingerprint).  The sample is taken
+    across the whole address range, skipping what donors already recovered, so library code built
+    with another compiler does not decide the answer.  The cases it produces stay in the store."""
+    low, high = CALIBRATION_SIZES
+    eligible = [row for row in rows if low <= row[2] <= high and row[1] not in skip]
+    if not eligible:
+        return {"sample": 0, "identical": 0, "recipes": {}, "chosen": None, "reason": "no functions in the size window"}
+    every = max(1, len(eligible) // sample)
+    result = resolve_hard(resolve_options(min_size=low, max_size=high, every=every, limit=sample,
+                                          cross_recipes=64, refine=None, budget=40))
+    store = resolvemod.CaseStore(state)
+    try:
+        cases = [case for case in store.all() if case.image == image and case.status in ("exact", "assumed")
+                 and low <= case.size <= high]
+    finally:
+        store.close()
+    tally: dict[str, int] = {}
+    for case in cases:
+        if case.recipe:
+            tally[case.recipe] = tally.get(case.recipe, 0) + 1
+    ranked = sorted(tally.items(), key=lambda item: (-item[1], item[0]))
+    chosen = None
+    if ranked and ranked[0][1] >= 3:
+        pipeline, _, flags = ranked[0][0].partition(" ")
+        chosen = {"label": ranked[0][0], "pipeline": pipeline, "flags": flags, "matched": ranked[0][1]}
+    return {"sample": result.get("functions"), "identical": len(cases), "recipes": dict(ranked[:8]),
+            "chosen": chosen, "seconds": result.get("seconds"),
+            "reason": None if chosen else "fewer than three sample functions were byte-identical under any recipe"}
+
+
 def refine_settings(settings: dict, args):
     """``[run.refine]`` (or a per-image override) merged with the command line; None when no
     refiner command is configured."""
@@ -90,8 +134,48 @@ def refine_settings(settings: dict, args):
     return built
 
 
+def declare_assumed(resolve_hard, resolve_options, state: Path, image: str, folder: Path, overrides: dict) -> dict:
+    """Declare the addresses that byte-identical (``assumed``) cases lean on and verify those cases
+    again.
+
+    Only a symbol whose name states its own address (``D_80123456`` at 0x80123456) is declared: the
+    declaration says nothing the name did not, and the address was read from the target's own
+    instructions.  Any other assumption (a named symbol, a section) is left for a person.  The
+    verdict still comes from the strict verifier; a case it does not call exact stays ``assumed``."""
+    store = resolvemod.CaseStore(state)
+    try:
+        names: dict[str, int] = {}
+        waiting = 0
+        for case in store.all():
+            if case.image != image or case.status != "assumed":
+                continue
+            waiting += 1
+            for item in (case.strict or {}).get("assumptions", []):
+                try:
+                    address = int(str(item.get("address")), 16)
+                except ValueError:
+                    continue
+                if item.get("kind") == "symbol" and item.get("name") == f"D_{address:08X}":
+                    names[item["name"]] = address
+    finally:
+        store.close()
+    if not names:
+        return {"declared": 0, "promoted": 0, "waiting": waiting}
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "declared_symbols.txt"
+    path.write_text("".join(f"{name} = 0x{address:08X};\n" for name, address in sorted(names.items(), key=lambda r: r[1])))
+    options = resolve_options(**overrides, refine=None, only_statuses=("assumed",))
+    options.symbols = list(options.symbols) + [str(path)]
+    report = resolve_hard(options)
+    statuses = report.get("statuses") or {}
+    return {"declared": len(names), "file": str(path), "waiting": waiting, "promoted": statuses.get("exact", 0),
+            "still_assumed": statuses.get("assumed", 0)}
+
+
 @command("decompile-run", "Drive every configured image through boundaries, donors, resolution, strict queue and ledger")
 def decompile_run(args):
+    if getattr(args, "donors", None) and not Path(args.donors).is_file():
+        raise SystemExit(f"--donors {args.donors}: no such file")
     project = Path(args.project).resolve()
     out = Path(args.out).resolve()
     if (out == project or project in out.parents) and not (project / ".n64dk" == out or
@@ -105,14 +189,30 @@ def decompile_run(args):
                          "vram_delta for linear images, catalogue, manifests)")
     names = sorted(registry) if args.all_images or not args.image else args.image
     events = out / "events.jsonl"
-    jobs = args.jobs or os.cpu_count() or 8
+    resource_plan = plan_jobs(args.jobs, reserve_mb=args.memory_reserve_mb or None,
+                              memory_per_job_mb=args.worker_memory_mb or None)
+    jobs = resource_plan.jobs
     started = time.time()
 
     def emit(kind: str, **fields) -> None:
         with events.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"time": round(time.time(), 3), "event": kind, **fields}) + "\n")
 
-    report = {"project": str(project), "images": {}}
+    report = {"project": str(project), "images": {}, "resources": resource_plan.as_dict()}
+    emit("resource-plan", **resource_plan.as_dict())
+    # a library of earlier runs: every other title in it is a donor, and this run joins it at the end
+    from ..match import library as libmod
+    library = Path(args.library).expanduser().resolve() if getattr(args, "library", None) else None
+    first = imagemod.resolve(project, "main" if "main" in registry else sorted(registry)[0])
+    title_key = libmod.rom_key(Path(first.path).read_bytes())
+    specs_seen = []
+    # every function start of the title, whichever image it is in: a unit may call across images
+    title_starts: set[int] = set()
+    for name in sorted(registry):
+        try:
+            title_starts.update(vram for _n, vram, _s in imagemod.resolve(project, name).rows())
+        except Exception:                                    # noqa: BLE001 - an image without a catalogue
+            pass
     for name in names:
         spec = imagemod.resolve(project, name)
         settings = _settings(project, spec.name)
@@ -153,13 +253,14 @@ def decompile_run(args):
 
         # --- 2. donors
         recovered: set[int] = set()
-        if args.donors and "donors" not in args.skip_stage:
+        library_identity = libmod.identity(library, title_key)
+        if (args.donors or library_identity) and "donors" not in args.skip_stage:
             def donors():
                 from ..match import transplant
                 from ..match.engine import Target
-                index, _stats = transplant.build_index(
-                    transplant.load_donors(args.donors, args.donor or None, args.exclude_donor or None),
-                    args.donor_index or out / "donor_index.json")
+                specs = (transplant.load_donors(args.donors, args.donor or None, args.exclude_donor or None)
+                         if args.donors else []) + libmod.donors(library, title_key)
+                index, _stats = transplant.build_index(specs, args.donor_index or out / "donor_index.json")
                 target = Target(data, delta, (0, len(data)))
                 skip = [(v, v + s) for v, s in ((r.vram, r.size) for m in manifests
                                                 for r in _rows_of(m, delta))]
@@ -167,22 +268,36 @@ def decompile_run(args):
                 toolchain = args.toolchain_dir or os.environ.get("N64DK_TOOLCHAIN") or \
                     load_config(project, None, None).toolchain_root
                 result = transplant.run(None, target, rows, index, skip=skip, out_dir=folder / "donors",
-                                        jobs=min(jobs, 4), toolchain_root=Path(toolchain) if toolchain else None)
+                                        jobs=min(jobs, 4), toolchain_root=Path(toolchain) if toolchain else None,
+                                        other_starts=title_starts - {v for _n, v, _s in rows})
                 keep = {k: v for k, v in result.items()
                         if not k.startswith("_") and (not isinstance(v, (list, dict)) or k in ("verdicts", "timing_s"))}
                 by_name = {n: v for n, v, _s in rows}
                 keep["verified"] = [{"functions": r.get("functions", []), "vram": r.get("target_vram"),
                                      "size": r.get("size"), "donor": r.get("donor"), "unit": r.get("donor_unit"),
+                                     "source_kind": ("assembly" if Path(str(r.get("donor_unit", ""))).suffix.lower()
+                                                     in (".s", ".asm") else "c"),
                                      "function_vrams": [by_name[n] for n in r.get("functions", []) if n in by_name]}
                                     for r in result.get("rows", [])
                                     if r.get("verdict") == transplant.EXACT_VERDICT]
+                keep["assumed"] = [{"functions": r.get("functions", []), "vram": r.get("target_vram"),
+                                    "size": r.get("size"), "donor": r.get("donor"), "unit": r.get("donor_unit"),
+                                    "source_kind": ("assembly" if Path(str(r.get("donor_unit", ""))).suffix.lower()
+                                                    in (".s", ".asm") else "c"),
+                                    "awaiting": r.get("awaiting") or {},
+                                    "function_vrams": [v for _n, v, _s in rows
+                                                       if int(str(r.get("target_vram")), 16) <= v
+                                                       < int(str(r.get("target_vram")), 16) + (r.get("size") or 0)]}
+                                   for r in result.get("rows", [])
+                                   if r.get("verdict") == transplant.ASSUMED_VERDICT]
                 return keep
             try:
                 image_report["donors"], _cached = _stage(folder, "donors", donors, args.redo,
                                                           _identity(base=stage_identity, donors=args.donors,
                                                                     selected=args.donor,
-                                                                    excluded=args.exclude_donor))
-                for row in image_report["donors"].get("verified", []):
+                                                                    excluded=args.exclude_donor,
+                                                                    library=library_identity))
+                for row in image_report["donors"].get("verified", []) + image_report["donors"].get("assumed", []):
                     recovered.update(int(v) for v in row.get("function_vrams", []))
             except Exception as error:
                 image_report["donors"] = {"error": str(error)[-300:]}
@@ -190,8 +305,7 @@ def decompile_run(args):
                  verified=len(image_report["donors"].get("verified", [])) if isinstance(image_report["donors"], dict) else 0)
 
         # --- 3. resolve
-        if "resolve" not in args.skip_stage:
-            from .resolve import resolve_hard
+        def resolve_options(**overrides):
             options = argparse.Namespace(
                 project=str(project), config=None, toolchain_dir=args.toolchain_dir, normalizer=None, include=[],
                 rom=str(spec.path), vram_delta=spec.vram_delta if spec.delta_source == "declared" else None,
@@ -210,11 +324,71 @@ def decompile_run(args):
                 context_parts="structs,globals,prototypes", proto_confidence=0.9, budget=args.budget,
                 state=str(out / "state"), events=str(events), no_draft=False, no_recipes=False,
                 draft_portfolio=True, draft_options=settings.get("draft_options", ""), force=False,
-                skip_vrams=recovered, addr=None, size=None)
+                skip_vrams=recovered, addr=None, size=None, cross_recipes=None,
+                only_names=getattr(args, "only_names", None),
+                region_recipes=bool(getattr(args, "region_recipes", False) or
+                                    settings.get("region_recipes", False)),
+                unit_recipes=bool(getattr(args, "unit_recipes", False) or
+                                  settings.get("unit_recipes", False)),
+                skip_unknown_search=bool(getattr(args, "skip_unknown_search", False) or
+                                         settings.get("skip_unknown_search", False)))
+            for key, value in overrides.items():
+                setattr(options, key, value)
+            return options
+
+        chosen_recipe = None
+        if "resolve" not in args.skip_stage:
+            from .resolve import resolve_hard
+            # --- 3a. calibrate: measure the title's recipe on a sample of its own functions
+            sample = args.calibrate if args.calibrate is not None else int(settings.get("calibrate", 0) or 0)
+            if sample == 0 and "calibrate" not in args.skip_stage and settings.get("pipeline"):
+                # No calibration asked for: the configured recipe is taken on trust.  When the code's
+                # own marks say most of the image was built another way, measure instead.
+                try:
+                    from ..match import idioms
+                    table = idioms.Table.load()
+                    marked = [(vram, idioms.features(data[vram - delta:vram - delta + size], vram))
+                              for _name, vram, size in rows if size >= 8]
+                    found = idioms.doubt(marked, table, f"{settings['pipeline']} {settings.get('flags', '')}")
+                    if found["share"] >= RECIPE_DOUBT:
+                        image_report["recipe_doubt"] = found
+                        sample = DOUBT_SAMPLE
+                        emit("stage", image=spec.name, stage="recipe-doubt", share=found["share"])
+                except Exception:                            # noqa: BLE001 - a hint, never a reason to stop
+                    pass
+            if sample > 0 and "calibrate" not in args.skip_stage:
+                def calibrate():
+                    return calibrate_recipe(resolve_hard, resolve_options, out / "state", spec.name, rows, recovered,
+                                            sample, delta)
+                try:
+                    image_report["calibrate"], _cached = _stage(
+                        folder, "calibrate", calibrate, args.redo,
+                        _identity(base=stage_identity, sample=sample, donors=sorted(recovered)))
+                    chosen_recipe = image_report["calibrate"].get("chosen")
+                except Exception as error:
+                    image_report["calibrate"] = {"error": str(error)[-300:]}
+                emit("stage", image=spec.name, stage="calibrate",
+                     chosen=(chosen_recipe or {}).get("label"))
+            overrides = {}
+            if chosen_recipe:
+                overrides = {"pipeline": chosen_recipe["pipeline"], "flags": chosen_recipe["flags"]}
             try:
-                image_report["resolve"] = resolve_hard(options)
+                image_report["resolve"] = resolve_hard(resolve_options(**overrides))
             except Exception as error:
                 image_report["resolve"] = {"error": str(error)[-300:]}
+            # --- 3b. declare: settle byte-identical cases that only wait for an address to be declared
+            if (args.declare_assumed or settings.get("declare_assumed")) and "error" not in image_report["resolve"]:
+                try:
+                    image_report["declare"] = declare_assumed(resolve_hard, resolve_options, out / "state",
+                                                              spec.name, folder, overrides)
+                    moved = image_report["declare"].get("promoted", 0)
+                    statuses = image_report["resolve"].get("statuses")
+                    if moved and isinstance(statuses, dict):
+                        statuses["exact"] = statuses.get("exact", 0) + moved
+                        statuses["assumed"] = max(0, statuses.get("assumed", 0) - moved)
+                except Exception as error:
+                    image_report["declare"] = {"error": str(error)[-300:]}
+                emit("stage", image=spec.name, stage="declare", promoted=image_report["declare"].get("promoted"))
 
         # --- 4. strict queue
         store = resolvemod.CaseStore(out / "state")
@@ -247,7 +421,27 @@ def decompile_run(args):
             except Exception as error:
                 image_report["ledger"] = {"error": str(error)[-300:]}
         report["images"][spec.name] = image_report
+        specs_seen.append(spec)
         emit("image-done", image=spec.name)
+    # The tables under queue/ are rewritten by each image's export: one more export, of every
+    # image, leaves them complete (and the library below describes every image, not the last).
+    if len(specs_seen) > 1:
+        store = resolvemod.CaseStore(out / "state")
+        try:
+            report["queue"] = {k: v for k, v in resolvemod.export_queue(
+                store, out / "queue", None, not args.strict_only).items() if k != "skipped"}
+        except Exception as error:
+            report["queue"] = {"error": str(error)[-300:]}
+        finally:
+            store.close()
+    # this run as a donor for other titles (strictly exact functions only)
+    try:
+        symbol_files = [project / s for s in (_settings(project, names[0]).get("symbols") or [])]
+        report["donor"] = libmod.write_donor(out, project, specs_seen, title_key, symbol_files)
+        if library is not None:
+            report["donor"]["registered"] = libmod.register(library, out, title_key)
+    except Exception as error:
+        report["donor"] = {"error": str(error)[-300:]}
     report["seconds"] = round(time.time() - started, 1)
     report["failed_stages"] = {name: _headline(item)["errors"] for name, item in report["images"].items()
                                if _headline(item)["errors"]}
@@ -274,9 +468,11 @@ def _headline(item: dict) -> dict:
     queue = item.get("queue") or {}
     return {"functions": item.get("functions"),
             "donor_verified": sum(len(r.get("functions", [])) for r in donors.get("verified", [])),
+            "donor_assumed": sum(len(r.get("function_vrams", [])) for r in donors.get("assumed", [])),
             "resolved": resolve.get("statuses"), "exact_bytes": resolve.get("exact_bytes"),
             "queued": queue.get("strict_exact"), "queued_strict_exact": queue.get("strict_exact"),
             "awaiting_symbols": queue.get("assumed"), "refine": resolve.get("refine"),
+            "calibrate": item.get("calibrate"), "declare": item.get("declare"),
             "errors": [k for k, v in item.items() if isinstance(v, dict) and "error" in v]}
 
 
@@ -286,11 +482,19 @@ def _markdown(report: dict) -> str:
         head = _headline(item)
         lines += [f"## {name}", "", f"- catalogued functions: {head['functions']}",
                   f"- recovered from donors (verified): {head['donor_verified']}",
+                  f"- identical to a donor unit, awaiting symbols: {head.get('donor_assumed') or 0} "
+                  "(`donors/awaiting_symbols.txt`)",
                   f"- resolution outcomes this run: {head['resolved']}",
                   f"- exact bytes from resolution: {head['exact_bytes']}",
                   f"- queued for integration (strictly exact): {head['queued_strict_exact']}",
                   f"- byte-identical, awaiting symbol declarations: {head.get('awaiting_symbols') or 0} "
                   "(`queue/assumed.tsv`; review `queue/symbols.assumed.txt`, add it to the symbol file, rerun)"]
+        if head.get("calibrate"):
+            info = head["calibrate"]
+            picked = (info.get("chosen") or {}).get("label")
+            lines.append(f"- recipe calibration: {info.get('identical')} of {info.get('sample')} sample functions "
+                         f"byte-identical; " + (f"sweep recipe `{picked}`" if picked
+                                               else f"configured recipe kept ({info.get('reason')})"))
         if head.get("refine"):
             info = head["refine"]
             lines.append(f"- refiner: asked about {info.get('attempted')} cases in {info.get('calls')} calls; "
@@ -314,10 +518,15 @@ def _args(p):
     p.add_argument("--image", action="append", default=[], help="logical image name (repeatable)")
     p.add_argument("--all-images", action="store_true")
     p.add_argument("--out", required=True, help="output directory for state, queue, reports (not a source tree)")
+    p.add_argument("--declare-assumed", action="store_true",
+                   help="declare self-describing data addresses (D_<address>) that byte-identical cases lean on "
+                        "and verify those cases again (default: [run] declare_assumed)")
     p.add_argument("--allow-project-output", action="store_true",
                    help="allow --out in the project outside .n64dk (unsafe for generated state)")
     p.add_argument("--donors", help="donors TOML for transplant (see docs/donors.example.toml)")
     p.add_argument("--donor-index", help="donor index file (default: <out>/donor_index.json)")
+    p.add_argument("--library", help="directory of finished runs: every other title registered there is used "
+                                     "as a donor, and this run registers its own strictly exact functions when it ends")
     p.add_argument("--donor", action="append", default=[], help="use only these donors")
     p.add_argument("--exclude-donor", action="append", default=[],
                    help="leave these donors out (always exclude the target project itself)")
@@ -325,7 +534,11 @@ def _args(p):
     p.add_argument("--pipeline", default="kmc+builtin", help="default pipeline when [run] does not set one")
     p.add_argument("--flags", default="-O2 -G0 -mips3 -mgp32 -mfp32")
     p.add_argument("--jobs", type=int, default=0,
-                   help="parallel builds in total (default: the number of hardware threads)")
+                   help="parallel builds in total (default: adaptive, capped at 4; set "
+                        "N64DK_ALLOW_OVERSUBSCRIBE=1 for an explicit unsafe override)")
+    p.add_argument("--calibrate", type=int,
+                   help="functions sampled to measure the title's recipe before the sweep "
+                        "(default: [run] calibrate, else none)")
     p.add_argument("--refine-command",
                    help="external author for unresolved cases: reads a prompt on stdin, prints C "
                         "(default: [run.refine] command; none configured means the stage is skipped)")
@@ -345,6 +558,14 @@ def _args(p):
                    help="skip the variant search when the best draft scores above this "
                         "(default: [run] search_ceiling, else the resolver's measured default; 0: always search)")
     p.add_argument("--limit", type=int, default=0, help="at most this many functions per image (smallest first)")
+    p.add_argument("--region-recipes", action="store_true",
+                   help="enable the experimental region-recipe retry (measured 3/126; off by default)")
+    p.add_argument("--unit-recipes", action="store_true",
+                   help="enable the experimental nearest-unit recipe retry (measured 0/165; off by default)")
+    p.add_argument("--skip-unknown-search", action="store_true",
+                   help="experimental: skip variant search in unknown-toolchain regions; advisory only by default")
+    p.add_argument("--only-names", action="append",
+                   help="attempt only these functions: comma-separated names or @FILE (one per line); repeatable")
     p.add_argument("--max-size", type=lambda s: int(s, 0), default=0)
     p.add_argument("--min-confidence", type=float, default=0.8)
     p.add_argument("--strict-only", action="store_true", help="queue only strictly exact cases")

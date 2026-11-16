@@ -244,3 +244,64 @@ class RealTransplantTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommonShapeTest(unittest.TestCase):
+    def test_a_unit_is_a_common_shape_only_when_every_function_of_it_is(self):
+        from types import SimpleNamespace as Hit
+        self.assertTrue(tp.common_shape([Hit(template=True)]))
+        self.assertTrue(tp.common_shape([Hit(template=True), Hit(template=True)]))
+        # one getter among functions that stand nowhere else: the unit's place is not in doubt
+        self.assertFalse(tp.common_shape([Hit(template=True), Hit(template=False), Hit(template=False)]))
+        self.assertFalse(tp.common_shape([Hit(template=False)]))
+        self.assertFalse(tp.common_shape([]))
+
+
+class AlternativesTest(unittest.TestCase):
+    def job(self, donor, source, functions=1, masked="m", flags=("-O2",), pipeline="kmc+as"):
+        unit = {"donor": donor, "source": source, "functions": [{}] * functions, "unit_masked": masked,
+                "flags": list(flags), "pipeline": pipeline}
+        return tp.Job([], unit, 0x80001000, 0x40)
+
+    def test_library_units_never_come_before_project_and_sdk_units(self):
+        jobs = [self.job("t0123456789abcdef_main", "main/func_80001000.c"),
+                self.job("sdk_2_0J_libgultra_rom", "src/os/createthread.c", functions=3),
+                self.job("Rugrats64", "src/runtime/create_thread.c")]
+        ordered = sorted(jobs, key=tp.alternative_order)
+        self.assertEqual([job.unit["donor"] for job in ordered],
+                         ["Rugrats64", "sdk_2_0J_libgultra_rom", "t0123456789abcdef_main"])
+
+    def test_the_same_build_from_several_library_versions_is_tried_once(self):
+        jobs = [self.job(f"sdk_2_0{v}_libgultra_rom", "/x/ultralib/src/os/createthread.c",
+                         flags=("-O3", f"-DBUILD_VERSION=VERSION_{v}")) for v in "FHIJKL"]
+        jobs.append(self.job("sdk_2_0J_libgultra_rom", "/x/ultralib/src/os/createthread.c", masked="other",
+                             flags=("-O3", "-DBUILD_VERSION=VERSION_J")))
+        jobs.append(self.job("sdk_2_0J_libultra_rom", "/x/ultralib/src/os/createthread.c", pipeline="ido5.3",
+                             flags=("-O1",)))
+        kept = tp.distinct_alternatives(jobs)
+        self.assertEqual(len(kept), 3)                               # one per distinct code, compiler and flags
+        self.assertGreaterEqual(tp.MAX_ALTERNATIVES, 8)
+
+    def test_different_sources_with_the_same_code_are_both_kept(self):
+        jobs = [self.job("Rugrats64", "src/runtime/create_thread.c"), self.job("sdk_2_0J_libgultra_rom", "src/os/createthread.c")]
+        self.assertEqual(len(tp.distinct_alternatives(jobs)), 2)
+
+
+class AssumedRowsTest(unittest.TestCase):
+    def test_exact_rows_are_chosen_before_rows_awaiting_symbols(self):
+        rows = [{"verdict": tp.ASSUMED_VERDICT, "target_vram": 0x80001000, "size": 0x40, "notes": []},
+                {"verdict": tp.EXACT_VERDICT, "target_vram": 0x80001020, "size": 0x20, "notes": []},
+                {"verdict": tp.ASSUMED_VERDICT, "target_vram": 0x80002000, "size": 0x20, "notes": []}]
+        chosen = tp.select_rows(rows)
+        self.assertEqual([row["verdict"] for row in chosen], ["superseded", tp.EXACT_VERDICT, tp.ASSUMED_VERDICT])
+
+    def test_transfer_reports_where_donor_functions_were_found(self):
+        callee = code(0x03E00008, 0x24020007)
+        caller = donor_fn(0x8030, 0x1234, 0x80200100)
+        unit = make_unit([("callee", callee)], 0x80200100, source="src/b.c")
+        index = tp.Index({"u": unit}, {"D": {"root": ".", "include": [], "delta": 0, "image": ""}})
+        image = image_with(0x80000000, {0x80001000: callee})
+        hits = tp.scan(image, 0x80000000, [("func_80001000", 0x80001000, len(callee))], index)
+        found = tp.transfer(hits)["definitions"]
+        self.assertEqual(found.get(("D", 0x80200100)), {0x80001000})
+        del caller

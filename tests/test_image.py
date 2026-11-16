@@ -4,7 +4,7 @@ import unittest
 
 from n64dk import fixtures, image, survey
 from n64dk.rom import Rom
-from tests.test_emu import SP, T0, T1, addiu, bne, lui, ori, sw, synthetic_rom
+from tests.test_emu import SP, T0, T1, T2, addiu, bne, lui, ori, sw, synthetic_rom
 
 
 def jal(target): return (3 << 26) | ((target >> 2) & 0x3FFFFFF)
@@ -21,6 +21,51 @@ def plain_rom() -> Rom:
     struct.pack_into(">III", data, 0, 0x80371240, 0, 0x80000400)
     struct.pack_into(f">{len(code)}I", data, 0x1000, *code)
     return Rom(bytes(data))
+
+
+def stub_rom() -> Rom:
+    """An ordinary entry routine (stack, call main) whose main writes two instructions into RAM
+    and jumps to them: a stub that produces the program, with nothing staged in the entry."""
+    def jr(reg): return (reg << 21) | 8
+    code = [lui(SP, 0x8030), addiu(SP, SP, -0x10), jal(0x80000440), 0, (4 << 26) | 0xFFFF, 0] + [0] * 10 + [
+        lui(T0, 0x8020), lui(T1, 0x1000), ori(T1, T1, 0xFFFF),          # 0x80000440: t1 = "b ."
+        sw(T1, 0, T0), sw(0, 4, T0),
+        # where to go is computed at run time (a sum kept in memory), as a real unpacker's is
+        sw(T0, 0, SP), (35 << 26) | (SP << 21) | (T2 << 16), jr(T2), 0]
+    data = bytearray(0x101000)
+    struct.pack_into(">III", data, 0, 0x80371240, 0, 0x80000400)
+    struct.pack_into(f">{len(code)}I", data, 0x1000, *code)
+    return Rom(bytes(data))
+
+
+class StubTests(unittest.TestCase):
+    def counts(self, static: int, unpacked: int):
+        seen = []
+
+        def count(_rom, program):
+            seen.append(program.method)
+            return static if program.method == "static" else unpacked
+        return count, seen
+
+    def test_a_small_boot_image_that_unpacks_more_is_replaced(self):
+        count, seen = self.counts(3, 300)
+        img = image.build(stub_rom(), count=count)
+        self.assertEqual((img.method, img.main().vram, img.main().kind), ("emulated", 0x80200000, "packed"))
+        self.assertEqual(img.loader["stub"], {"functions": 3, "unpacked_functions": 300})
+        self.assertEqual(seen, ["static", "emulated"])
+
+    def test_what_it_unpacks_must_hold_several_times_more(self):
+        count, _seen = self.counts(40, 70)
+        self.assertEqual(image.build(stub_rom(), count=count).method, "static")
+
+    def test_a_boot_image_of_ordinary_size_is_not_emulated(self):
+        count, seen = self.counts(900, 5000)
+        self.assertEqual(image.build(stub_rom(), count=count).method, "static")
+        self.assertEqual(seen, ["static"])
+
+    def test_a_small_program_that_unpacks_nothing_stays_as_it_is(self):
+        count, _seen = self.counts(2, 0)
+        self.assertEqual(image.build(plain_rom(), count=count).method, "static")
 
 
 class ProgramImageTests(unittest.TestCase):

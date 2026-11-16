@@ -43,11 +43,66 @@ def _inventory_args(p):
     p.add_argument("--summary-only", action="store_true")
     p.add_argument("--image-file", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--boundary-aware", action="store_true")
+    p.add_argument("--verify", action="store_true",
+                   help="rebuild configured manifest units and attach strict current-source verdicts")
+    p.add_argument("--symbols", action="append", default=[],
+                   help="independent symbol file used by strict verification (repeatable)")
+    p.add_argument("--jobs", type=int, default=4, help="parallel verification builds (capped at 4)")
+
+
+def _verify_inventory(args):
+    """Rebuild configured image manifests using the current image registry.
+
+    Inventory catalogue addresses can differ from linked image addresses.  Verification therefore
+    stays in each image's declared link coordinate system and only hands the resulting receipt to
+    inventory by source path plus linked VRAM; inventory owns the catalogue-space reconciliation.
+    """
+    from ..match import images as imagemod
+    from ..match import manifest as manmod
+    from ..match import symbols as symmod
+    from ..match import unit_verify
+    from ..match.toolchain import load_config
+
+    project = Path(args.project).resolve()
+    cfg = load_config(project)
+    symbol_paths = [Path(path).resolve() for path in args.symbols]
+    symbol_paths += [path for path in cfg.symbols if path not in symbol_paths]
+    symbols = symmod.load([path for path in symbol_paths if path.is_file()]).explicit()
+    verification = {}
+    images = []
+    for spec in imagemod.load_registry(project).values():
+        if not spec.manifests:
+            continue
+        data = spec.load()
+        to_vram = lambda offset, delta=spec.delta: offset + delta
+        to_offset = lambda vram, delta=spec.delta: vram - delta
+        units = []
+        for manifest in spec.manifests:
+            units += manmod.parse(manifest, project, to_vram)
+        starts = {vram for _name, vram, _size in spec.rows()}
+        rows = unit_verify.verify_units(
+            units, cfg, data, to_offset, symbols,
+            project / ".n64dk" / "inventory" / spec.name,
+            max(1, min(args.jobs, 4)), starts,
+        )
+        for row in rows:
+            # Manifest ownership records retain the spelling from the manifest (normally a
+            # project-relative path); verifier rows also carry the resolved filesystem path.
+            verification[(row["unit"], row["vram"])] = row
+            verification[(row["source"], row["vram"])] = row
+        images.append({"image": spec.name, "units": len(rows),
+                       "cached": sum(bool(row.get("cached")) for row in rows),
+                       "verdicts": {verdict: sum(row.get("verdict") == verdict for row in rows)
+                                    for verdict in sorted({row.get("verdict") for row in rows})}})
+    return verification, {"images": images, "symbol_files": [str(path) for path in symbol_paths]}
 
 
 @command("match-inventory", "Build an interval-correct function and translation-unit inventory")
 def match_inventory(args):
-    result = invmod.build(args.project, args.refresh_sources)
+    verification, verify_report = _verify_inventory(args) if args.verify else (None, None)
+    result = invmod.build(args.project, args.refresh_sources, verification=verification)
+    if verify_report is not None:
+        result["verification"] = verify_report
     if args.boundary_aware:
         mappings = dict(value.split("=", 1) for value in args.image_file)
         for row in result["functions"]:
@@ -396,7 +451,7 @@ def quickwin_sweep(args):
         raise ValueError("--run-ready-only requires --resume")
     db = _state(Path(args.state_root)); mappings = dict(value.split("=", 1)
         for value in getattr(args, "image_file", []) if "=" in value)
-    context_cache = None; planning_exclusions = {"counts": {}, "examples": {}}
+    context_cache = None; planning_exclusions = {"counts": {}, "examples": {}}; funnel = None
     if args.run_ready_only:
         existing = db.execute("SELECT project, inventory_digest FROM tranches WHERE tranche_id = ?",
                               (args.resume,)).fetchone()
@@ -484,6 +539,23 @@ def quickwin_sweep(args):
             if ready_targets >= max(0, args.limit):
                 break
         planning_exclusions = {"counts": exclusion_counts, "examples": exclusion_examples}
+        examined = sum(exclusion_counts.values()) + len(ranked)
+        rows = inventory["functions"]
+        funnel = {"catalogue_rows": len(rows),
+                  "already_matched": sum(row["state"] == "covered" for row in rows),
+                  "assembly_owned": sum(row["state"] == "assembly" for row in rows),
+                  "configured_exclusions": sum(row["state"] == "excluded" for row in rows),
+                  "conflicts": sum(row["state"] == "conflict" for row in rows),
+                  "remaining_candidates": len(candidates), "examined": examined,
+                  "not_examined": max(0, len(candidates) - examined),
+                  "boundary_rejected": exclusion_counts.get("boundary_rejected", 0),
+                  "mapping_ambiguous": exclusion_counts.get("mapping_ambiguous", 0),
+                  "source_missing": exclusion_counts.get("source_missing", 0),
+                  "source_rejected_other": sum(count for state, count in exclusion_counts.items()
+                                               if state not in ("boundary_rejected", "mapping_ambiguous",
+                                                                "source_missing", "recipe_unknown")),
+                  "recipe_unknown": exclusion_counts.get("recipe_unknown", 0),
+                  "requested": args.limit, "selected": len(ranked), "ready": ready_targets}
         stable_inventory = {key: value for key, value in inventory.items() if key != "source_index"}
         digest = hashlib.sha256(json.dumps(stable_inventory, sort_keys=True).encode()).hexdigest()
         tranche_id = args.resume
@@ -637,6 +709,7 @@ def quickwin_sweep(args):
                       + counts.get("build_failed", 0),
                   "selected": len(items), "status": counts,
                   "preflight_exclusions": planning_exclusions,
+                  "funnel": funnel,
                   "next": [item for item in items if item["status"] != "exact"][:20],
                   "timing": {"discovery_seconds": inventory.get("source_index", {}).get("elapsed_seconds", 0.0),
                              "context_seconds": context_cache.metrics.get("context_seconds", 0.0) if context_cache else 0.0,

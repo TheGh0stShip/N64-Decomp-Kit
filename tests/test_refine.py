@@ -183,3 +183,51 @@ class PrepareAnswerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExamplesTest(unittest.TestCase):
+    def test_examples_sharing_references_come_first_then_neighbours(self):
+        pool = refine.Examples()
+        pool.add("far_sharing", 0x80009000, 0x20, {0x80050000, 0x80001000}, "asm far", "void far_sharing(void) {}")
+        pool.add("near_plain", 0x80001040, 0x20, set(), "asm near", "void near_plain(void) {}")
+        pool.add("nearer_plain", 0x80001020, 0x20, set(), "asm nearer", "void nearer_plain(void) {}")
+        picked = pool.pick(0x80001000, {0x80050000}, 2)
+        self.assertEqual([row[0] for row in picked], ["far_sharing", "nearer_plain"])
+        self.assertEqual(pool.pick(0x80001000, set(), 0), [])
+
+    def test_a_function_is_never_its_own_example_and_long_or_raw_sources_are_left_out(self):
+        pool = refine.Examples(max_bytes=0x40)
+        pool.add("self", 0x80001000, 0x20, set(), "asm", "void self(void) {}")
+        pool.add("big", 0x80002000, 0x80, set(), "asm", "void big(void) {}")
+        pool.add("raw", 0x80003000, 0x20, set(), "asm", "void raw(void *a) { M2C_FIELD(a, s32 *, 4) = 0; }")
+        self.assertEqual(pool.pick(0x80001000, set(), 3), [])
+
+    def test_the_prelude_is_not_shown(self):
+        text = "#ifndef N64DK_M2C_PRELUDE\n#define N64DK_M2C_PRELUDE\ntypedef int s32;\n#endif\n\ns32 f(void) { return 1; }\n"
+        self.assertEqual(refine.Examples.body(text), "s32 f(void) { return 1; }")
+
+    def test_examples_appear_in_the_prompt_before_the_best_source(self):
+        text = refine.build_prompt("f", "kmc -O2", "jr $ra", "int f(void) { return 0; }", "differs", [], [],
+                                   examples=[("g", "addiu $v0, $zero, 1", "int g(void) { return 1; }")])
+        self.assertIn("### g", text)
+        self.assertLess(text.index("int g(void)"), text.index("## Best C so far"))
+
+    def test_the_number_of_examples_is_part_of_the_resumable_identity(self):
+        one = refine.Settings.from_table({"command": "x", "examples": 0})
+        other = refine.Settings.from_table({"command": "x"})
+        self.assertEqual((one.examples, other.examples), (0, 3))
+        self.assertNotEqual(one.signature(), other.signature())
+
+
+class FailedDraftTest(unittest.TestCase):
+    def test_a_draft_that_does_not_build_is_shown_with_its_compiler_output(self):
+        text = refine.build_prompt("f", "ido5.3 -O2", "jr $ra", None, "", [], [],
+                                   failed_draft=("void f(void) { *x(); }", "line 1: Non-function name referenced"))
+        self.assertIn("does not compile", text)
+        self.assertIn("*x();", text)
+        self.assertIn("Non-function name referenced", text)
+
+    def test_it_is_not_shown_once_a_source_builds(self):
+        text = refine.build_prompt("f", "ido5.3 -O2", "jr $ra", "void f(void) {}", "differs", [], [],
+                                   failed_draft=("void f(void) { *x(); }", "line 1: error"))
+        self.assertNotIn("does not compile", text)

@@ -181,3 +181,38 @@ class LedgerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CorroboratedSectionTest(unittest.TestCase):
+    """A donor unit's own section: its contents at the derived address confirm that address."""
+
+    def test_contents_found_at_the_derived_address_confirm_it(self):
+        from n64dk.match import transplant
+        rom = rom_from(elf(TRUTH), {".data": DATA})
+        symbols = {"goodFunction": SYMBOLS["goodFunction"], "gRight": SYMBOLS["gRight"]}
+        first = strict(elf(TRUTH), rom, symbols)
+        self.assertEqual(first.verdict, "assumed")
+        confirmed = transplant.corroborated_sections(first, elf(TRUTH))
+        self.assertEqual(confirmed, {".data": DATA})
+        self.assertEqual(strict(elf(TRUTH), rom, symbols, confirmed).verdict, "exact")
+
+    def test_a_section_of_zeros_confirms_nothing(self):
+        from n64dk.match import transplant
+        rom = rom_from(elf(SHORTDATA), {".data": DATA})
+        first = strict(elf(SHORTDATA), rom, {"goodFunction": SYMBOLS["goodFunction"], "gRight": SYMBOLS["gRight"]})
+        self.assertTrue(first.text_equal)
+        self.assertEqual(transplant.corroborated_sections(first, elf(SHORTDATA)), {})
+
+    def test_different_code_confirms_nothing(self):
+        from n64dk.match import transplant
+        rom = rom_from(elf(TRUTH), {".data": DATA})
+        first = strict(elf(WRONG), rom, {})
+        if not first.text_equal:
+            self.assertEqual(transplant.corroborated_sections(first, elf(WRONG)), {})
+
+    def test_fixed_addresses(self):
+        from n64dk.match import transplant
+        self.assertTrue(transplant.fixed_address(0x80000308))
+        self.assertTrue(transplant.fixed_address(0xA4400010))
+        self.assertFalse(transplant.fixed_address(0x80000400))
+        self.assertFalse(transplant.fixed_address(0x8009D030))

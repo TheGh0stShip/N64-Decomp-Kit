@@ -79,6 +79,94 @@ class RepairTest(unittest.TestCase):
         self.assertTrue(fixed.startswith("s32 g();"))
         self.assertIsNone(autodraft.repair(self.SOURCE, "x.c:9: parse error"))
 
+    def test_a_missing_declaration_goes_to_the_function_body_not_a_nested_block(self):
+        source = "s32 f(s32 arg0) {\n    s32 t;\n\n    t = sp10;\n    if (arg0 != 0) {\n        t = 1;\n    }\n    return t;\n}\n"
+        fixed = autodraft.repair(source, "x.c:4: `sp10' undeclared (first use this function)")
+        self.assertTrue(fixed.startswith("s32 f(s32 arg0) {\n    s32 sp10;\n"), fixed)
+
+    def test_a_call_through_a_loaded_function_pointer_is_parenthesised(self):
+        line = "    temp = *M2C_FIELD(arg0, void *(***)(void *, M2C_UNK), 4)(arg0, 0x118);"
+        source = "void *f(void *arg0) {\n    void *temp;\n\n" + line + "\n    return temp;\n}\n"
+        for message in ("cfe: Error: x.c, line 4: Non-function name referenced in function call.",
+                        "x.c:4: called object is not a function"):
+            fixed = autodraft.repair(source, message)
+            self.assertIn("temp = (*M2C_FIELD(arg0, void *(***)(void *, M2C_UNK), 4))(arg0, 0x118);", fixed)
+        # already parenthesised, or not a call: left alone
+        self.assertEqual(autodraft.call_through_loaded_pointer("x = (*M2C_FIELD(a, s32 (**)(), 0))(a);"),
+                         "x = (*M2C_FIELD(a, s32 (**)(), 0))(a);")
+        self.assertEqual(autodraft.call_through_loaded_pointer("x = *M2C_FIELD(a, s32 **, 0) + 1;"),
+                         "x = *M2C_FIELD(a, s32 **, 0) + 1;")
+
+    def test_a_guessed_prototype_in_a_function_pointer_cast_is_dropped_at_any_depth(self):
+        source = "void f(void *a, void *b) {\n    M2C_FIELD(a, M2C_UNK (**)(M2C_UNK *, void *, void *), 8)(a, b);\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: The number of arguments doesn't agree with the "
+                                         "number in the declaration.")
+        self.assertIn("M2C_FIELD(a, M2C_UNK (**)(), 8)(a, b);", fixed)
+
+    def test_an_integer_minus_an_address_becomes_integer_arithmetic(self):
+        source = "s32 *f(s32 *arg0) {\n    *arg0 = 0x8023E000 - &D_802142F0;\n    return arg0;\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: Unacceptable operand of '-'.")
+        self.assertIn("*arg0 = 0x8023E000 - (s32) &D_802142F0;", fixed)
+
+    def test_a_starred_variable_that_is_called_gets_a_callable_type(self):
+        source = "void f(void ***arg0) {\n    **arg0(arg0);\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: Non-function name referenced in function call.")
+        self.assertIn("    ((s32 (*)()) **arg0)(arg0);", fixed)
+
+    def test_dereferencing_an_integer_variable_treats_it_as_an_address(self):
+        source = "void f(s32 arg0) {\n    s32 var_a0;\n    void *p;\n\n    *var_a0 = 0;\n    *p = *arg0;\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 5: Dereferenced a non-pointer.")
+        self.assertIn("    *(s32 *)var_a0 = 0;", fixed)
+        fixed = autodraft.repair(source, "x.c:6: invalid type argument of `unary *'")
+        self.assertIn("    *p = *(s32 *)arg0;", fixed)                  # the pointer is left alone
+
+    def test_arithmetic_on_a_loaded_void_pointer_is_byte_arithmetic(self):
+        source = "void f(s32 *arg0, s32 arg1) {\n    M2C_FIELD((M2C_FIELD(arg0, void **, 0x1B4) + (arg1 * 4)), s32 *, 8) = 0;\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: Unacceptable operand of '+'.")
+        self.assertIn("M2C_FIELD(arg0, s8 **, 0x1B4) + (arg1 * 4)", fixed)
+
+    def test_a_loaded_pointer_called_inside_a_condition_is_parenthesised_not_mangled(self):
+        source = "s32 f(void *arg0) {\n    if (*M2C_FIELD(arg0, s32 (***)(void *), 0x1B0)(arg0) == 0) {\n        return 1;\n    }\n    return 0;\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: Non-function name referenced in function call.")
+        self.assertIn("if ((*M2C_FIELD(arg0, s32 (***)(void *), 0x1B0))(arg0) == 0) {", fixed)
+
+    def test_a_pointer_compared_with_an_integer_compares_the_address(self):
+        source = "s32 f(void *arg1, s32 *p) {\n    if ((p[3] == 6) && (arg1 == M2C_FIELD(p, s32 *, 0x10))) {\n        return 1;\n    }\n    return 0;\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: Unacceptable operand of == or !=")
+        self.assertIn("((s32) arg1 == M2C_FIELD(p, s32 *, 0x10))", fixed)
+        self.assertIn("(p[3] == 6)", fixed)
+
+    def test_null_stored_to_an_integer_is_zero(self):
+        source = "void f(s32 *t) {\n    *t = NULL;\n}\n"
+        self.assertIn("*t = 0;", autodraft.repair(source, "cfe: Error: x.c, line 2: Constants must have arithmetic type."))
+
+    def test_an_address_subtracted_from_a_variable_is_integer_arithmetic(self):
+        source = "void f(s32 arg0) {\n    s32 sp0;\n\n    sp0 = arg0 - &D_80180DB0;\n}\n"
+        self.assertIn("sp0 = arg0 - (s32) &D_80180DB0;",
+                      autodraft.repair(source, "cfe: Error: x.c, line 4: Unacceptable operand of '-'."))
+
+    def test_a_builtin_called_with_other_arguments_is_called_through_a_cast(self):
+        source = "void f(s32 a, s32 b) {\n    memcpy(&D_1, a, 0x20, b);\n}\n"
+        fixed = autodraft.repair(source, "x.c:2: too many arguments to function `memcpy'")
+        self.assertIn("    ((s32 (*)()) memcpy)(&D_1, a, 0x20, b);", fixed)
+        declared = "s32 g(s32);\nvoid f(s32 a, s32 b) {\n    g(a, b);\n}\n"         # a declaration is relaxed instead
+        self.assertTrue(autodraft.repair(declared, "x.c:3: too many arguments to function `g'").startswith("s32 g();"))
+
+    def test_a_pointer_compared_with_an_address_expression(self):
+        source = "void f(s32 v) {\n    s32 sp7C;\n\n    do {\n    } while ((s32) v != ((v * 8) + &sp7C));\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 5: Unacceptable operand of == or !=")
+        self.assertIn("} while ((s32) v != ((v * 8) + (s32) &sp7C));", fixed)
+
+    def test_a_word_read_through_a_void_cast(self):
+        source = "void f(void) {\n    do {\n    } while (*(void *)0xA4600010 & 3);\n}\n"
+        self.assertIn("while (*(s32 *)0xA4600010 & 3);",
+                      autodraft.repair(source, "x.c:3: void value not ignored as it ought to be"))
+
+    def test_a_function_pointer_read_from_a_computed_address_is_called(self):
+        source = "void f(s32 i) {\n    *D_1 = *(&D_2 + (i * 4))(D_1, i);\n}\n"
+        fixed = autodraft.repair(source, "cfe: Error: x.c, line 2: Non-function name referenced in function call.")
+        self.assertIn("*D_1 = ((s32 (*)()) *(&D_2 + (i * 4)))(D_1, i);", fixed)
+
     def test_sweep_rejects_interval_outside_image(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = autodraft.sweep([("outside", 0x80002000, 8)], bytes(16), 0x80001000,

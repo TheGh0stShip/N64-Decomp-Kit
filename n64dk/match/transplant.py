@@ -63,6 +63,12 @@ from .toolchain import Config
 
 INDEX_VERSION = 3
 EXACT_VERDICT = "exact-with-transferred-symbols"
+# The unit's code is byte-identical, and an address it uses was read from the target's own
+# instructions with nothing independent to confirm the name it was given (a section of the unit
+# with no contents to compare, a data symbol no other unit placed).  The same standing as a
+# resolved case that ends ``assumed``: identical bytes, awaiting symbols.
+ASSUMED_VERDICT = "identical-awaiting-symbols"
+CORROBORATING_BYTES = 8         # a section's contents confirm its address from this many bytes on
 NEAR_MIN_WORDS = 6
 AUTO_NAME = re.compile(r"^(?:func|D|B|jtbl|L|sym|data)_[0-9A-Fa-f]{6,8}$|^0x[0-9A-Fa-f]+$")
 INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
@@ -236,7 +242,15 @@ class DonorContext:
         from ..rom import Rom
         from .engine import Target
         self.spec = spec
-        self.target = Target.from_rom(Rom.load(spec.image), spec.vram_delta)
+        try:
+            self.target = Target.from_rom(Rom.load(spec.image), spec.vram_delta)
+        except Exception:
+            # Not a cartridge image: a linear one whose load address is declared (a segment a
+            # blind run unpacked, a library linked for the purpose).  Offset 0 is that address.
+            if spec.vram_delta is None:
+                raise
+            data = Path(spec.image).read_bytes()
+            self.target = Target(data, spec.vram_delta, (0, len(data)))
         self.symbols = symmod.load([p for p in spec.symbols if p.is_file()])
         self.functions = load_functions([p for p in spec.catalogue if p.is_file()], self.target.delta)
         for name, vram, size in self.functions:
@@ -268,7 +282,7 @@ def _unit_rows(donor: DonorSpec, ctx: DonorContext):
         except Exception:                                   # noqa: BLE001 - foreign manifest layout
             continue
         for unit in units:
-            if unit.source.suffix not in (".c",):
+            if unit.source.suffix not in (".c", ".s"):       # C, and assembly a library was written in
                 continue
             row = lines[unit.line - 1] if 0 < unit.line <= len(lines) else ""
             yield man, unit, row
@@ -585,7 +599,13 @@ def transfer(hits: list[Hit]) -> dict:
             if len(daddrs) > 1:
                 suspicious.append({"target_address": f"0x{taddr:08X}", "donor": donor,
                                    "donor_symbols": sorted(f"{names[(donor, d)] or '?'}@0x{d:08X}" for d in daddrs)})
-    return {"symbols": symbols, "contradictions": contradictions, "suspicious": suspicious}
+    # Where each donor function itself was found (independent of who refers to it).
+    definitions: dict[tuple[str, int], set[int]] = defaultdict(set)
+    for hit in hits:
+        if hit.kind == "exact" and hit.status in ("candidate", "partial-unit"):
+            definitions[(hit.unit["donor"], hit.function["vram"])].add(hit.vram)
+    return {"symbols": symbols, "contradictions": contradictions, "suspicious": suspicious,
+            "definitions": dict(definitions)}
 
 
 def symbol_file(transfer_result: dict) -> str:
@@ -714,6 +734,40 @@ def plan(hits: list[Hit], image: bytes, vram_delta: int,
     return jobs, partial
 
 
+def corroborated_sections(verdict, elf: Elf) -> dict[str, int]:
+    """Sections of a unit whose assumed address the unit's own data confirms.
+
+    The address was derived from the code (where its instructions point).  When the section's
+    contents, as compiled, are then found at that address, bytes the derivation never looked at
+    agree with it.  A section with nothing in it, or next to nothing but zeros, confirms nothing
+    and stays an assumption."""
+    if not verdict.text_equal:
+        return {}
+    states = {state.get("section"): state for state in verdict.sections}
+    confirmed = {}
+    for item in verdict.assumptions:
+        state = states.get(item.name) if item.kind == "section" else None
+        section = cmp.find_section(elf, item.name) if state else None
+        if (state and section is not None and state.get("status") == "equal"
+                and state.get("compared") == state.get("size") and (state.get("size") or 0) >= CORROBORATING_BYTES
+                and sum(1 for byte in section.data if byte) >= CORROBORATING_BYTES // 2):
+            confirmed[item.name] = item.address
+    return confirmed
+
+
+def common_shape(hits) -> bool:
+    """Whether a unit's place in the target is only a common shape: every one of its functions
+    also stands at other addresses (a getter, a setter).  A unit of several functions is pinned
+    by the ones that stand nowhere else; one common member does not make its place doubtful."""
+    return bool(hits) and all(hit.template for hit in hits)
+
+
+def fixed_address(address: int) -> bool:
+    """Low memory the boot code fills and the hardware registers: the same on every console, so a
+    donor's name for one of them cannot belong to a different address in the target."""
+    return 0x80000000 <= address < 0x80000400 or 0xA0000000 <= address < 0xC0000000
+
+
 def verify_job(job: Job, index: Index, target, transfer_result: dict, function_starts: set[int] | None,
                workroot: Path, toolchain_root: Path | None, data_symbols: dict | None = None) -> dict:
     from .verify import strict_compare
@@ -743,12 +797,24 @@ def verify_job(job: Job, index: Index, target, transfer_result: dict, function_s
     toff = target.vram_to_rom(job.vram)
     tcode = target.rom[toff:toff + job.size]
     tbases, tsyms = cmp.infer_from_rom(elf, tcode, job.vram, {}, {})
-    table = {} if any(h.template for h in job.hits) else transfer_result["symbols"]
-    row["template"] = any(h.template for h in job.hits)
+    row["template"] = common_shape(job.hits)
+    table = {} if row["template"] else transfer_result["symbols"]
+    definitions = transfer_result.get("definitions") or {}
     declared = symmod.SymbolMap()
     for name, taddr in tsyms.items():
         daddr = dsyms.get(name)
         item = table.get((unit["donor"], daddr)) if daddr is not None else None
+        if item is None and daddr is not None and taddr in definitions.get((unit["donor"], daddr), ()):
+            # the function this name belongs to was itself found, identical, at that address
+            declared[name] = taddr
+            row["transferred"][name] = f"0x{taddr:08X}"
+            row.setdefault("corroborated", {})[name] = "the donor function of that name is identical there"
+            continue
+        if item is None and daddr is not None and daddr == taddr and fixed_address(daddr):
+            declared[name] = taddr                          # the same fixed address on both sides
+            row["transferred"][name] = f"0x{taddr:08X}"
+            row.setdefault("corroborated", {})[name] = "a fixed address, the same in the donor"
+            continue
         if item is None:
             # Keep target-derived values as diagnostics only.  Supplying them to strict_compare
             # would make the bytes under test their own authority and could prove a wrong symbol.
@@ -769,13 +835,29 @@ def verify_job(job: Job, index: Index, target, transfer_result: dict, function_s
     # may promote independently transferred/project-declared bases; this pass must fail closed.
     verdict = strict_compare(elf, target.rom, target.vram_to_rom, job.vram, job.size, declared, {},
                              None, function_starts)
+    confirmed = corroborated_sections(verdict, elf)
+    if confirmed:
+        verdict = strict_compare(elf, target.rom, target.vram_to_rom, job.vram, job.size, declared, confirmed,
+                                 None, function_starts)
+        for name, base in confirmed.items():
+            row.setdefault("corroborated", {})[name] = f"its {len(cmp.find_section(elf, name).data)} bytes are at 0x{base:08X}"
     row["strict"] = verdict.as_dict()
     unverified = [s["section"] for s in verdict.sections if s.get("status") == "unverified"]
     if verdict.verdict == "mismatch" or not verdict.text_equal:
         row["verdict"] = "mismatch"
         row["first_diff"] = None if verdict.first_diff is None else f"0x{verdict.first_diff:X}"
-    elif verdict.assumptions:
+    elif verdict.assumptions and (
+            (row["template"] and any(a.kind == "symbol" for a in verdict.assumptions))
+            or any(a.kind == "symbol" and dsyms.get(a.name) is not None and fixed_address(dsyms[a.name])
+                   and dsyms[a.name] != a.address for a in verdict.assumptions)):
+        # The same code stands at several addresses with a different symbol each time (a getter,
+        # a setter), or the donor's symbol is a fixed address and the target's is another one:
+        # the shape of a function, not this function.  Left to the resolution ladder.
         row["verdict"] = "mismatch"
+        row["notes"].append("identical code with other symbols: a common shape, not the donor's function")
+    elif verdict.assumptions:
+        row["verdict"] = ASSUMED_VERDICT
+        row["awaiting"] = {a.name: f"0x{a.address:08X}" for a in verdict.assumptions}
         row["notes"].append("strict oracle still needed retail-derived addresses: "
                             + ", ".join(a.name for a in verdict.assumptions))
     elif unverified:
@@ -833,7 +915,10 @@ _IMAGES: dict[str, bytes] = {}
 def _donor_image(path: str) -> bytes:
     if path not in _IMAGES:
         from ..rom import Rom
-        _IMAGES[path] = Rom.load(path).data
+        try:
+            _IMAGES[path] = Rom.load(path).data
+        except Exception:                                    # a linear image (see DonorContext)
+            _IMAGES[path] = Path(path).read_bytes()
     return _IMAGES[path]
 
 
@@ -846,14 +931,27 @@ def _manifest_row(job_row: dict, target, out_source: str, include_flags: list[st
 def write_outputs(out_dir: Path, rows: list[dict], index: Index, target, report: dict, symtext: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "proposed_symbol_addrs.txt").write_text(symtext)
+    waiting = [r for r in rows if r.get("verdict") == ASSUMED_VERDICT]
+    if waiting:
+        lines = ["# Units whose code is byte-identical and that wait for these addresses.  Each address was",
+                 "# read from the target's own instructions; nothing independent confirms the name.  Review,",
+                 "# add to the symbol file (sections: to the unit's manifest row), run again.", ""]
+        for row in sorted(waiting, key=lambda r: r["target_vram"]):
+            lines.append(f"# 0x{row['target_vram']:08X} {row['donor']}:{row['donor_unit']}")
+            lines.extend(f"{name} = {address};" if not name.startswith(".") else f"#   section {name} at {address}"
+                         for name, address in sorted((row.get("awaiting") or {}).items()))
+        (out_dir / "awaiting_symbols.txt").write_text("\n".join(lines) + "\n")
     manifests: dict[tuple[str, str], list[str]] = defaultdict(list)
     for row in rows:
-        if row.get("verdict") != EXACT_VERDICT:
+        if row.get("verdict") not in (EXACT_VERDICT, ASSUMED_VERDICT) or "_elf_spec" not in row:
             continue
+        waits = row.get("verdict") == ASSUMED_VERDICT       # its source is kept too; its manifest rows apart
         donor = index.donors[row["donor"]]
         root = Path(donor["root"])
         src = root / row["donor_unit"]
-        rel = Path(row["donor"]) / row["donor_unit"]
+        unit_path = Path(row["donor_unit"])
+        # a unit kept outside the donor's root (generated text) is filed by its last two components
+        rel = Path(row["donor"]) / (Path(*unit_path.parts[-2:]) if unit_path.is_absolute() else unit_path)
         dest = out_dir / "src" / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dest)
@@ -874,7 +972,8 @@ def write_outputs(out_dir: Path, rows: list[dict], index: Index, target, report:
                 includes.append(f"-I{Path(path).resolve().relative_to(root.resolve())}")
             except ValueError:
                 includes.append(f"-I{path}")
-        manifests[(row["donor"], row["donor_pipeline"])].append(_manifest_row(row, target, row["donor_unit"], includes))
+        manifests[(("awaiting_" if waits else "") + row["donor"], row["donor_pipeline"])].append(
+            _manifest_row(row, target, row["donor_unit"], includes))
     for (donor_name, pipe), lines in manifests.items():
         name = donor_name + "_" + pipe.replace("+", "_").replace(".", "")
         (out_dir / f"proposed_{name}.tsv").write_text(
@@ -884,17 +983,49 @@ def write_outputs(out_dir: Path, rows: list[dict], index: Index, target, report:
     (out_dir / "report.json").write_text(json.dumps(report, indent=1, default=str))
 
 
+MAX_ALTERNATIVES = 8            # distinct donor units built for one place before giving up
+_LIBRARY_DONOR = re.compile(r"^t[0-9a-f]{16}_")
+
+
+def alternative_order(job) -> tuple:
+    """Which donor unit to build first for a place several of them fit.
+
+    Units of decompiled projects and of the SDK come before units of the library of finished
+    runs: they carry real names and whole source files, and a library that grows with every
+    title must not push them out of the attempts that are made.  Then single-function units,
+    then by name, so the order does not depend on how the index was built."""
+    unit = job.unit
+    return (bool(_LIBRARY_DONOR.match(unit["donor"])), len(unit["functions"]) != 1, unit["donor"], unit["source"])
+
+
+def distinct_alternatives(alts: list) -> list:
+    """``alts`` without repeats of one build: the same source file, compiler and flags (apart from
+    macro definitions) whose donor code is identical is the same object, whichever build of the
+    library it was indexed from."""
+    seen, out = set(), []
+    for job in alts:
+        unit = job.unit
+        flags = tuple(flag for flag in unit.get("flags", []) if not str(flag).startswith("-D"))
+        key = (unit.get("unit_masked"), unit.get("pipeline"), Path(str(unit.get("source"))).name, flags)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(job)
+    return out
+
+
 def select_rows(rows: list[dict]) -> list[dict]:
     """Keep non-overlapping exact rows (largest first); overlapped exact rows become ``superseded``."""
     taken: list[tuple[int, int]] = []
-    exact = sorted((r for r in rows if r["verdict"] == EXACT_VERDICT), key=lambda r: (-r["size"], r["target_vram"]))
-    for row in exact:
-        lo, hi = row["target_vram"], row["target_vram"] + row["size"]
-        if any(a < hi and lo < b for a, b in taken):
-            row["verdict"] = "superseded"
-            row["notes"].append("overlaps a larger exact transplant")
-        else:
-            taken.append((lo, hi))
+    for wanted in (EXACT_VERDICT, ASSUMED_VERDICT):          # every exact row before any assumed one
+        chosen = sorted((r for r in rows if r["verdict"] == wanted), key=lambda r: (-r["size"], r["target_vram"]))
+        for row in chosen:
+            lo, hi = row["target_vram"], row["target_vram"] + row["size"]
+            if any(a < hi and lo < b for a, b in taken):
+                row["verdict"] = "superseded"
+                row["notes"].append("overlaps a larger exact transplant")
+            else:
+                taken.append((lo, hi))
     return rows
 
 
@@ -925,8 +1056,13 @@ def manifest_declared_addresses(paths) -> set[int]:
 def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]], index: Index,
         skip: list[tuple[int, int]] | None = None, out_dir: Path | None = None, jobs: int = 4,
         toolchain_root: Path | None = None, verify: bool = True, near_max: int = 2,
-        target_symbols: symmod.SymbolMap | None = None, truth_addresses: set[int] | None = None) -> dict:
-    """Scan, transfer, transplant and verify; return the report dict (and write outputs)."""
+        target_symbols: symmod.SymbolMap | None = None, truth_addresses: set[int] | None = None,
+        other_starts: set[int] | None = None) -> dict:
+    """Scan, transfer, transplant and verify; return the report dict (and write outputs).
+
+    ``other_starts`` are the function starts of the title's other images.  A call out of this
+    image into one of them lands on a function start too; without them every unit that calls
+    across images was refused."""
     t0 = time.time()
     skip = sorted(skip or [])
     def skipped(vram, size):
@@ -944,16 +1080,18 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
         for job in jobs_list:
             by_addr[job.vram].append(job)
         for alts in by_addr.values():
-            alts.sort(key=lambda j: (len(j.unit["functions"]) != 1, j.unit["donor"], j.unit["source"]))
+            alts.sort(key=alternative_order)
         with tempfile.TemporaryDirectory(prefix="n64dk-transplant-") as tmp:
             def attempt(alts):
                 tried = []
-                for job in alts[:4]:
-                    row = verify_job(job, index, target, xfer, starts, Path(tmp), toolchain_root)
+                for job in distinct_alternatives(alts)[:MAX_ALTERNATIVES]:
+                    row = verify_job(job, index, target, xfer, starts | (other_starts or set()), Path(tmp),
+                                     toolchain_root)
                     tried.append(row)
                     if row["verdict"] == EXACT_VERDICT:
                         break
-                best = next((r for r in tried if r["verdict"] == EXACT_VERDICT), tried[0])
+                best = next((r for r in tried if r["verdict"] == EXACT_VERDICT),
+                            next((r for r in tried if r["verdict"] == ASSUMED_VERDICT), tried[0]))
                 best["alternatives_tried"] = len(tried)
                 if best["verdict"] != EXACT_VERDICT:
                     best["other_attempts"] = [{"donor": r["donor"], "unit": r["donor_unit"], "verdict": r["verdict"]}
@@ -995,6 +1133,8 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
         "near_hit_functions": len({h.vram for h in hits if h.kind == "near"} - {h.vram for h in hits if h.kind == "exact"}),
         "hit_status_by_function": dict(Counter(_best_status(hs) for hs in _by_vram(hits).values())),
         "unit_transplants": len(rows), "verdicts": dict(verdicts),
+        "functions_awaiting_symbols": len({v for r in rows if r["verdict"] == ASSUMED_VERDICT for v in starts
+                                           if r["target_vram"] <= v < r["target_vram"] + r["size"]}),
         "functions_recovered_new": len(new_funcs),
         "bytes_recovered_new": sum(sizes[v] for v in new_funcs),
         "rows_overlapping_matched": sum(1 for r in exact_rows if r.get("overlaps_matched")),

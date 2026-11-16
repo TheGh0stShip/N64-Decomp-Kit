@@ -53,8 +53,11 @@ def analyse(rom: Rom, window: int = 0x100, max_steps: int = 512) -> BootInfo:
     The IPL3 copies ROM 0x1000.. (1 MiB) to the header entry address, so the
     first instructions at ROM 0x1000 are the entry routine.
     """
-    entry = rom.header.entry
-    info = BootInfo(entry=rom.entry_vram, main_rom=IPL3_COPY_ROM, main_vram=entry, copy_size=IPL3_COPY_SIZE)
+    # Where the boot code puts the image and jumps: the header's value, moved down by the boot
+    # chips that relocate it (6103, 6106).  Placing the image at the unmoved value leaves the
+    # entry outside it and nothing is found.
+    entry = rom.entry_vram
+    info = BootInfo(entry=entry, main_rom=IPL3_COPY_ROM, main_vram=entry, copy_size=IPL3_COPY_SIZE)
     info.refs = mips.scan_refs(rom.data[IPL3_COPY_ROM:IPL3_COPY_ROM + window], entry)
     _walk(rom, info, max_steps)
     return info

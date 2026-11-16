@@ -12,42 +12,80 @@ The proof and acceptance details for this release are in
 
 ```sh
 n64dk --format json decompile-run --project . --all-images --out out/run \
-    --donors donors.toml --max-size 0x400 --budget 100 --jobs 8
+    --donors donors.toml --max-size 0x400 --budget 100
 ```
 
-## Configuration
+## Starting from a ROM alone
 
-```toml
-[images.main]                       # one table per image; overlays get their own
-path = "baserom.z64"                # `composite`, `raw` and `rom` are accepted as synonyms
-catalogue = "config/functions.toml" # TOML, or TSV/CSV with a header row (name, vram, size)
-manifests = ["config/matching_*.tsv"]   # optional: units already matched (skipped by the run)
-# vram_delta = 0x7FFFF400           # for a linear image (overlay, unpacked program)
-# catalogue_shift = 0x4724          # catalogue address minus link address, when they differ
+A title nobody has worked on has no catalogue, no symbol list and no known compiler.
+`decompile-init` derives all three from the ROM and writes a project `decompile-run` can use:
 
-[run]
-pipeline = "ido5.3"                 # or kmc+as, kmc+asn64, ido7.1, sn, custom:<name>
-flags = "-O2 -mips2 -non_shared -G 0"
-symbols = ["symbol_addrs.txt"]
-
-[run.images.main]                   # per-image overrides of [run], and per-unit recipes:
-recipes = { "config/matching_ido7_units.tsv" = "ido7.1" }   # the pipeline each manifest's rows used
-
-[pipelines.gcc281]                  # a compiler the kit has no built-in lane for
-family = "gcc"                      # "gcc" or "ido": decompiler target and diagnosis rules
-steps = ["{cc1} -quiet {flags} {source} -o {stem}.s", "{as} -EB -mips3 {stem}.s -o {object}"]
-[pipelines.gcc281.vars]
-cc1 = "/opt/gcc-2.8.1/cc1"
-as = "mips-linux-gnu-as"
+```sh
+n64dk decompile-init game.z64 --out work/game
+n64dk decompile-run --project work/game --all-images --out work/game/run --allow-project-output \
+    --donors donors.toml
 ```
 
-A function inside a unit named by a `recipes` manifest is built with that unit's pipeline and
-flags; its neighbours in the same translation unit (16-byte alignment and padding decide where a
-unit ends) inherit them. The lane declared under `[pipelines.gcc281]` is named `custom:gcc281` wherever a
-pipeline name is accepted.
+- **Code and boundaries** come from the survey of the ROM (the boot segment, or a packed
+  program's unpacked form). The ROM is linked, not copied, and never written.
+- **Library names** are the SDK matcher's confident identifications (`survey/sdk_symbols.txt`).
+- **The recipe** starts from the compiler family the SDK fingerprint attributes to the game code.
+  That is only a guess, so the project sets `[run] calibrate = 96`: before the sweep,
+  `decompile-run` resolves a spread sample of small functions with every available recipe tried
+  on each (other compilers, `-O1`, `-O3`, unoptimised) and sweeps with the recipe most of the
+  byte-identical ones were built with. Fewer than three matches keeps the configured recipe, and
+  the report says so. `--calibrate N` sets the sample for any project.
+- **Code outside the boot segment** is looked for in three ways, each of which makes an image of
+  its own (`[images.seg_<ROM offset>]`):
+  - a ROM range a recognised loader reads raw, placed where its own calls agree;
+  - a compressed stream that decodes to code (zlib, gzip, header-less deflate, MIO0, Yay0, Yaz0),
+    unpacked to `survey/seg_<ROM offset>.bin` and placed the same way (`--no-compressed` skips it);
+  - any other ROM range with the density of compiled code, placed by one vote over the whole ROM:
+    a linked program keeps one distance between a function's ROM offset and its address, so every
+    (call target, prologue offset) pair votes for that distance. Overlays that share addresses
+    have different distances and are told apart (`--no-region-scan` skips it).
+- **Identical functions are settled automatically.** The project sets `[run] declare_assumed = true`:
+  a function that is byte-identical but leans on an undeclared data address is verified again
+  with `D_<address>` declared at that address. Only names that state their own address are
+  declared; the verdict is still the strict verifier's.
+- **The whole ROM is mapped, not only its code.** `survey/layout.json` lists the header, the boot
+  code (IPL3, with the CIC), the main program's `.text`, `.data`, `.rodata` and `.bss` (the
+  last has no ROM bytes), RSP microcode and its data found inside the program image, the
+  identified microcode and SDK versions, every further code segment, and the bytes each
+  classifier accounted for. `survey/extract/` holds each piece that has bytes as its own file.
+  Ranges nothing explains are counted as unknown.
+- **Compilers.** `n64dk compilers` lists every compiler known to have built N64 retail code
+  (seventeen, the set the public decomp.me service keeps for the platform), which are installed
+  under the toolchain root and which the kit can drive. `n64dk compilers --fetch` downloads the
+  missing ones from that public archive into the toolchain root; every layer is checked against
+  the SHA-256 its manifest states before it is unpacked, and nothing is executed. Four have
+  built-in pipelines (IDO 5.3, IDO 7.1, KMC GCC 2.7.2, SN GCC 2.8.1). Nine more (IDO 5.2,
+  IDO 6.0, MIPSpro 7.4.4, three SN builds of GCC 2.7.2, the rebuilt SN GCC 2.7.2, GCC 2.8.1,
+  EGCS 1.1.2) are driven as configured lanes: `decompile-init` writes a `[pipelines.<lane>]`
+  table for each one that is installed, and calibration and the per-function alternatives then
+  try them like any other recipe. The SN kits need `wibo` (it runs their Windows executables)
+  and the rebuilt SN GCC needs a MIPS GNU assembler; a lane whose helper is missing is left out
+  and `n64dk compilers` says why. A title built with a compiler that is not installed cannot be
+  matched; check this before reading a low result.
+- **A refiner can be recorded at the start.** `decompile-init --refine-command CMD` writes
+  `[run.refine] command`, so the one `decompile-run` that follows also asks it about every case
+  the mechanical pass leaves.
+- **What is covered** is stated in `survey/blind.json`: every image and its code range, and under
+  `code_not_placed` the ranges that look like code but whose calls support no load address
+  (they are not attempted). A stream in a compression format the kit does not decode is not seen.
 
-`docs/toolchains.md` lists which compiler each surveyed project uses and where its build
-recipe differs from the built-in lanes.
+
+**Getting into the program.** Two things the survey has to get right before anything else:
+
+- *Where the image is.* The boot code copies the first megabyte to the address in the header,
+  except under the boot chips that move it (6103 by 1 MiB, 6106 by 2 MiB): the image is placed
+  where the code actually runs.
+- *Where the code starts.* The entry routine usually calls the program; some jump to it through
+  a register, with data lying between the routine and the code.  The address it hands over to
+  is a function start in its own right.
+
+Titles whose boot segment only unpacks the real program with a compressor the kit does not know
+are still surveyed as a handful of functions.
 
 ## Stages
 
@@ -57,8 +95,15 @@ recipe differs from the built-in lanes.
 | donors | looks every function up, relocation-masked, in the donor index; a hit is rebuilt from the donor's source with this title's symbols and compared | `<image>/donors/`, `stage_donors.json` |
 | resolve | for each remaining function: declarations recovered from the machine code, a portfolio of drafts (plain, with callee/own prototypes, loop-normal, type-narrowed), compile repair, recipe selection, one search over all transformation families, twin reuse | `state/` (case store) |
 | refine | optional: an external author answers for the cases the ladder left (see below) | `state/` |
+| declare | optional (`[run] declare_assumed`, `--declare-assumed`): declares the self-describing data addresses (`D_<address>`) that byte-identical cases lean on and verifies those cases again | `<image>/declared_symbols.txt` |
 | queue | exports what is finished | `queue/queue.tsv`, `queue/<image>/*.c` |
 | ledger | one owner class per byte, with violations | `<image>/ownership.tsv` |
+
+**Running again.** A second run over the same output directory never loses a result. An `exact`
+case is returned as stored; an `assumed` case is only verified again (it becomes `exact` when its
+addresses have been declared since); any other case continues from its stored best source under
+the recipe that source was built with, and the stored case stays when the new attempt ends
+further from the target.
 
 **What the resolve stage does beyond drafting.**
 
@@ -73,11 +118,17 @@ recipe differs from the built-in lanes.
   the repair is computed: temporaries that only name a sub-expression are substituted, and the
   bytes still missing are reserved with an unused local.
 
-**Parallelism.** `--jobs` is the total number of parallel builds (default: every hardware
-thread). The search generates its variants in Python, so the resolve stage splits the functions
-among worker processes (`--workers`, default automatic: one per two hardware threads, fewer when
-free memory is short; a worker peaks at about 450 MB). Cases meet in the case store. `resolve-hard`
-takes the same `--workers` option (default 1).
+**Parallelism and machine safety.** `--jobs` is the total number of parallel builds. The default
+planner caps it at four, reserves 2 GiB of currently available memory, and includes swap usage and
+the limiting reason in the `resource-plan` event. `N64DK_MAX_JOBS` lowers the process-wide cap.
+Only `N64DK_ALLOW_OVERSUBSCRIBE=1` permits a requested value above it; that is an explicit unsafe
+override. The resolve stage can split functions among worker processes (`--workers`), but the
+resource plan bounds the compile concurrency handed to it. Batch runs process titles sequentially.
+
+Every compiler/assembler subprocess has a timeout and its own process group. Timeout or interrupt
+terminates the group, so abandoned compiler children cannot continue consuming memory or I/O.
+Object-cache identities cover the source, recursively included headers, pipeline, flags,
+normalizer, environment and tool binaries.
 
 **Where the search is not tried.** The variant search runs only when the best draft is within
 `--search-ceiling` of the target (default 40, `[run] search_ceiling`, 0 to always search). Over
@@ -88,6 +139,55 @@ its case says so.
 The run can be interrupted and restarted: finished stages are read from their checkpoint
 (`--redo` recomputes them) and finished cases from the case store. `--skip-stage NAME` omits a
 stage; `--limit N` and `--max-size` bound a trial run.
+
+**Measured experiments that are not defaults.** `--region-recipes` retries unresolved functions
+under a recipe inferred for an address region (3 exact results in 126 measured retries).
+`--unit-recipes` uses a nearby unit's recipe (0/165). `--skip-unknown-search` trusts the
+unknown-toolchain classifier enough to suppress variant search; without that switch the
+classification is advisory. These switches remain available for controlled experiments, but a
+normal unattended run does not spend work or discard search based on those weak measurements.
+
+## A set of titles: `decompile-batch`
+
+```sh
+n64dk decompile-batch a.z64 b.z64 c.z64 --out DIR [--donors donors.toml] [--refine-command CMD]
+```
+
+runs `decompile-init` and `decompile-run` for each ROM, one at a time, with one library
+(`DIR/library`, see below). With the default `--passes 2` every title is visited a second time
+after all have run once, so early titles also receive what later ones matched; the second visit
+recomputes the donor stage and continues the stored cases. Projects are `DIR/<title>/`, runs
+`DIR/<title>.run/`, and `DIR/batch.md` / `batch.json` hold the per-title and total numbers after
+every title. A title that fails is reported and the batch goes on.
+
+## A library of finished runs
+
+`decompile-run --library DIR` makes every title a donor for the ones that follow.
+
+- **At the end of a run** the strictly exact functions are described as donor entries in
+  `<out>/donor.toml` (one per image: the sources and per-pipeline manifests under `<out>/queue`,
+  the image, its catalogue and its symbol files) and that description is copied to
+  `DIR/<ROM digest>.toml`. `donor.toml` is written whether or not `--library` is given, so a
+  finished run can also be named in a `--donors` file by hand.
+- **At the start of a run** every other title in `DIR` is added to the donors. A title is told
+  apart by the content of its ROM and is never its own donor. An entry whose image no longer
+  exists is skipped.
+- **Nothing transplanted is trusted.** The donor stage compiles each donor unit for the receiving
+  image and compares bytes and relocations, as it does for a hand-written donor project.
+
+What this is for: code titles share that no SDK signature names (a studio's engine, a middleware
+library, the same library built by the same compiler), and functions a refiner was paid to
+match. Matched once, they are not matched again.
+
+## Drafts that do not compile
+
+A decompiler's draft is not always valid C for the target compiler. `n64dk/match/autodraft.py`
+repairs the diagnostics that have one mechanical answer (a missing declaration, a call through a
+function pointer loaded from a table written without parentheses, a pointer compared with an
+integer, arithmetic on a `void *`, a built-in function called with other arguments, and so on),
+up to twelve repairs per draft. A draft that still does not build is kept with the case
+(`source_digest` in its `baseline` stage) together with the compiler's output, and the refine
+stage shows both to the refiner.
 
 ## The refine stage: an external author for the hard cases
 
@@ -134,6 +234,11 @@ command authorizes sending that material to its provider.
   For example a wrapper that passes stdin to an assistant's non-interactive mode and prints its
   reply. The prompt contains disassembly of the image and candidate sources: whoever configures
   the command decides where that text is sent.
+- **Worked examples.** Each prompt carries up to `examples` (default 3) functions of the same
+  image that already compile to their exact bytes under the same recipe, as (assembly, source)
+  pairs: those sharing callees or data with the target first, then its nearest neighbours.
+  Functions the refiner settles join the pool, so later cases learn from earlier ones.
+  `examples = 0` turns this off.
 - **Resumable.** A case already refined by the same command and settings is not asked again.
   Changing the refiner configuration gives it a new identity; `resolve-hard --force` reruns it
   even when the identity is unchanged.
@@ -147,6 +252,164 @@ No unattended whole-title run with a real model has been performed; the oracle-s
 check and seven hand-selected cases do not establish a recovery rate, latency, cost, or privacy
 profile for any provider.
 
+## The SDK as a donor: `sdk-donor`
+
+```sh
+n64dk sdk-donor --source ULTRALIB --out DIR [--versions F,H,I,J,K,L] [--flavours libgultra_rom,libultra_rom,libgultra]
+```
+
+builds a source tree of the SDK library once per version and flavour and describes each build as
+a donor (`DIR/donors.toml`, one image, catalogue and manifest set per build). The C units are
+compiled with the recipe the library's own makefile gives each of them. The hand-written units
+(`.s`: the exception handler, interrupt masking, cache and TLB routines, `bcopy`, `bzero`) are
+preprocessed once and assembled: with the GNU assembler for the GCC builds, through IDO's own
+assembler for the IDO builds (its objects list local and global symbols mixed; the table is put
+in ELF order before the link). Labels inside a hand-written routine are not functions and are
+left out of the catalogue. The addresses the boot code leaves in low memory (`osTvType`,
+`osRomBase`, ...) are the same on every console and are defined in the link.
+
+The donor stage treats an assembly unit like any other: found by its relocation-masked bytes,
+rebuilt for the receiving image, compared.
+
+**Several donor units for one place.** A function of the SDK is in every build of it that was
+indexed, in the projects that contain the SDK, and in the library of finished runs.  Up to eight
+*distinct* units are built for one place: the same source file under the same compiler and flags
+(macro definitions aside) with identical donor code counts once.  Units of decompiled projects
+and of the SDK are tried before units of the library, so a library that grows with every title
+does not push them out.  (With four attempts and no order between the kinds, a title visited a
+second time, after the library had grown, lost nine functions it had the first time.)
+
+## Donor units that await symbols
+
+A donor unit can be byte-identical and still rest on an address nothing independent confirms.
+Three cases are settled by evidence the address derivation never looked at:
+
+- a **section of the unit itself** (`.rodata`, `.data`) whose compiled contents, at least eight
+  bytes and not just zeros, are found in the image at the derived address;
+- a **function** the unit calls that was itself found, identical, at that address;
+- a **fixed address** (low memory below `0x80000400`, the hardware registers) that is the same
+  in the donor.
+
+What is left (a `.bss` section, a data symbol no other unit placed) ends
+`identical-awaiting-symbols`: the functions are not attempted again, are counted with the
+`assumed` cases, and `<image>/donors/awaiting_symbols.txt` lists the declarations that would
+settle them. Code that is identical at several addresses with a different symbol each time (a
+getter, a setter), or whose fixed-address symbol is a different address in the target, is the
+shape of a function and not the donor's function; it goes to the resolve stage as before.
+
+## Hand-written code
+
+Part of every image was never C: the entry stub, the exception and interrupt handlers, cache
+and TLB routines. A function with a system instruction (`mfc0`, `mtc0`, `eret`, `cache`, the TLB
+instructions), or with other strong evidence of hand-written code, is not drafted. Its assembly
+source is written (calls, branches and address pairs as names; coprocessor registers by number
+with their names beside them), assembled with GNU as (`-march=vr4300 -mabi=o64`), relocated and
+compared. When the bytes are the target's, the case ends `assembly` and its source is exported
+to `queue/<image>/<name>.s` and listed in `queue/assembly.tsv`. Otherwise it stays
+`probable-handwritten`.
+
+`assembly` is reported apart from what was matched from C: `decompile-batch` gives `identical`
+(C) and `accounted` (C plus assembly). It is never offered for a function a compiler could
+have produced, so it cannot stand in for decompilation.
+
+## Code no known compiler explains
+
+`n64dk/match/idioms.py` holds, for each compiler and level proven so far, how often its functions
+show each encoding and convention (which register an address is built in, how a move is spelled,
+whether arguments are stored on entry).  A stretch of an image that keeps doing something every
+known class all but never does was built by a compiler or assembler the kit does not have.  One
+and the same trait must rule every class out: where each class is ruled out by something
+different, the stretch is only the seam between two known compilers.  A jump out of a function is
+not counted (it is what a wrongly split function looks like).
+
+Such functions are still drafted and tried under the recipes, but the variant search is not run on
+them, and the run's report lists the stretches (`resolve.unknown_toolchain`) with the trait that
+gave them away.  On the title that showed the case, 786 of 1,545 functions lie in such stretches;
+they had taken three quarters of the title's builds and the search had matched none of them.
+`n64dk recipe-prior --project P` shows the same map without running anything.
+
+The remedy is a compiler, not a draft: `n64dk compilers` lists what is installed, and a lane for
+a further compiler is a `[pipelines.<name>]` table.  A lane may list further usual settings
+(`flag_sets`); the ones declared by `decompile-init` carry the optimisation levels and instruction
+sets that published decompilations of real titles were built with.
+
+**A configured recipe is checked against the code.** A project states its recipe (`[run]
+pipeline`, `flags`) and, unless calibration is asked for, the run takes it on trust.  When the
+marks put most of the likelihood of at least four tenths of the image's functions on another
+compiler family or another optimisation level, the run calibrates anyway and records why
+(`recipe_doubt` in the image's report).  A project that had been run at `-O2` for three rounds
+turned out to be `-O1` this way.
+
+## A title somebody has already decompiled
+
+Source that is known to give a title's bytes is the shortest way to them, and the donor stage
+already rebuilds and verifies foreign units.  What it lacked was the build: which files are
+units, where the headers are, which compiler and flags each unit takes, which configuration
+macros are set.  Every source tree says that in its own build files.  `source-donor` does not
+read them; it measures:
+
+    n64dk source-donor --source TREE --project PROJECT --run RUN --out DIR
+
+- units are the C files with a function body (generated directories are left out);
+- include directories come from the `#include` lines: a name not beside the including file is
+  looked up among the tree's files by its path suffix;
+- candidate recipes are the ones the title's own run matched functions under, plus the first of
+  them at the other usual levels; each unit takes the recipe under which most of the title's
+  functions are found in it (masked signatures, the donor stage's comparison);
+- configuration macros are the names the tree tests in `#if` lines and does not define
+  unconditionally.  Each is measured on up to 32 units that can see it and kept when more of the
+  title is found with it.  The measurement runs in rounds, so a macro that only counts once
+  another is set is found too, and of two that exclude each other (two releases) the better one
+  is kept.
+
+The result is a `donors.toml` for `decompile-run --donors`.  Nothing in it is trusted: each
+function still counts only when its unit is rebuilt for the title and verified.
+
+`decompile-batch --source-tree DIR` (repeatable) does this unattended.  Nobody says which tree
+belongs to which title: after a title's first run every tree is measured against it, one that
+gives it at least eight functions becomes a donor of that title, and the title runs again.  The
+batch report lists every tree against every title with what was found.
+
+What is deliberately not taken from a tree:
+
+- **Assembly files.**  In most trees they are the title's own disassembly, and a unit built from
+  them compares equal to the title without being a decompilation.
+- **Routines a C unit pulls in through the assembler** (the macros trees in progress use for
+  functions that are only disassembled).  Only a symbol whose name is followed by a parameter
+  list and a body in the unit, or in a file it includes, is catalogued; the report gives the
+  number left out (`symbols_not_written_in_c`).
+
+A macro the tree compares with something (`#if RELEASE >= RELEASE_C`) is tried at each value it
+is compared with.  A unit that needs a header the tree generates during its own build is reported
+as failed.
+
+## Every function, every byte
+
+`decompile-export` writes a finished run as a tree to commit, and leaves nothing out:
+
+- a function matched from C is its C source;
+- a hand-written function is its assembly source;
+- **every other function is written as assembly that assembles back to its bytes**
+  (`asm_not_decompiled/`).  That is a disassembly, not a decompilation; the table
+  (`FUNCTIONS.tsv`, column `reproduced_by`) and the counts keep the three apart.  A function
+  with several jump tables gets each table in a section of its own.
+- `COVERAGE.md` gives the functions by what reproduces them and **every byte of the ROM by
+  class**, from the survey's ledger: its rows cover the ROM from the first byte to the last, and
+  the report states the bytes no row covers and the bytes two rows claim (both must be 0).
+  Content the survey has a row for and could not identify is the class `unknown`; its largest
+  ranges are listed with what was measured about them.
+
+Functions above 0x400 bytes are drafted and built under their recipe but not put through the
+other recipes or the variant search: they are 5% of functions and 37% of the code, the
+translators for unoptimised builds match some outright, and searching them costs the most.
+
+## Where every function ended
+
+`decompile-batch` closes its report with one table: for each title, the functions matched from C,
+the hand-written ones kept as assembly, and the unmatched ones by the kind of thing that would
+have to change (a compiler the catalogue lacks; the catalogue itself; a draft that does not
+compile; a draft within ten differences; a draft far off, small and larger functions apart).
+
 ## What "finished" means
 
 A case is `exact` only when the engine's strict verifier accepts it: owned text and data equal,
@@ -159,7 +422,8 @@ decision about the project, so the run does not make it: review the file, append
 project's symbol file, and run again. Those cases are then verified strictly like any other.
 
 Everything else is in the case store with a status (`near`, `open`, `does-not-build`,
-`needs-tu`, `blocked-boundary`, `probable-handwritten`, `needs-source`) and a ranked cause;
+`needs-tu`, `blocked-boundary`, `probable-handwritten`, `needs-source`) and a ranked cause
+(`assembly` is the finished state of hand-written code, above);
 `hard-queue --state <out>/state` prints them grouped by cause for whoever works on them next.
 
 `report.md` and `report.json` summarise the run; `events.jsonl` is the stream of what happened.

@@ -74,6 +74,7 @@ class Settings:
     max_score: int = 0                    # 0: no limit; otherwise only cases at most this far
     asm_limit: int = 400                  # instructions of target assembly shown
     diff_limit: int = 40                  # differing instructions shown per round
+    examples: int = 3                     # matched functions of the same image shown as worked examples
     prompt_limit: int = 512 * 1024        # bytes sent to one invocation
     output_limit: int = 512 * 1024        # combined stdout/stderr retained from one invocation
     source_limit: int = 256 * 1024        # one returned translation unit
@@ -93,7 +94,7 @@ class Settings:
                    statuses=tuple(table.get("statuses", STATUSES)), max_size=int(table.get("max_size", 0x400)),
                    max_cases=int(table.get("max_cases", 0)), jobs=int(table.get("jobs", 4)),
                    max_score=int(table.get("max_score", 0)), asm_limit=int(table.get("asm_limit", 400)),
-                   diff_limit=int(table.get("diff_limit", 40)),
+                   diff_limit=int(table.get("diff_limit", 40)), examples=int(table.get("examples", 3)),
                    prompt_limit=int(table.get("prompt_limit", 512 * 1024)),
                    output_limit=int(table.get("output_limit", 512 * 1024)),
                    source_limit=int(table.get("source_limit", 256 * 1024)),
@@ -108,7 +109,7 @@ class Settings:
             raise ValueError("refiner timeout must be between 0 and 86400 seconds")
         if not 1 <= self.jobs <= 64:
             raise ValueError("refiner jobs must be between 1 and 64")
-        for name in ("max_size", "max_cases", "max_score", "asm_limit", "diff_limit"):
+        for name in ("max_size", "max_cases", "max_score", "asm_limit", "diff_limit", "examples"):
             if getattr(self, name) < 0:
                 raise ValueError(f"refiner {name} must be non-negative")
         for name in ("prompt_limit", "output_limit", "source_limit"):
@@ -121,7 +122,7 @@ class Settings:
         import json
         payload = {"command": self.command, "rounds": self.rounds, "timeout": self.timeout,
                    "statuses": self.statuses, "max_size": self.max_size, "max_score": self.max_score,
-                   "asm_limit": self.asm_limit, "diff_limit": self.diff_limit,
+                   "asm_limit": self.asm_limit, "diff_limit": self.diff_limit, "examples": self.examples,
                    "prompt_limit": self.prompt_limit, "output_limit": self.output_limit,
                    "source_limit": self.source_limit,
                    "env_digest": hashlib.sha256(json.dumps(self.env, sort_keys=True).encode()).hexdigest()}
@@ -275,8 +276,10 @@ def _strip_paths(text: str) -> str:
 
 def build_prompt(name: str, recipe: str, assembly: str, best_source: str | None, best_text: str,
                  causes: list[dict], attempts: list[tuple[str, str]], asm_limit: int = 400,
-                 declarations: str = "") -> str:
-    """One round's prompt.  ``attempts`` are this conversation's earlier answers with what the
+                 declarations: str = "", examples: list[tuple[str, str, str]] | None = None,
+                 failed_draft: tuple[str, str] | None = None) -> str:
+    """One round's prompt.  ``examples`` are ``(name, assembly, source)`` of functions of the same
+    image that already compile to their exact bytes under this recipe.  ``attempts`` are this conversation's earlier answers with what the
     compiler made of each (most recent last)."""
     listing = assembly.strip().split("\n")
     if len(listing) > asm_limit + 20:
@@ -286,6 +289,17 @@ def build_prompt(name: str, recipe: str, assembly: str, best_source: str | None,
     if declarations.strip():
         parts += ["", "## Declarations recovered from the whole image (evidence, not truth)", "```c",
                   declarations.strip()[:6000], "```"]
+    if examples:
+        parts += ["", "## Worked examples: other functions of this game that already match",
+                  "Each source below compiles to exactly the assembly shown above it, with this compiler. Use them "
+                  "for the coding style, the types of shared data and the prototypes of shared callees."]
+        for other, listing_text, source in examples:
+            parts += ["", f"### {other}", "```", listing_text.strip(), "```", "```c", source.strip(), "```"]
+    if failed_draft and not best_source:
+        parts += ["", "## A decompiler's draft that does not compile",
+                  "It shows the structure the decompiler recovered. Its types are guesses and it is rejected by the "
+                  "compiler; write source that compiles.", "```c", failed_draft[0].strip(), "```",
+                  "Compiler output:", "```", failed_draft[1].strip()[-1200:], "```"]
     if best_source:
         parts += ["", "## Best C so far", "```c", best_source.strip(), "```", "", "## What the compiler made of it",
                   best_text]
@@ -303,7 +317,7 @@ def build_prompt(name: str, recipe: str, assembly: str, best_source: str | None,
 
 def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, best_source: str | None,
            best_evaluation, causes: list[dict] | None = None, prepare=None, declarations: str = "",
-           emit=None, run=run_command) -> dict:
+           emit=None, run=run_command, examples=None, failed_draft: tuple[str, str] | None = None) -> dict:
     """Converse about one function.  ``evaluate(text) -> (Evaluation, code)``; ``prepare(text)``
     turns an answer into a buildable unit (typedef prelude).  Returns ``{"rounds", "calls",
     "errors", "best_source", "best", "improved", "history"}`` where ``best`` is the Evaluation of
@@ -321,7 +335,8 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
     for round_number in range(1, settings.rounds + 1):
         prompt = build_prompt(name, recipe, assembly, best_text,
                               describe_evaluation(best, settings.diff_limit) if best_text else "",
-                              causes or [], attempts[-2:], settings.asm_limit, declarations)
+                              causes or [], attempts[-2:], settings.asm_limit, declarations,
+                              examples() if callable(examples) else examples, failed_draft)
         if len(prompt.encode()) > settings.prompt_limit:
             errors.append(f"prompt exceeds the {settings.prompt_limit}-byte limit")
             history.append({"round": round_number, "error": errors[-1]})
@@ -363,3 +378,45 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
             break
     return {"rounds": len(history), "calls": calls, "errors": errors, "best_source": best_text, "best": best,
             "improved": rank(best) < start, "history": history}
+
+
+# ---------------------------------------------------------------------------------------------
+# Worked examples.  A model that has never seen this title's compiler output guesses its idioms;
+# functions of the same image that already match are verified (assembly, source) pairs for exactly
+# this compiler, and the ones that share callees or data with the target also carry the
+# prototypes and types the target needs.
+
+class Examples:
+    """Matched functions of one image, ranked per target by what they share with it."""
+
+    def __init__(self, max_bytes: int = 0x140, max_source: int = 2500):
+        self.max_bytes, self.max_source = max_bytes, max_source
+        self._rows: dict[int, tuple[str, int, frozenset, str, str]] = {}   # vram -> name, size, refs, asm, source
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def body(source: str) -> str:
+        """A stored unit without the kit's typedef/macro prelude."""
+        marker = source.rfind("#endif")
+        return (source[marker + 6:] if "N64DK_M2C_PRELUDE" in source and marker >= 0 else source).strip()
+
+    def add(self, name: str, vram: int, size: int, refs, assembly: str, source: str) -> None:
+        text = self.body(source)
+        if not text or size > self.max_bytes or len(text) > self.max_source or "M2C_" in text:
+            return                                             # short, readable sources only
+        with self._lock:
+            self._rows[vram] = (name, size, frozenset(refs), assembly, text)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def pick(self, vram: int, refs, count: int, recipe_of=None) -> list[tuple[str, str, str]]:
+        """Up to ``count`` examples for the function at ``vram`` referring to ``refs``: shared
+        references first, then address distance (neighbours tend to come from one source file)."""
+        if count <= 0:
+            return []
+        refs = frozenset(refs)
+        with self._lock:
+            rows = [(other, row) for other, row in self._rows.items() if other != vram]
+        ranked = sorted(rows, key=lambda item: (-len(refs & item[1][2]), abs(item[0] - vram)))
+        return [(row[0], row[3], row[4]) for _other, row in ranked[:count]]

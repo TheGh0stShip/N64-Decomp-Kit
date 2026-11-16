@@ -71,6 +71,50 @@ class ResolveTest(unittest.TestCase):
         case = resolve.resolve(self.store, "main", "piece", BASE, FRAGMENT, fake_evaluate(calls), source=SOURCE, jobs=1)
         self.assertEqual((case.status, case.top_cause, calls), ("blocked-boundary", "boundary.fragment", []))
 
+    HANDWRITTEN = code([0x40086000, 0x2401FFFE, 0x01014824, 0x40896000, 0x31020001, 0x00000000,
+                        0x03E00008, 0x00000000])          # mfc0/mtc0 Status: no compiler writes this
+
+    def test_handwritten_code_is_kept_as_assembly_when_its_source_assembles_back(self):
+        calls = []
+
+        def draft(family=None):
+            return None, "not reached"
+        draft.assembly = lambda: ("glabel irq_off\n    mfc0 $t0, $12\n", {"verdict": "exact", "assumptions": []})
+        case = resolve.resolve(self.store, "main", "irq_off", BASE, self.HANDWRITTEN, fake_evaluate(calls),
+                               draft=draft, jobs=1)
+        self.assertEqual((case.status, calls), ("assembly", []))
+        self.assertIn("mfc0", self.store.source(case.best_digest))
+        self.assertEqual(case.strict.get("verdict"), "exact")
+        self.assertIn("gnu-as", case.recipe)
+
+    def test_assembly_is_exported_beside_the_queue_and_not_in_it(self):
+        import pathlib
+
+        def draft(family=None):
+            return None, "not reached"
+        draft.assembly = lambda: ("glabel irq_off\n    mfc0 $t0, $12\n", {"verdict": "exact", "assumptions": []})
+        resolve.resolve(self.store, "main", "irq_off", BASE, self.HANDWRITTEN, fake_evaluate([]), draft=draft,
+                        jobs=1, rom_offset=0x1000)
+        out = pathlib.Path(_scratch("n64dk-queue-test-"))
+        found = resolve.export_queue(self.store, out)
+        self.assertEqual((found["assembly"], found["assembly_bytes"], found["exported"]), (1, 32, 0))
+        self.assertIn("mfc0", (out / "main" / "irq_off.s").read_text())
+        table = (out / "assembly.tsv").read_text()
+        self.assertIn("0x1000\t0x20\tmain/irq_off.s\t# 0x80001000", table)
+        self.assertFalse((out / "queue.tsv").exists())
+
+    def test_handwritten_code_without_a_proved_source_stays_a_finding(self):
+        calls = []
+
+        def draft(family=None):
+            return None, "not reached"
+        draft.assembly = lambda: None
+        case = resolve.resolve(self.store, "main", "irq_off", BASE, self.HANDWRITTEN, fake_evaluate(calls),
+                               draft=draft, jobs=1)
+        self.assertEqual((case.status, calls), ("probable-handwritten", []))
+        plain = resolve.resolve(self.store, "main", "irq_off2", BASE, self.HANDWRITTEN, fake_evaluate(calls), jobs=1)
+        self.assertEqual(plain.status, "probable-handwritten")
+
     def test_changed_target_archives_the_old_case(self):
         calls, events = [], []
         resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate(calls), source=SOURCE, jobs=1)
@@ -255,6 +299,42 @@ class ResolveTest(unittest.TestCase):
                                                                      "conflicts": ["wrong callee"]})
         self.assertEqual(other.status, "open")
         self.assertIn("wrong callee", other.next)
+
+    def test_assumed_case_is_reverified_not_recomputed(self):
+        verdicts = [{"verdict": "assumed", "assumptions": [{"kind": "symbol", "name": "gThing"}]}, {"verdict": "exact"}]
+        calls, seen = [], []
+
+        def strict(text, recipe):
+            seen.append(recipe)
+            return verdicts[min(len(seen), 2) - 1]
+        exact_source = SOURCE.replace("u16 value;", "s16 value;")
+        arguments = dict(jobs=1, strict=strict, recipe_label="ido5.3 -O2", draft=lambda family: [("plain", exact_source)])
+        first = resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate(calls, proof=False), **arguments)
+        self.assertEqual(first.status, "assumed")
+        builds = len(calls)
+        again = resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate(calls, proof=False),
+                                **{**arguments, "recipe_label": "kmc -O2"})
+        self.assertEqual((again.status, len(calls), seen), ("exact", builds, ["ido5.3 -O2", "ido5.3 -O2"]))
+        self.assertEqual(self.store.get(first.case_id).status, "exact")
+
+    def test_rerun_continues_under_the_stored_recipe_and_never_gets_worse(self):
+        def default(text):
+            return iterate.Evaluation(8, False, {"counts": {"register": 8}}), WRONG
+
+        def sibling(text):
+            return iterate.Evaluation(2, False, {"counts": {"register": 2}}), WRONG
+        arguments = dict(jobs=1, pipeline="kmc", recipe_label="kmc -O2", draft=lambda family: [("plain", SOURCE)])
+        first = resolve.resolve(self.store, "main", "read", BASE, TARGET, default, **arguments,
+                                recipes=lambda family: [("ido5.3 -O2", "ido5.3", sibling)])
+        self.assertEqual((first.status, first.best_score, first.recipe), ("near", 2, "ido5.3 -O2"))
+        again = resolve.resolve(self.store, "main", "read", BASE, TARGET, default, **arguments,
+                                recipes=lambda family: [("ido5.3 -O2", "ido5.3", sibling)])
+        self.assertEqual((again.status, again.best_score, again.recipe), ("near", 2, "ido5.3 -O2"))
+        events = []
+        kept = resolve.resolve(self.store, "main", "read", BASE, TARGET, default, **arguments, emit=events.append)
+        self.assertEqual((kept.status, kept.best_score, kept.recipe), ("near", 2, "ido5.3 -O2"))
+        self.assertIn("case-kept-previous", [e["event"] for e in events])
+        self.assertEqual(self.store.get(first.case_id).best_score, 2)
 
     def test_exact_without_strict_proof_is_never_persisted(self):
         case = resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate([], proof=False), source=SOURCE,

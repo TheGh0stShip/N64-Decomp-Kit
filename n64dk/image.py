@@ -36,6 +36,7 @@ class Segment:
     game_codec: str | None = None      # the game's own routine that unpacks it (n64dk.gamecodec)
     evidence: str = ""
     data: bytes = field(default=b"", repr=False)
+    phys: int | None = None       # where it lies in RAM, when the program runs it at a mapped address
 
     @property
     def end(self) -> int:
@@ -111,12 +112,42 @@ def needs_emulation(b: bootmod.BootInfo) -> bool:
     return b.staged or len(b.calls) > 1
 
 
-def build(rom: Rom, mode: str = "auto", max_steps: int = 150_000_000) -> ProgramImage:
-    """``mode``: ``auto`` (emulate only when the entry routine runs a loader), ``static``
-    or ``emulated``."""
+STUB_FUNCTIONS = 256       # a boot image with fewer functions than any game has is looked at again
+STUB_GAIN = 2              # ... and replaced when what it unpacks holds this many times more
+
+
+def count_functions(rom: Rom, program: "ProgramImage") -> int:
+    from .analysis import functions
+    try:
+        return len(functions.discover(rom, program=program).functions)
+    except Exception:                                        # noqa: BLE001 - a count, never a reason to stop
+        return 0
+
+
+def build(rom: Rom, mode: str = "auto", max_steps: int = 150_000_000, count=count_functions) -> ProgramImage:
+    """``mode``: ``auto``, ``static`` or ``emulated``.
+
+    ``auto`` emulates when the entry routine runs a loader.  An entry routine can also look
+    ordinary and still belong to a stub: its *program* unpacks the game and jumps to it.  Nothing
+    in the entry routine says so; the size of the program does.  A boot image with fewer
+    functions than any game has is emulated as well, and the image the emulation reaches replaces
+    it when that holds several times more code."""
     b = bootmod.analyse(rom)
-    if mode == "static" or (mode == "auto" and not needs_emulation(b)):
+    if mode == "static":
         return static_image(rom, b)
+    if mode == "auto" and not needs_emulation(b):
+        static = static_image(rom, b)
+        small = count(rom, static)
+        if small >= STUB_FUNCTIONS:
+            return static
+        emulated = emulated_image(rom, b, max_steps)
+        if emulated.method != "emulated":
+            return static
+        unpacked = count(rom, emulated)
+        if unpacked < max(STUB_FUNCTIONS // 4, STUB_GAIN * small):
+            return static
+        emulated.loader["stub"] = {"functions": small, "unpacked_functions": unpacked}
+        return emulated
     return emulated_image(rom, b, max_steps)
 
 
@@ -146,8 +177,19 @@ def emulated_image(rom: Rom, b: bootmod.BootInfo, max_steps: int = 150_000_000) 
     ram = res.image_ram
     pieces = [p for p in res.pieces("image") if p[1] > LOW_MEMORY]
     pieces = [(max(lo, LOW_MEMORY), hi, kind, src) for lo, hi, kind, src in pieces]
-    target = (hand_over or 0) & 0x1FFFFFFF
+    target = res.physical(hand_over or 0)
+    target = -1 if target is None else target
     idx = next((i for i, p in enumerate(pieces) if p[0] <= target < p[1] and p[2] != "zero"), None)
+    boot_lo, boot_hi = b.main_vram & 0x1FFFFFFF, (b.main_vram & 0x1FFFFFFF) + min(b.copy_size, rom.size - b.main_rom)
+    if idx is None and boot_lo <= target < boot_hi and not 0x80000000 <= (hand_over or 0) < 0xC0000000:
+        # Nothing was unpacked: the program is the boot copy itself, run at a mapped address.
+        # Its calls and its data use that address, so that is where the image is placed.
+        vram, lo, hi = res.linear(hand_over, boot_lo, boot_hi)
+        start = b.main_rom + lo - boot_lo
+        main = Segment(vram, hi - lo, "rom", start, start + hi - lo, data=rom.data[start:start + hi - lo], phys=lo,
+                       evidence=f"IPL3 copy, run mapped at 0x{vram:08X} (RAM 0x{lo | 0x80000000:08X})")
+        loader["mapped"] = [f"0x{v:08X}+0x{n:X} -> RAM 0x{p | 0x80000000:08X}" for v, n, p in res.mappings[:16]]
+        return ProgramImage("emulated", b.entry, hand_over, b.stack_top, [main], b, loader, res.first_args)
     if idx is None:
         loader["warning"] = "hand-over is not in written RAM; using the static image"
         img = static_image(rom, b)
@@ -155,18 +197,26 @@ def emulated_image(rom: Rom, b: bootmod.BootInfo, max_steps: int = 150_000_000) 
         img.hand_over = hand_over
         return img
     lo, hi, kind, src = pieces[idx]
+    # A program that runs at a mapped address: the part of the piece its translation covers in
+    # one straight run, at the addresses the program itself uses.
+    vram, lo, hi = res.linear(hand_over, lo, hi)
+    mapped = vram != lo | 0x80000000
+    if mapped and src is not None:
+        src += lo - pieces[idx][0]
     # contiguous zero runs after the main piece form its BSS
     bss_hi = hi
     for p in pieces[idx + 1:]:
-        if p[0] != bss_hi or p[2] != "zero":
+        if p[0] != bss_hi or p[2] != "zero" or mapped:
             break
         bss_hi = p[1]
-    vram = lo | 0x80000000
     if kind == "dma":
         main = Segment(vram, hi - lo, "rom", src, src + hi - lo, evidence="PI DMA by the loader",
                        data=bytes(ram[lo:hi]))
     else:
         main = Segment(vram, hi - lo, "packed", evidence="written by the loader", data=bytes(ram[lo:hi]))
+        if mapped:
+            main.phys = lo
+            main.evidence += f"; runs mapped at 0x{vram:08X} (RAM 0x{lo | 0x80000000:08X})"
         _trace_source(rom, b, res, main)
     # Exact end and BSS: the loader's own BSS bounds, else the second stage's entry routine
     # (the same walk over the unpacked code at the hand-over), else the codec output size,
@@ -195,7 +245,7 @@ def emulated_image(rom: Rom, b: bootmod.BootInfo, max_steps: int = 150_000_000) 
             main.rom_end = main.rom + main.size
     main.evidence += f"; end: {how}"
     if bss is None and bss_hi > hi:
-        bss = (main.end, bss_hi | 0x80000000, "zero at the hand-over")
+        bss = (main.end, main.end + bss_hi - hi, "zero at the hand-over")
     segs = [main]
     if bss and bss[1] > bss[0]:
         segs.append(Segment(bss[0], bss[1] - bss[0], "bss", evidence=bss[2]))
@@ -226,7 +276,8 @@ def _trace_source(rom: Rom, b: bootmod.BootInfo, res: emu.EmuResult, main: Segme
     """Find the packed source of a loader-written segment: RAM the loader read (not code it
     ran, not the output itself) mapped back to ROM through the DMAs and the boot copy."""
     executed = res.image_executed
-    out_lo, out_hi = main.vram & 0x1FFFFFFF, main.end & 0x1FFFFFFF
+    out_lo = main.phys if main.phys is not None else main.vram & 0x1FFFFFFF
+    out_hi = out_lo + main.size
     dmas = [d for d in res.dmas if d.step < (res.image_step or 0)]
     boot_lo = b.main_vram & 0x1FFFFFFF
     boot_hi = boot_lo + b.copy_size

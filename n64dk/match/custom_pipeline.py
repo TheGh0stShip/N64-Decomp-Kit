@@ -52,6 +52,7 @@ class Recipe:
     timeout: float = 120.0
     variables: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
+    flag_sets: list[list[str]] = field(default_factory=list)    # further usual settings, tried after the default
 
     def digest_material(self) -> str:
         """Everything that identifies this recipe for an object-cache key (tool files included)."""
@@ -90,7 +91,8 @@ def load(project: str | Path, config: str | Path | None = None) -> dict[str, Rec
             raise CustomPipelineError(f"[pipelines.{name}] family must be \"gcc\" or \"ido\"")
         out[name] = Recipe(name, list(steps), family, [str(f) for f in table.get("default_flags", [])],
                            float(table.get("timeout", 120)), {k: str(v) for k, v in (table.get("vars") or {}).items()},
-                           {k: str(v) for k, v in (table.get("env") or {}).items()})
+                           {k: str(v) for k, v in (table.get("env") or {}).items()},
+                           [[str(f) for f in flags] for flags in (table.get("flag_sets") or []) if isinstance(flags, list)])
     return out
 
 

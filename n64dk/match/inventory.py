@@ -6,11 +6,14 @@ many functions and tiny assembly/shared-tail units cannot accidentally change th
 """
 from __future__ import annotations
 
+import os
+
 import csv
 import hashlib
 import re
 import tomllib
 from dataclasses import asdict, dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 
@@ -59,6 +62,9 @@ class InventoryFunction:
     mapping_evidence: tuple[str, ...]
     rank: float | None
     library_identity: str | None = None
+    manifest_declared: bool = False
+    verified: str | None = None
+    verification: dict | None = None
 
     def as_dict(self) -> dict:
         value = asdict(self)
@@ -72,9 +78,29 @@ def _inventory_config(project: Path) -> dict:
     if not path.is_file():
         return {}
     try:
-        return tomllib.loads(path.read_text()).get("inventory", {})
-    except tomllib.TOMLDecodeError:
+        return tomllib.loads(path.read_text()).get("inventory", {}) or {}
+    except (tomllib.TOMLDecodeError, OSError):
         return {}
+
+
+def _configured_images(project: Path) -> dict[Path, tuple[str, dict]]:
+    path = project / "n64dk.toml"
+    if not path.is_file():
+        return {}
+    try:
+        images = tomllib.loads(path.read_text()).get("images", {}) or {}
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+    found = {}
+    for name, table in images.items():
+        if not isinstance(table, dict):
+            continue
+        value = table.get("catalogue") or table.get("functions")
+        if value:
+            catalogue = Path(value)
+            catalogue = catalogue if catalogue.is_absolute() else project / catalogue
+            found[Path(os.path.abspath(catalogue))] = (name, table)
+    return found
 
 
 def _catalogues(project: Path) -> list[Path]:
@@ -82,6 +108,7 @@ def _catalogues(project: Path) -> list[Path]:
     if configured:
         return sorted((project / value).resolve() for value in configured)
     conventional = set(project.glob("config/**/functions_*.toml"))
+    conventional.update(_configured_images(project))
     # Game-agnostic fallback: accept TOML files that actually contain section/function tables,
     # while excluding kit/progress configuration by content rather than filename convention.
     candidates = list(project.glob("config/**/*.toml")) + list(project.glob("analysis/**/functions.toml"))
@@ -112,12 +139,59 @@ def _sections(path: Path) -> list[tuple[int, int, int]]:
             for row in data.get("section", [])]
 
 
+def image_delta(project: Path, image: str) -> int | None:
+    """Declared ``vram - file offset`` of a logical image (``[images.<name>] vram_delta``), or
+    None when the project does not declare one.  Names are compared without ``_``/``-`` and case."""
+    path = Path(project) / "n64dk.toml"
+    if not path.is_file():
+        return None
+    try:
+        entries = tomllib.loads(path.read_text()).get("images", {}) or {}
+    except (tomllib.TOMLDecodeError, OSError):
+        return None
+
+    def key(text: str) -> str:
+        return text.replace("_", "").replace("-", "").lower()
+    for name, table in entries.items():
+        if isinstance(table, dict) and key(name) == key(image) and "vram_delta" in table:
+            def number(value) -> int:
+                return int(value, 0) if isinstance(value, str) else int(value)
+            # the catalogue may list an image at addresses shifted from where it links
+            return number(table["vram_delta"]) + number(table.get("catalogue_shift", 0))
+    return None
+
+
+def image_manifests(project: Path, image: str) -> list[Path]:
+    """Manifests the project declares for a logical image (``[images.<name>] manifests``): the
+    list the matcher and the image registry read, so the inventory reads it too."""
+    path = Path(project) / "n64dk.toml"
+    try:
+        entries = tomllib.loads(path.read_text()).get("images", {}) or {}
+    except (tomllib.TOMLDecodeError, OSError):
+        return []
+
+    def key(text: str) -> str:
+        return text.replace("_", "").replace("-", "").lower()
+    for name, table in entries.items():
+        if isinstance(table, dict) and key(name) == key(image):
+            return [Path(os.path.abspath(Path(project) / str(value))) for value in table.get("manifests", []) or []
+                    if (Path(project) / str(value)).is_file()]
+    return []
+
+
 def _manifest_intervals(project: Path, image: str,
                         sections: list[tuple[int, int, int]]) -> list[Interval]:
     result: list[Interval] = []
     configured = _inventory_config(project).get("manifests", {})
-    configured_rows = configured.get(image, []) if isinstance(configured, dict) else []
-    patterns = [(project / value).resolve() for value in configured_rows]
+    configured_rows = configured.get(image, []) if isinstance(configured, dict) else configured
+    patterns = []
+    for value in configured_rows or []:
+        path = Path(value)
+        if path.is_absolute():
+            patterns.extend(Path(p) for p in __import__("glob").glob(str(path), recursive=True))
+        else:
+            patterns.extend(project.glob(str(path)))
+    patterns += image_manifests(project, image)
     patterns += list(project.glob(f"config/**/matching_{image}_*units.tsv"))
     patterns += list(project.glob(f"config/**/matching_{image}_units.tsv"))
     # The resident/main image commonly predates image-qualified manifest names.
@@ -136,7 +210,18 @@ def _manifest_intervals(project: Path, image: str,
         except ValueError:
             return int(value, 16)
 
-    for path in sorted(set(patterns)):
+    # A manifest offset is an offset into the image file the matcher builds against.  When the
+    # project declares that image with its placement (``[images.<name>] vram_delta``), the
+    # address is ``offset + vram_delta`` -- the same resolution the matcher uses -- and never
+    # an offset relative to a catalogue section, whose ``rom`` field is a different coordinate.
+    declared_delta = image_delta(project, image)
+    configured_table = next((table for name, table in _configured_images(project).values()
+                             if name == image), {})
+    configured_bias = configured_table.get("rom_bias") if configured_table else None
+    configured_bias = (int(configured_bias, 0) if isinstance(configured_bias, str)
+                       else int(configured_bias)) if configured_bias is not None else None
+
+    for path in sorted({Path(os.path.abspath(p)) for p in patterns}):   # one file, one reading; links kept
         with path.open(newline="") as stream:
             for row in csv.reader((line for line in stream if line.strip() and not line.startswith("#")),
                                   delimiter="\t"):
@@ -152,7 +237,14 @@ def _manifest_intervals(project: Path, image: str,
                     source = row[0]
                 else:
                     source = row[2]
-                    section = next((s for s in sections if s[1] <= rom < s[1] + s[2]), None)
+                    if declared_delta is not None:
+                        placed = rom + declared_delta
+                        section = next((s for s in sections if s[0] <= placed < s[0] + s[2]), None)
+                        if section is not None:
+                            section = (section[0], section[0] - declared_delta, section[2])
+                    else:
+                        mapped_rom = rom - (configured_bias or 0)
+                        section = next((s for s in sections if s[1] <= mapped_rom < s[1] + s[2]), None)
                     if section is None:
                         # A row outside every declared coordinate space is retained as a
                         # contradiction rather than silently shifted by a game-specific bias.
@@ -160,14 +252,13 @@ def _manifest_intervals(project: Path, image: str,
                                                str(path.relative_to(project)),
                                                row[4] if len(row) > 4 and re.fullmatch(r"[0-9a-fA-F]{64}", row[4]) else None))
                         continue
-                    vram = section[0] + rom - section[1]
+                    vram = section[0] + (rom if declared_delta is not None else mapped_rom) - section[1]
                 suffix = Path(source).suffix.lower()
                 kind = "assembly" if suffix in {".s", ".asm"} else "source"
                 result.append(Interval(vram, vram + size, source, kind,
                                        str(path.relative_to(project)),
                                        next((value for value in row[3:] if re.fullmatch(r"[0-9a-fA-F]{64}", value)), None)))
     return result
-
 
 def _candidate_source(project: Path, name: str, vram: int, index=None) -> str | None:
     if index is not None:
@@ -208,7 +299,19 @@ def _splat(project: Path) -> list[dict]:
     return result
 
 
-def build(project: str | Path, refresh_sources: bool = False) -> dict:
+def _exclusion(name: str, status: str, rules: dict) -> str | None:
+    for pattern in rules.get("exclude_names", []) or []:
+        if fnmatchcase(name, pattern):
+            return f"exclude_names {pattern!r}"
+    normalized = re.sub(r"[\s_-]+", " ", status.strip().lower())
+    for pattern in rules.get("exclude_kinds", []) or []:
+        if fnmatchcase(normalized, re.sub(r"[\s_-]+", " ", pattern.strip().lower())):
+            return f"exclude_kinds {pattern!r}"
+    return None
+
+
+def build(project: str | Path, refresh_sources: bool = False,
+          verification: dict | None = None) -> dict:
     root = Path(project).expanduser().resolve()
     from .source_index import SourceIndex
     source_index = SourceIndex(root)
@@ -217,12 +320,19 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
     from .toolchain import load_config
     from .verification_store import current as current_verifications
     cfg = load_config(root)
+    provided_verification = verification or {}
     receipts = current_verifications(root, cfg)
+    if verification is not None:
+        receipts = {(source, vram, 0): value for (source, vram), value in verification.items()
+                    if value.get("verdict") == "exact"}
     functions: list[InventoryFunction] = []
     images = []
     unmapped_claims = []
+    configured_images = _configured_images(root)
+    exclusions = _inventory_config(root)
+    excluded_rows = []
     for catalogue in _catalogues(root):
-        image = _image_name(catalogue)
+        image = configured_images.get(Path(os.path.abspath(catalogue)), (_image_name(catalogue), {}))[0]
         sections = _sections(catalogue)
         claims = _manifest_intervals(root, image, sections)
         unmapped_claims += [{"image": image, "manifest": claim.manifest, "source": claim.source}
@@ -276,6 +386,7 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
             asm_owners = [claim for claim in owners if claim.kind == "assembly"]
             normalized_status = re.sub(r"[\s-]+", "_", status.strip().lower())
             structural = {normalized_status} & {value.replace("-", "_") for value in _STRUCTURAL_KINDS}
+            explicit_exclusion = _exclusion(name, status, exclusions)
             candidate = _candidate_source(root, name, start, source_index)
             # A catalogue comment and a discovered source file are evidence, not proof of
             # coverage.  Only an exact matching manifest may remove an interval from work.
@@ -283,12 +394,21 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                                  and len([claim for claim in intersecting if claim.kind == "source"]) == 1
                                  and all(claim.kind == "source" or "padding" in claim.source.lower()
                                          for claim in intersecting))
-            verified_owners = [claim for claim in source_owners
-                               if (claim.source, claim.start, claim.end - claim.start) in receipts]
+            def receipt_for(claim):
+                return (receipts.get((claim.source, claim.start, claim.end - claim.start)) or
+                        receipts.get((claim.source, claim.start, 0)))
+            verified_owners = [claim for claim in source_owners if receipt_for(claim)]
+            row_verification = receipt_for(source_owners[0]) if source_owners else None
+            if source_owners and row_verification is None:
+                row_verification = provided_verification.get((source_owners[0].source,
+                                                               source_owners[0].start))
+            verified = ("exact" if verified_owners else
+                        row_verification.get("verdict") if row_verification else None)
             if padding_partition and next((claim for claim in intersecting if claim.kind == "source"), None) in verified_owners:
                 claim = next(claim for claim in intersecting if claim.kind == "source")
                 state, reason, owner = "covered", "C unit plus explicit padding partition owns catalogue interval", claim.source
                 ownership_state, coverage_authority, rank = "manifest_exact_member", "manifest", None
+                verified, row_verification = "exact", receipt_for(claim)
                 owners, partial = intersecting, []
             elif len(source_owners) > 1:
                 state, reason, owner = "conflict", "multiple authoritative C owners", None
@@ -303,19 +423,24 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                 ownership_state = ("manifest_exact_unit" if claim.start == start and claim.end == end
                                    else "manifest_exact_member")
                 coverage_authority = "manifest"
+                verified, row_verification = "exact", receipt_for(claim)
                 rank = None
             elif source_owners:
                 claim = source_owners[0]
                 source_path = Path(claim.source)
                 source_path = source_path if source_path.is_absolute() else root / source_path
-                digest_ok = (claim.declared_digest is not None and source_path.is_file())
                 state = "claimed"
                 reason = ("manifest ownership claim awaits strict rebuild verification" if source_path.is_file()
                           else "manifest ownership claim references missing source")
                 owner = claim.source
                 ownership_state = "manifest_nonexact"
                 coverage_authority = "manifest-claim"
+                verified = (verified or ("unverified" if source_path.is_file() else "source-missing"))
                 rank = None
+            elif explicit_exclusion:
+                state, reason, owner = "excluded", explicit_exclusion, None
+                ownership_state, coverage_authority, rank = "configured_exclusion", None, None
+                excluded_rows.append({"name": name, "image": image, "reason": explicit_exclusion})
             elif structural and not candidate:
                 state, reason = "excluded", "non-independent interval: " + ", ".join(sorted(structural))
                 owner, rank = asm_owners[0].source if asm_owners else None, None
@@ -348,10 +473,12 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                                      candidate, tuple(evidence), rank,
                                      ("libultra" if any("libultra" in value.lower() for value in
                                         ([owner] if owner else []) + [claim.source for claim in owners])
-                                      else None))
+                                      else None), bool(source_owners), verified, row_verification)
             functions.append(item)
             image_rows.append(item)
+        configured = Path(os.path.abspath(catalogue)) in configured_images or bool(_inventory_config(root).get("catalogues"))
         images.append({"name": image, "catalogue": str(catalogue.relative_to(root)),
+                       "discovery": "configured" if configured else "default",
                        "functions": len(image_rows),
                        "covered": sum(row.state == "covered" for row in image_rows),
                        "claimed": sum(row.state == "claimed" for row in image_rows),
@@ -403,14 +530,23 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                     "denominator_delta": denominator_delta,
                     "covered": sum(row.state == "covered" for row in functions),
                     "claimed": sum(row.state == "claimed" for row in functions),
+                    "manifest_declared": sum(row.manifest_declared for row in functions),
+                    "manifest_verified_current": sum(row.verified == "exact" for row in functions),
+                    "unmapped_manifest_rows": len(unmapped_claims),
+                    "verification": {state: sum(row.verified == state for row in functions)
+                                     for state in ("exact", "assumed", "mismatch", "build-failed",
+                                                   "unverified", "source-missing")},
                     "remaining": sum(row.state == "remaining" for row in functions),
                     "assembly": sum(row.state == "assembly" for row in functions),
                     "excluded": sum(row.state == "excluded" for row in functions),
                     "conflicts": len(conflicts), "unowned": len(unowned)},
         "consistency": {"ok": bool(functions) and not conflicts and not unowned and not unmapped_claims
+                              and not any(row.verified == "source-missing" for row in functions)
                               and denominator_delta in (None, 0),
                         "reason": "no catalogue functions discovered" if not functions else None,
                         "conflicts": [row.id for row in conflicts],
+                        "problems": (["no catalogue functions discovered"] if not functions else []),
+                        "missing_sources": [row.id for row in functions if row.verified == "source-missing"],
                         "unmapped_manifest_rows": unmapped_claims,
                         "missing_ownership": [row.id for row in unowned],
                         "denominator_mismatch": ({"catalogue_functions": len(functions),
@@ -418,6 +554,7 @@ def build(project: str | Path, refresh_sources: bool = False) -> dict:
                                                    "delta": denominator_delta}
                                                   if denominator_delta not in (None, 0) else None)},
         "reconciliation": reconciliation,
+        "discovery": {"exclusions": excluded_rows, "unmapped_manifest_rows": unmapped_claims},
         "functions": [row.as_dict() for row in functions],
     }
 

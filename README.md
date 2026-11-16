@@ -40,6 +40,10 @@ python3 -m venv .venv
 First-draft lifting is optional. Install it with `.venv/bin/pip install -e '.[draft]'`;
 ordinary analysis and matching do not require m2c.
 
+Historical compiler binaries are not bundled. `n64dk compilers` reports the supported catalogue,
+installed lanes, missing helpers and checksums; `n64dk compilers --fetch --toolchain-dir DIR`
+can fetch checksum-pinned public packages. Review the reported sources and licensing before use.
+
 ROM images are never part of the repository. Pass a path on the command line; tests and
 fixtures find ROMs through `roms.toml` (ignored by git) or the `N64DK_ROMS` environment
 variable (see [Tests](#tests)).
@@ -60,6 +64,26 @@ n64dk survey baserom.z64 --out out/survey
 unpacked when the game packs it). Games whose boot loader unpacks the program with an
 unknown codec are emulated, and the game's own routine is used as the codec. Add
 `--require-complete` to fail while any byte is still `unknown`.
+
+For a ROM-only unattended decompilation pass:
+
+```bash
+n64dk decompile-init baserom.z64 --out work/title
+n64dk decompile-run --project work/title --all-images --out work/title/.n64dk/run
+n64dk decompile-export --project work/title --run work/title/.n64dk/run --out out/title
+```
+
+`decompile-init` discovers loaded images, functions, symbols, compiler evidence and a complete ROM
+ledger. `decompile-run` tries verified donors, compiler-specific draft generators, strict rebuilds,
+bounded source search and an optional external refiner. `decompile-export` keeps four categories
+separate: strictly verified C, C awaiting independent symbol declarations, verified assembly, and
+generated assembly for code not decompiled. Generated assembly and raw-word fallbacks provide byte
+coverage but never count as C decompilation.
+
+The run planner is deliberately conservative: at most four build jobs by default, with 2 GiB held
+in reserve and observed swap reported in the `resource-plan` event. Set `N64DK_MAX_JOBS` to lower
+the cap. `N64DK_ALLOW_OVERSUBSCRIBE=1` is the explicit unsafe override; unattended collection runs
+should remain sequential.
 
 Every command accepts `--format json` before the command name for machine-readable output:
 
@@ -83,6 +107,13 @@ export, and proof boundaries.
 
 | Command | What it does |
 |---|---|
+| `decompile-init ROM --out PROJECT` | Build a logical-image project, catalogue, symbols, compiler lanes and byte ledger from a bare ROM |
+| `decompile-run --project PROJECT --all-images --out DIR` | Run the checkpointed donor/draft/recipe/search/strict-verification pipeline with bounded resources |
+| `decompile-batch ROM... --out DIR` | Process titles sequentially and share only independently verified donor results |
+| `decompile-export --project PROJECT --run DIR --out DIR` | Export every function with honest C/assembly/unresolved provenance and full ROM-byte coverage |
+| `source-donor TREE --project PROJECT` | Measure an existing C source tree and split verified translation units into reusable per-function donors |
+| `sdk-donor TREE --out DIR` | Build version/flavour-specific libultra donor descriptions |
+| `compilers` | Audit or fetch the checksum-pinned catalogue of known retail N64 compilers and usable lanes |
 | `info ROM` | Header, CIC, checksum, main segment, stack, BSS, hand-over, staged boot |
 | `disasm ROM VRAM SIZE` | Disassemble a range of the main segment |
 | `survey ROM --out DIR [--image auto\|static\|emulated] [--require-complete]` | Everything below over the program image; report and ROM ledger |
@@ -102,7 +133,7 @@ export, and proof boundaries.
 | `match-session-try SESSION_ID` | Apply in-memory edits and compile a batch of source/flag variants |
 | `match-session-status SESSION_ID` | Show the best result and nondominated residual frontier |
 | `match-session-export SESSION_ID OUTPUT` | Export a retained candidate only when explicitly requested |
-| `match-inventory --project DIR` | Reconcile catalogues and manifest intervals, including aggregate translation units |
+| `match-inventory --project DIR [--verify]` | Reconcile catalogues and manifest intervals; optionally rebuild and cache strict current-source receipts |
 | `context-bundle --project DIR --image IMAGE --function NAME` | Collect target code, callers, callees, globals and access patterns |
 | `quickwin-sweep --project DIR --all-images --limit N --jobs N` | Create/resume a persistent ranked cross-function tranche |
 | `quickwin-sweep-status ID [--status active]` | Filter tranche rows and inspect current versus historical best results |
@@ -177,6 +208,12 @@ of `exact`; `assumed` results remain research evidence only. See
 [goal and invariants](docs/durable-goal.md), and the paste-ready
 [Madden operator handoff](docs/MADDEN_ROUND4_HANDOFF.md).
 
+Region-recipe retry, nearest-unit recipe retry, and search suppression based on an
+unknown-toolchain classifier are retained as experiments but are off by default: their measured
+returns were 3/126, 0/165, and not sufficiently validated, respectively. Enable them explicitly
+with `--region-recipes`, `--unit-recipes`, or `--skip-unknown-search`; ordinary runs still use
+manifest-proven per-unit recipes and report unknown-toolchain evidence without treating it as fact.
+
 Run `n64dk COMMAND --help` for every option.
 
 ## Library use
@@ -207,6 +244,10 @@ report = survey.run(rom)["report"]
   usage, evidence, verification boundary and limitations
 * [docs/autonomous-tranches.md](docs/autonomous-tranches.md): interval inventories, context
   bundles, cross-function scheduling, compact session output and exact-winner preparation
+* [docs/decompile-run.md](docs/decompile-run.md): bare-ROM initialization, unattended stages,
+  resource limits, donors, refinement, batch operation and export semantics
+* [docs/claude-integration-audit.md](docs/claude-integration-audit.md): recovered-lab integration
+  ledger, accepted/rejected experiments, verification gates and remaining external limitations
 * [docs/tooling-research.md](docs/tooling-research.md): upstream workflow concepts and the
   first-class operations that replace repeated searches, extraction and comparison calls
 * [docs/AUTOMATION_HANDOFF.md](docs/AUTOMATION_HANDOFF.md): operating and reporting

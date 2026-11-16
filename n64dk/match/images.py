@@ -95,6 +95,27 @@ def _int(value) -> int:
     return value if isinstance(value, int) else int(str(value), 0)
 
 
+def _catalogue_delta(path: Path, shift: int) -> int | None:
+    """Infer a linear image delta from an explicitly mapped catalogue section.
+
+    Small extracted images used by projects and tests are not complete N64 ROMs, so boot-header
+    discovery is unavailable.  A section carrying both ``vram`` and ``rom`` is nevertheless an
+    independent, exact mapping.  Refuse to infer when mapped sections disagree.
+    """
+    if not path.is_file():
+        return None
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    deltas = set()
+    sections = data.get("section", []) if isinstance(data, dict) else []
+    for section in sections if isinstance(sections, list) else []:
+        if isinstance(section, dict) and "vram" in section and "rom" in section:
+            deltas.add(_int(section["vram"]) - shift - _int(section["rom"]))
+    return next(iter(deltas)) if len(deltas) == 1 else None
+
+
 def load_registry(project) -> dict[str, ImageSpec]:
     project = Path(project)
     config = project / "n64dk.toml" if project.is_dir() else project
@@ -112,15 +133,21 @@ def load_registry(project) -> dict[str, ImageSpec]:
         for pattern in table.get("manifests", []):
             hits = sorted(root.glob(pattern)) if any(c in str(pattern) for c in "*?[") else [root / pattern]
             manifests += hits
+        catalogue = root / table["catalogue"] if table.get("catalogue") else None
+        shift = _int(table.get("catalogue_shift", 0))
+        declared_delta = _int(table["vram_delta"]) if "vram_delta" in table else None
+        mapped_delta = _catalogue_delta(catalogue, shift) if catalogue and declared_delta is None else None
         out[name] = ImageSpec(
             name, root / image_path,
-            _int(table["vram_delta"]) if "vram_delta" in table else None,
-            root / table["catalogue"] if table.get("catalogue") else None,
-            _int(table.get("catalogue_shift", 0)),
+            declared_delta if declared_delta is not None else mapped_delta,
+            catalogue,
+            shift,
             manifests,
             [(_int(a), _int(b), _int(c), str(d)) for a, b, c, d in table.get("raw_segments", [])],
             list(table.get("aliases", [])),
-            tuple(_int(x) for x in table["extent"]) if table.get("extent") else None)
+            tuple(_int(x) for x in table["extent"]) if table.get("extent") else None,
+            "declared" if declared_delta is not None else
+            ("catalogue section map" if mapped_delta is not None else "declared"))
     return out
 
 

@@ -42,7 +42,39 @@ def _common(p):
     p.add_argument("--vram-delta", type=_int, help="VRAM minus file offset (omit for a ROM with a boot segment)")
     p.add_argument("--catalogue", required=True, help="function catalogue TOML or symbol_addrs.txt")
     p.add_argument("--catalogue-shift", type=_int, default=0)
-    p.add_argument("--show", type=int, default=30)
+    p.add_argument("--show", type=_int, default=30, help="how many flagged rows to list (a count)")
+    p.add_argument("--function", metavar="NAME_OR_ADDRESS",
+                   help="report one catalogued function only: its name, or its address in hex or decimal")
+
+
+def _one_entry(wanted: str, functions, starts, data, delta) -> dict:
+    """The entry verdict of one function, selected by name or by address (hex or decimal)."""
+    try:
+        address = int(wanted, 0)
+    except ValueError:
+        address = None
+    chosen = [f for f in functions if f[0] == wanted or (address is not None and f[1] == address)]
+    if not chosen:
+        raise SystemExit(f"entry-audit: no catalogued function named or starting at {wanted!r}")
+    name, vram, size = chosen[0]
+    flow = flowmod.analyse_in_image(data, delta, vram, size)
+    found = [c for c in causemod.target_causes(flow, starts) if c.confidence >= 0.6]
+    family = causemod.compiler_family(flow)
+    ordered = sorted(starts)
+    position = ordered.index(vram)
+    before = next((f for f in functions if position and f[1] == ordered[position - 1]), None)
+    falls_in = False
+    if before is not None and before[1] + before[2] == vram:
+        previous = flowmod.analyse_in_image(data, delta, before[1], before[2])
+        last = previous.insns[-2:] if len(previous.insns) >= 2 else previous.insns
+        falls_in = not any(i.kind in ("return", "jump", "jr") or (i.kind == "branch" and i.word >> 16 == 0x1000)
+                           for i in last)
+    return {"name": name, "vram": f"0x{vram:08X}", "size": f"0x{size:X}",
+            "entry": found[0].id if found else "complete", "strict_entry": not found and not falls_in,
+            "predecessor": before[0] if before else None, "predecessor_fallthrough": falls_in,
+            "frame_size": flow.frame.size, "compiler_family": family,
+            "causes": [{"cause": c.id, "confidence": round(c.confidence, 2), "evidence": c.evidence[:3],
+                        "next": c.next} for c in found]}
 
 
 @command("entry-audit", "Classify every catalogued range: complete function, fragment, false split, "
@@ -51,6 +83,8 @@ def entry_audit(args):
     data, delta = _image(args)
     functions = _functions(args, data, delta)
     starts = {vram for _n, vram, _s in functions}
+    if getattr(args, "function", None):
+        return _one_entry(args.function, functions, starts, data, delta)
     verdicts, families, nops, shapes = Counter(), Counter(), Counter(), Counter()
     rows, padding = [], 0
     for name, vram, size in functions:

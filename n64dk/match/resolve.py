@@ -36,6 +36,7 @@ from pathlib import Path
 
 from ..analysis import flow as flowmod
 from . import causes as causemod
+from . import handasm
 from . import iterate as itermod
 
 BLOCKING = ("boundary.fragment", "boundary.false_split", "boundary.embedded_data")
@@ -46,8 +47,8 @@ BLOCKING = ("boundary.fragment", "boundary.false_split", "boundary.embedded_data
 SEARCH_CEILING = 40
 CROSS_DRAFTS, CROSS_RECIPES = 4, 8      # drafts x recipes tried when no draft is exact under the default recipe
 
-STATUSES = ("exact", "assumed", "near", "open", "blocked-boundary", "needs-tu", "probable-handwritten", "needs-source",
-            "does-not-build", "stale")
+STATUSES = ("exact", "assumed", "assembly", "near", "open", "blocked-boundary", "needs-tu", "probable-handwritten",
+            "needs-source", "does-not-build", "stale")
 # rough tractability of the top cause, used only to order the queue (higher = sooner)
 TRACTABILITY = {"compiler.family": 0.95, "type.signedness": 0.9, "type.width": 0.9, "type.volatile": 0.85, "register.lifetime": 0.8,
                 "global.declaration": 0.7, "control.branch_form": 0.6, "control.branch_likely": 0.6,
@@ -175,7 +176,8 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
             neighbours: set[int] | None = None, budget: int = 300, jobs: int = 8, force: bool = False,
             near: int = 10, emit=None, pipeline: str | None = None, recipes=None, strict=None,
             recipe_label: str = "", rom_offset: int | None = None,
-            search_ceiling: int | None = SEARCH_CEILING, frame_fit: bool = True) -> Case:
+            search_ceiling: int | None = SEARCH_CEILING, frame_fit: bool = True,
+            cross_recipes: int | None = None, fresh: bool = False) -> Case:
     """Run the ladder for one function and store the case.
 
     ``evaluate(text) -> (iterate.Evaluation, relocated candidate bytes or None)``;
@@ -185,7 +187,10 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     the baseline source when the bytes carry another compiler family's fingerprint or the
     baseline is far off; ``strict(text, recipe_label) -> dict`` re-verifies an exact candidate
     with the non-circular oracle (its verdict is stored on the case; a ``mismatch`` demotes the
-    case to ``open``); ``emit(event_dict)`` receives progress events."""
+    case to ``open``); ``emit(event_dict)`` receives progress events.  ``fresh`` starts again from
+    the drafts under the given recipe instead of continuing the stored case (whose best source
+    and recipe may be what kept it from matching); the stored case still stands when the new
+    attempt ends further away."""
     size, digest = len(target), hashlib.sha256(target).hexdigest()
     key = case_id(image, vram, size)
 
@@ -201,12 +206,60 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         previous = None
     if previous is not None and previous.status == "exact" and not force:
         return previous
+    if previous is not None and previous.status == "assumed" and not force and source is None:
+        # Byte-identical already; the only open question is whether the addresses it leans on have
+        # been declared since.  Ask the verifier again with the recipe the match was found under.
+        # Re-running the ladder here could only lose the match (it would start from the default
+        # recipe), so the stored case is returned whatever the verifier says.
+        if strict is not None and previous.best_digest:
+            try:
+                again = strict(store.source(previous.best_digest) or "", previous.recipe) or {}
+            except Exception:
+                again = {}
+            if again.get("verdict") == "exact":
+                previous.strict, previous.status = again, "exact"
+                previous.next = ""
+                previous.stages.append({"stage": "strict-verify", "verdict": "exact", "assumptions": 0,
+                                        "origin": "re-verified"})
+                store.put(previous)
+                event("case-exact", top_cause=previous.top_cause, score=previous.best_score, builds=previous.builds)
+        return previous
     case = Case(key, image, name, vram, size, digest, recipe=recipe_label, rom_offset=rom_offset)
-    if previous is not None:
+    if previous is not None and not fresh:
         case.closed_families, case.best_digest, case.best_score = (previous.closed_families, previous.best_digest,
                                                                    previous.best_score)
+        if source is None and previous.best_digest and previous.recipe and previous.recipe != recipe_label \
+                and recipes is not None:
+            # the stored best was built under another recipe: continue under that one
+            try:
+                for label, recipe_pipeline, recipe_evaluate in recipes(None):
+                    if label == previous.recipe:
+                        evaluate, pipeline, case.recipe = recipe_evaluate, recipe_pipeline, label
+                        break
+            except Exception:
+                pass
+
+    _RANK = {"exact": 0, "assumed": 1, "near": 2}
 
     def finish(status: str, ranked, next_step: str = "") -> Case:
+        done = _finish(status, ranked, next_step)
+        if previous is None or force or source is not None:
+            return done
+        # A rerun never makes a case worse: the earlier result stays when this one is further away.
+        # Findings about the target itself (boundary, ABI, hand-written) are new information and stand.
+        if done.status in _RANK or done.status in ("open", "does-not-build", "needs-source"):
+            before, after = _RANK.get(previous.status, 3), _RANK.get(done.status, 3)
+            worse = after > before or (after == before and previous.best_score is not None
+                                       and (done.best_score is None or done.best_score > previous.best_score))
+            if worse:
+                previous.builds = done.builds + previous.builds
+                store.put(previous)
+                event("case-kept-previous", status=previous.status, score=previous.best_score,
+                      rerun_status=done.status, rerun_score=done.best_score)
+                return previous
+        return done
+
+    def _finish(status: str, ranked, next_step: str = "") -> Case:
         if status in ("exact", "assumed") and case.proof and case.proof.get("verdict") not in (None, "not-run"):
             # the evaluator already verified strictly (engine proof): one verdict, one place
             case.strict = dict(case.proof)
@@ -248,12 +301,30 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
                         "compiler_family": fingerprint["family"], "family_confidence": fingerprint["confidence"]})
     by_id = {c.id: c for c in found}
     if not force:
+        handwritten = by_id.get("assembly.handwritten") and by_id["assembly.handwritten"].confidence >= 0.8
+        if handwritten:
+            # Never C: its faithful source is assembly.  Kept when that source assembles back to
+            # the same bytes (``draft.assembly``), and reported apart from what was matched from C.
+            # This comes before the boundary findings: hand-written routines branch into and fall
+            # through to one another, which is what those findings see.
+            kept, assemble = None, getattr(draft, "assembly", None)
+            if assemble is not None:
+                try:
+                    kept = assemble()
+                except Exception:                           # noqa: BLE001 - the finding itself still stands
+                    kept = None
+            if kept:
+                text_kept, proof_kept = kept
+                case.best_digest, case.best_score = store.save_source(text_kept), 0
+                case.recipe, case.strict = handasm.RECIPE, dict(proof_kept)
+                return finish(handasm.STATUS, found, "hand-written code: kept as assembly source that "
+                                                     "assembles to the same bytes")
         blocking = [c for c in found if c.id in BLOCKING and c.confidence >= 0.7]
         if blocking:
             return finish("blocked-boundary", found)
         if by_id.get("abi.nonstandard") and by_id["abi.nonstandard"].confidence >= 0.7:
             return finish("needs-tu", found)
-        if by_id.get("assembly.handwritten") and by_id["assembly.handwritten"].confidence >= 0.8:
+        if handwritten:
             return finish("probable-handwritten", found)
 
     # 2. source
@@ -304,7 +375,7 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     if recipes is not None and base is not None and not base.exact and scored:
         candidates = [row for row in scored if row[0] != 1 << 30][:CROSS_DRAFTS]
         tried, chosen = 0, None
-        for label, recipe_pipeline, recipe_evaluate in list(recipes(family))[:CROSS_RECIPES]:
+        for label, recipe_pipeline, recipe_evaluate in list(recipes(family))[:cross_recipes or CROSS_RECIPES]:
             for row in candidates:
                 evaluation, code = recipe_evaluate(row[3])
                 tried += 1
@@ -408,7 +479,10 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         if chosen:
             event("recipe-selected", recipe=chosen, score=base.score)
     if base.score is None:
-        case.stages.append({"stage": "baseline", "error": (base.error or "")[-300:]})
+        # the draft is kept although it does not build: its error is the next thing to fix, by a
+        # repair rule or by whoever is asked about the case later
+        case.stages.append({"stage": "baseline", "error": (base.error or "")[-900:],
+                            "source_digest": store.save_source(text)})
         return finish("does-not-build", causemod.diagnose(target, None, vram, flow, neighbours),
                       "fix the compile error: " + (base.error or "")[-200:])
     case.best_score, case.best_digest = base.score, store.save_source(text)
@@ -521,10 +595,23 @@ def export_queue(store: CaseStore, out: Path, image: str | None = None, include_
     (one ``NAME = 0xADDRESS;`` per symbol, for review: declaring them is the operator's decision,
     after which a rerun verifies those cases strictly).  Nothing is written anywhere but ``out``."""
     out = Path(out)
-    rows, skipped, assumptions = [], [], []
+    rows, skipped, assumptions, assembly = [], [], [], []
     declarations: dict[tuple[str, str], list[str]] = {}
     for case in store.all():
-        if case.status not in ("exact", "assumed") or (image and case.image != image):
+        if image and case.image != image:
+            continue
+        if case.status == handasm.STATUS:
+            # hand-written code kept as assembly source that assembles to the same bytes
+            text = store.source(case.best_digest)
+            if text is None or (case.strict or {}).get("verdict") != "exact":
+                skipped.append({"case": case.case_id, "name": case.name, "strict": "assembly-unproved"})
+                continue
+            folder = out / case.image
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"{case.name}.s").write_text(text)
+            assembly.append((case.image, case.rom_offset, case.vram, case.size, f"{case.image}/{case.name}.s"))
+            continue
+        if case.status not in ("exact", "assumed"):
             continue
         verdict = (case.strict or case.proof or {}).get("verdict", "unverified")
         if case.status == "assumed" and verdict == "exact":
@@ -562,6 +649,16 @@ def export_queue(store: CaseStore, out: Path, image: str | None = None, include_
             lines.append(f"{start}\t0x{size:X}\t{source}\t{flags}\t# 0x{vram:08X} {verdict}")
         return lines
 
+    if assembly:
+        out.mkdir(parents=True, exist_ok=True)
+        lines, current = [], None
+        for image_name, rom_offset, vram, size, source in sorted(assembly, key=lambda r: (r[0], r[2])):
+            if image_name != current:
+                current = image_name
+                lines.append(f"# image {image_name}; {handasm.RECIPE}; ROM_START SIZE SOURCE  (# VRAM)")
+            start = f"0x{rom_offset:X}" if rom_offset is not None else "?"
+            lines.append(f"{start}\t0x{size:X}\t{source}\t# 0x{vram:08X}")
+        (out / "assembly.tsv").write_text("\n".join(lines) + "\n")
     if rows:
         out.mkdir(parents=True, exist_ok=True)
         (out / "queue.tsv").write_text("\n".join(table("exact")) + "\n")
@@ -573,4 +670,5 @@ def export_queue(store: CaseStore, out: Path, image: str | None = None, include_
                     for (name, address), users in sorted(declarations.items(), key=lambda kv: kv[0][1])))
     return {"exported": len(rows), "bytes": sum(r[4] for r in rows),
             "strict_exact": sum(1 for r in rows if r[7] == "exact"),
-            "assumed": sum(1 for r in rows if r[7] == "assumed"), "skipped": skipped, "out": str(out)}
+            "assumed": sum(1 for r in rows if r[7] == "assumed"), "assembly": len(assembly),
+            "assembly_bytes": sum(r[3] for r in assembly), "skipped": skipped, "out": str(out)}

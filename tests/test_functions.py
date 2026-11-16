@@ -81,6 +81,78 @@ def synthetic_rom() -> Rom:
     return Rom(bytes(data))
 
 
+def rom_of(words_at: dict[int, list[int]], entry: int = BASE) -> Rom:
+    data = bytearray(0x101000)
+    struct.pack_into(">I", data, 0, 0x80371240)
+    struct.pack_into(">I", data, 8, entry)
+    for off, words in words_at.items():
+        for i, w in enumerate(words):
+            struct.pack_into(">I", data, 0x1000 + off - 0x400 + 4 * i, w)
+    return Rom(bytes(data))
+
+
+class HandOverTest(unittest.TestCase):
+    """An entry routine that hands over through a register to code that does not start right
+    behind it: data lies between, and the hand-over is the only way in."""
+
+    def rom(self) -> Rom:
+        return rom_of({
+            0x400: [lui(T0, 0x8000), addiu(T0, T0, 0x0500), jr(T0), NOP],
+            0x410: [0x47414D45, 0x20444154, 0x41000000, 0x00010203] * 4,          # data, not code
+            0x500: [addiu(SP, SP, -0x18), sw(RA, 0x14, SP), jal(0x80000540), NOP,
+                    lw(RA, 0x14, SP), jr(RA), addiu(SP, SP, 0x18)],
+            0x540: [jr(RA), addiu(V0, ZERO, 7)],
+        })
+
+    def test_the_program_behind_the_data_is_found(self):
+        from n64dk import boot
+        rom = self.rom()
+        info = boot.analyse(rom)
+        self.assertEqual(info.main_call, 0x80000500)
+        starts = {f.start for f in fn.discover(rom).functions}
+        self.assertLessEqual({0x80000400, 0x80000500, 0x80000540}, starts)
+
+
+class JumpIntoDataTest(unittest.TestCase):
+    """A jump whose target follows a return and does not decode as code (a jump into a table).
+    The target is proposed as a start, dropped when its walk fails, and must not be proposed
+    again on the next pass: the discovery once never returned on such a title."""
+
+    def test_growth_ends_and_the_target_is_not_a_function(self):
+        import signal
+        target = 0x80000410
+        rom = rom_of({
+            0x400: [jal(0x80000480), NOP, jr(RA), addiu(V0, ZERO, 1)],
+            0x410: [I(0x20, ZERO, V1, 0xDEB0)] * 3 + [0x7C000000] * 2,            # reads as loads, then as nothing
+            0x480: [(2 << 26) | ((target >> 2) & 0x3FFFFFF), NOP],                # a function that jumps back there
+        })
+
+        def late(*_args):
+            raise AssertionError("function discovery did not end")
+        previous = signal.signal(signal.SIGALRM, late)
+        signal.alarm(20)
+        try:
+            found = fn.discover(rom)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        starts = {f.start for f in found.functions}
+        self.assertIn(0x80000480, starts)
+        self.assertNotIn(target, starts)
+
+
+class RelocatedEntryTest(unittest.TestCase):
+    def test_the_image_is_placed_where_the_boot_code_puts_it(self):
+        from n64dk import boot
+        rom = rom_of({0x400: [jal(0x80000420), NOP, jr(RA), NOP], 0x420: [jr(RA), addiu(V0, ZERO, 1)]},
+                     entry=0x80100400)
+        rom.cic = "6103"                                             # this boot chip moves the entry down 1 MiB
+        self.assertEqual(rom.entry_vram, 0x80000400)
+        info = boot.analyse(rom)
+        self.assertEqual((info.entry, info.main_vram), (0x80000400, 0x80000400))
+        self.assertIn(0x80000420, {f.start for f in fn.discover(rom).functions})
+
+
 class SyntheticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -169,3 +241,52 @@ class FixtureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeadReturnTest(unittest.TestCase):
+    """A debug build's frameless functions are followed by returns nothing reaches."""
+
+    VRAM = 0x80001000
+    FRAMED = bytes.fromhex("27bdfff8" "afa40008" "10000001" "00000000" "03e00008" "27bd0008")   # with b +1; nop
+    LEAF = bytes.fromhex("00851021" "03e00008" "00000000")                                     # addu; jr ra; nop
+    STUB = bytes.fromhex("03e00008" "00000000")
+
+    def _catalogue(self, parts, optimised=False):
+        from n64dk.analysis import functions
+        data, rows, at = b"", [], self.VRAM
+        framed = self.FRAMED if not optimised else self.FRAMED[:8] + bytes(8) + self.FRAMED[16:]
+        for index in range(24):                                # enough framed functions to judge the build
+            parts = [("framed", framed, "call")] + parts if index else parts
+        for name, code, seed in parts:
+            rows.append(functions.Function(at, at + len(code), at + len(code), name=f"{name}_{at:X}", seed=seed,
+                                           kind="c", frame=8 if name == "framed" else 0))
+            data += code
+            at += len(code)
+        cat = functions.Catalogue.__new__(functions.Catalogue)
+        cat.functions = rows
+        return cat, data
+
+    def test_unreferenced_return_only_ranges_join_the_frameless_function_before_them(self):
+        from n64dk.analysis import functions
+        cat, data = self._catalogue([("leaf", self.LEAF, "call"), ("stub", self.STUB, "unreferenced"),
+                                     ("stub", self.STUB, "unreferenced"), ("leaf", self.LEAF, "call")])
+        before = len(cat.functions)
+        result = functions.merge_dead_returns(cat, data, self.VRAM)
+        self.assertEqual((result["debug_build"], result["merged"]), (True, 2))
+        self.assertEqual(len(cat.functions), before - 2)
+        leaf = next(f for f in cat.functions if f.name.startswith("leaf"))
+        self.assertEqual(leaf.size, len(self.LEAF) + 16)
+        self.assertEqual(data[leaf.start - self.VRAM:leaf.end - self.VRAM][-16:], self.STUB * 2)
+
+    def test_a_referenced_empty_function_and_one_behind_a_framed_function_stay(self):
+        from n64dk.analysis import functions
+        cat, data = self._catalogue([("leaf", self.LEAF, "call"), ("stub", self.STUB, "call"),
+                                     ("framed", self.FRAMED, "call"), ("stub", self.STUB, "unreferenced")])
+        self.assertEqual(functions.merge_dead_returns(cat, data, self.VRAM)["merged"], 0)
+
+    def test_an_optimised_build_is_left_alone(self):
+        from n64dk.analysis import functions
+        cat, data = self._catalogue([("leaf", self.LEAF, "call"), ("stub", self.STUB, "unreferenced")], optimised=True)
+        before = len(cat.functions)
+        self.assertEqual(functions.merge_dead_returns(cat, data, self.VRAM), {"merged": 0, "debug_build": False})
+        self.assertEqual(len(cat.functions), before)

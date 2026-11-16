@@ -209,6 +209,9 @@ def _simm(ins) -> int:
     return v - 0x10000 if v & 0x8000 else v
 
 
+WEAK_SEEDS = ("tail", "pointer", "data_pointer", "sweep")     # starts no call vouches for
+
+
 class Analyser:
     def __init__(self, image: Image, entry: int, text_hint_end: int | None = None, text_lo: int | None = None):
         self.img = image
@@ -216,6 +219,7 @@ class Analyser:
         self.text_lo = entry if text_lo is None else text_lo
         self.text_hi = text_hint_end or image.end
         self.starts: dict[int, str] = {}
+        self.rejected: set[int] = set()          # weak starts dropped because they do not walk as code
         self.bodies: dict[int, Body] = {}
         self.findings: list[Finding] = []
         self.data_regions: list[tuple[int, int]] = []
@@ -380,6 +384,10 @@ class Analyser:
     def add(self, v: int, seed: str) -> bool:
         if v in self.starts or v not in self.img or v % 4 or not (self.text_lo <= v < self.text_hi):
             return False
+        if seed in WEAK_SEEDS and v in self.rejected:
+            # Dropped once because it does not walk as code.  The jump that proposed it is still
+            # there and would propose it on every pass: growth would never end.
+            return False
         self.starts[v] = seed
         return True
 
@@ -404,10 +412,12 @@ class Analyser:
             self.bodies = bodies
             # Drop weak starts whose walk hits invalid code (calls into data, misread tails).
             for s, b in bodies.items():
-                weak = self.starts.get(s) in ("tail", "pointer", "data_pointer", "sweep")
+                weak = self.starts.get(s) in WEAK_SEEDS
                 if weak and (not b.ok or (b.fell_through and self.starts[s] == "sweep" and s not in self.evidence)):
                     reason = b.reason or "falls into the next function"
                     self.findings.append(Finding(s, "rejected_start", f"{self.starts[s]} seed: {reason}"))
+                    if not b.ok:                              # what does not walk never will
+                        self.rejected.add(s)
                     del self.starts[s]
                     new = True
             if not new:
@@ -483,7 +493,8 @@ class Analyser:
         top = max(ends)
         refs = self.code_refs()
         data_refs = sorted(r.address for r in refs if r.kind in ("load", "store") and r.address >= top)
-        floor = data_refs[0] if data_refs else self.img.end
+        # a data reference may point past the loaded image (bss): the sweep stops at the image's end
+        floor = min(data_refs[0], self.img.end) if data_refs else self.img.end
         # Continue past the last reached function while the bytes keep forming functions.
         pc = top
         while pc < floor:
@@ -552,11 +563,23 @@ def main_image(rom: Rom, info: bootmod.BootInfo | None = None, program=None) -> 
     return Image(data[info.main_rom:info.main_rom + size], info.main_vram), info
 
 
-def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None) -> Catalogue:
+def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds=()) -> Catalogue:
+    """``seeds`` are further addresses known to start functions (for a segment that was not reached
+    through a boot entry: its stack-frame prologues), so the call closure does not depend on the
+    first function reaching the rest."""
     image, info = main_image(rom, info, program)
     # After IPL3 the entry is the first word of text; a loader's hand-over can be anywhere in it.
     an = Analyser(image, info.entry, text_lo=info.main_vram if program is not None else None)
     an.add(info.entry, "entry")
+    # The entry routine hands over through a register (``jr``), which the call closure does not
+    # follow.  Where the program's code does not start right behind the entry routine (data lies
+    # between), that hand-over is the only way in.
+    main_call = getattr(info, "main_call", None)
+    if main_call and main_call != info.entry and image.vram <= main_call < image.end and main_call & 3 == 0:
+        an.add(main_call, "call")
+    for seed in seeds:
+        if image.vram <= seed < image.end and seed & 3 == 0:
+            an.add(seed, "call")
     # Phase 1: call closure inside the image.
     an.grow()
     text_end = an.find_text_end()
@@ -966,6 +989,46 @@ def to_toml(cat: Catalogue, title: str = "") -> str:
                      f' # {f.kind}{(" " + ",".join(f.flags)) if f.flags else ""}')
     lines.append("]")
     return "\n".join(lines) + "\n"
+
+
+RETURN_ONLY = bytes.fromhex("03e0000800000000")              # jr $ra; nop
+_FALL_THROUGH = bytes.fromhex("1000000100000000")            # b +1; nop
+
+
+def merge_dead_returns(cat: Catalogue, data: bytes, vram: int) -> dict:
+    """Give a debug build's functions back the code nothing reaches.
+
+    IDO without optimisation ends every function with a return for control falling off the end,
+    and compiles each ``return`` as a jump to the epilogue.  In a function with a stack frame that
+    is ``b L; nop; L: <epilogue>``.  In a frameless one the epilogue is nothing but ``jr $ra``, so
+    every jump to it is itself ``jr $ra; nop`` and the function's code is followed by one or two
+    more of them that no path reaches.  A sweep for function starts takes each for an empty
+    function.  They are part of the function in front of them: compiled alone, that function
+    produces them again, and its interval has to hold them to be matched.
+
+    Only done for an image that *is* such a build (a quarter or more of its framed functions show
+    the ``b +1; nop`` fall-through), and only for a return-only range nothing references that
+    directly follows a frameless function with no padding between."""
+    functions = sorted(cat.functions, key=lambda f: f.start)
+
+    def body(f) -> bytes:
+        return data[f.start - vram:f.body_end - vram]
+
+    framed = [f for f in functions if f.frame]
+    falling = sum(1 for f in framed if any(body(f)[at:at + 8] == _FALL_THROUGH for at in range(0, len(body(f)) - 7, 4)))
+    if len(framed) < 20 or falling * 4 < len(framed):
+        return {"merged": 0, "debug_build": False}
+    kept, merged = [], 0
+    for f in functions:
+        before = kept[-1] if kept else None
+        if before is not None and f.seed == "unreferenced" and body(f) == RETURN_ONLY and before.end == f.start \
+                and before.body_end == before.end and not before.frame and before.kind != "asm":
+            before.end, before.body_end = f.end, f.body_end
+            merged += 1
+            continue
+        kept.append(f)
+    cat.functions[:] = kept
+    return {"merged": merged, "debug_build": True, "framed": len(framed), "fall_through": falling}
 
 
 def to_symbol_addrs(cat: Catalogue) -> str:

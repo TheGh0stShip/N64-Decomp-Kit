@@ -61,6 +61,35 @@ class BuildError(RuntimeError):
     pass
 
 
+DEFAULT_TOOL_TIMEOUT = 120.0
+
+
+def tool_timeout(cfg: Config | None = None) -> float | None:
+    """Per-tool wall-clock limit.
+
+    ``N64DK_TOOL_TIMEOUT`` wins, then an optional project configuration value, then 120 seconds.
+    A value of zero deliberately disables the limit.
+    """
+    value = os.environ.get("N64DK_TOOL_TIMEOUT")
+    if value is None and cfg is not None:
+        value = getattr(cfg, "tool_timeout", None)
+    if value is None:
+        return DEFAULT_TOOL_TIMEOUT
+    value = float(value)
+    return value if value > 0 else None
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 @dataclass
 class BuildSpec:
     pipeline: str
@@ -109,7 +138,8 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0, timeout: float | Non
     if env:
         full_env.update(env)
     started = time.monotonic()
-    timeout = timeout or float(os.environ.get("N64DK_TOOL_TIMEOUT", "120"))
+    if timeout is None:
+        timeout = tool_timeout()
     for _attempt in range(retries + 1):
         proc = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=full_env,
                                 stdin=subprocess.PIPE if stdin is not None else None,
@@ -120,12 +150,13 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0, timeout: float | Non
         except subprocess.TimeoutExpired:
             # Compilers often leave pass executables behind.  Terminate the whole private
             # process group so a timed-out tranche worker cannot leak cc1/uopt/wibo children.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            _kill_group(proc)
             stdout, stderr = proc.communicate()
-            raise BuildError(f"{Path(str(argv[0])).name} timed out after {timeout:g}s")
+            raise BuildError(f"{Path(str(argv[0])).name} timed out after {timeout:g}s") from None
+        except BaseException:
+            _kill_group(proc)
+            proc.communicate()
+            raise
         proc.stdout, proc.stderr = stdout, stderr
         crashed = proc.returncode < 0 or "died due to signal" in (proc.stderr or "")
         if not (proc.returncode and crashed):
@@ -295,6 +326,44 @@ def dependency_digest(source: Path, spec: BuildSpec, cfg: Config,
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def include_closure_digest(source: Path, spec: BuildSpec, cfg: Config,
+                           includes: list[Path] | None = None,
+                           defines: list[str] | None = None) -> str:
+    """Public dependency identity used by tests and verification receipts."""
+    # Defines are already represented separately in the object identity.  Feed command-line
+    # -D values through the same parser so computed includes still resolve here.
+    enriched = BuildSpec(spec.pipeline, [*spec.flags, *(defines or [])], dict(spec.section_bases),
+                         dict(spec.symbols), list(spec.normalizer_args))
+    return dependency_digest(source, enriched, cfg, includes)
+
+
+_PATH_OPTIONS = ("-I", "-isystem", "-iquote", "-idirafter")
+
+
+def absolute_flags(flags: list[str], project: Path) -> list[str]:
+    """Make path-bearing compiler options independent of the private build directory."""
+    project = Path(project).resolve()
+    out, index = [], 0
+    while index < len(flags):
+        flag = flags[index]
+        if flag in _PATH_OPTIONS and index + 1 < len(flags):
+            path = Path(flags[index + 1])
+            out += [flag, str((project / path).resolve() if not path.is_absolute() else path.resolve())]
+            index += 2
+            continue
+        replaced = False
+        for option in _PATH_OPTIONS:
+            if flag.startswith(option) and len(flag) > len(option) and flag != "-I-":
+                path = Path(flag[len(option):])
+                out.append(option + str((project / path).resolve() if not path.is_absolute() else path.resolve()))
+                replaced = True
+                break
+        if not replaced:
+            out.append(flag)
+        index += 1
+    return out
+
+
 def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
           includes: list[Path] | None = None, defines: list[str] | None = None) -> Path:
     """Compile ``source`` and return the object path inside ``workdir``.  Commands run in the
@@ -364,28 +433,7 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
                 os.replace(temporary, cache)
                 _CACHE_STATS["stores"] += 1
         return obj
-    def absolute_flags(flags: list[str]) -> list[str]:
-        """Make path-bearing options stable when tools run in the private unit directory."""
-        out, index = [], 0
-        while index < len(flags):
-            flag = flags[index]
-            if flag in include_options and index + 1 < len(flags):
-                path = Path(flags[index + 1])
-                out += [flag, str((cwd / path).resolve() if not path.is_absolute() else path.resolve())]
-                index += 2
-                continue
-            replaced = False
-            for option in include_options:
-                if flag.startswith(option) and len(flag) > len(option):
-                    path = Path(flag[len(option):])
-                    out.append(option + str((cwd / path).resolve() if not path.is_absolute() else path.resolve()))
-                    replaced = True
-                    break
-            out.append(flag) if not replaced else None
-            index += 1
-        return out
-
-    private_flags = absolute_flags(spec.flags)
+    private_flags = absolute_flags(spec.flags, cwd)
     if pipe.startswith("kmc"):
         kmc = cfg.toolchain("kmc")
         if kmc is None:

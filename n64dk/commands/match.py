@@ -28,6 +28,25 @@ from ..match import inventory as inventorymod
 from ..rom import Rom
 
 
+def _sqlite_retry(action, attempts: int = 5, delay: float = 0.1):
+    """Retry transient SQLite contention and return a visible warning on persistent failure."""
+    import time
+    for attempt in range(attempts):
+        try:
+            action()
+            return None
+        except sqlite3.OperationalError as error:
+            transient = any(word in str(error).lower() for word in ("locked", "busy"))
+            if transient and attempt + 1 < attempts:
+                time.sleep(delay * (2 ** attempt))
+                continue
+            suffix = f" (after {attempt + 1} attempts)" if transient else ""
+            return f"history not recorded: {error}{suffix}"
+        except (sqlite3.Error, OSError) as error:
+            return f"history not recorded: {type(error).__name__}: {error}"
+    return "history not recorded"
+
+
 def _exact_project_evidence(cfg, args, outcome, source, spec, target):
     if not outcome.exact or outcome.vram is None:
         return {}
@@ -151,10 +170,18 @@ def _setup(args):
         rows = [row for row in inventory["functions"] if int(row["vram"], 0) == args.addr
                 and int(row["size"]) == args.size]
         if args.image_name:
+            known = {row["image"] for row in inventory["functions"]}
+            if known and args.image_name not in known:
+                raise SystemExit(f"--image-name {args.image_name!r} is not an inventory image "
+                                 f"(images: {', '.join(sorted(known))})")
             rows = [row for row in rows if row["image"] == args.image_name]
+            if not rows and known:
+                raise SystemExit(f"no catalogue function at 0x{args.addr:08X} size 0x{args.size:X} "
+                                 f"in image {args.image_name!r}")
         if len(rows) > 1:
-            choices = ", ".join(sorted({row["image"] for row in rows}))
-            raise ValueError(f"target interval is ambiguous across images ({choices}); pass --image-name")
+            choices = "; ".join(f"{row['image']}:{row['name']} (rom {row.get('rom')})" for row in rows)
+            raise SystemExit(f"0x{args.addr:08X} size 0x{args.size:X} exists in {len(rows)} images: "
+                             f"{choices}; pass --image-name")
         if len(rows) == 1:
             resolved = resolve_image_map(rom_path, from_inventory(rows[0]))
             comparison_addr = _mapped_comparison_addr(
@@ -271,7 +298,7 @@ def match(args):
         payload["manifest_row"] = manifest_row(o, cfg.project, source, target, syms)
         payload.update(_exact_project_evidence(cfg, args, o, source, spec, target))
     # Direct observations enter the same durable history as sessions immediately.
-    try:
+    def record_history():
         from ..match.results import ResultIndex
         address, size = o.vram, o.size
         target_offset = address - target.delta
@@ -285,11 +312,11 @@ def match(args):
                 source.stem if re.fullmatch(r"func_[0-9A-Fa-f]{8}", source.stem) else None,
                 "valid_current_target" if target_digest else "unknown_provenance")
         finally: history.close()
+    warning = _sqlite_retry(record_history)
+    if warning is None:
         payload["history"] = "recorded"
-    except (sqlite3.Error, OSError) as error:
-        # A match remains useful when history is unavailable, but losing the observation must
-        # be visible to both humans and automation rather than silently swallowed.
-        payload["history"] = f"not recorded: {error}"
+    else:
+        payload["history"] = warning
     if args.format == "json":
         return payload
     lines = [f"{'MATCH' if o.exact else 'DIFF'} {source.name} @ 0x{o.vram:08X} "
@@ -793,6 +820,30 @@ def _batch_args(p):
     p.add_argument("--infer-externals", action="store_true",
                    help="recover symbols no symbol file or batch unit defines from the retail code")
     p.add_argument("--only", action="append", default=[], help="verify only units whose name contains this")
+
+
+def _strict_batch(units, cfg, target, syms, jobs) -> list[dict]:
+    """Compatibility entry point for strict per-unit verdicts used by audits and callers."""
+    from ..match.unit_verify import verify_units
+    return verify_units(units, cfg, target.rom, target.vram_to_rom, syms,
+                        cfg.project / ".n64dk", min(jobs or 4, 4))
+
+
+def _strict_summary(rows: list[dict]) -> dict:
+    from types import SimpleNamespace
+    from ..match import verify as verifymod
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = "exact_strict" if row["verdict"] == "exact" else row["verdict"]
+        counts[key] = counts.get(key, 0) + 1
+    ledger = verifymod.reconcile_assumptions([
+        {"unit": row["unit"], "verdict": SimpleNamespace(assumptions=[
+            verifymod.Assumption(item["kind"], item["name"], int(item["address"], 16))
+            for item in row.get("assumptions", [])])} for row in rows])
+    return {"verdicts": counts,
+            "all_exact_strict": all(row["verdict"] == "exact" for row in rows),
+            "assumed_symbols": ledger["proposed_symbols"],
+            "contradictions": ledger["contradictions"]}
 
 
 @command("match-batch", "Rebuild and verify every unit of one or more matching manifests in parallel")

@@ -97,6 +97,7 @@ class _Runner:
         self.declarations = ""
         self.rendered, self.facts = None, {}
         self.recipe_map = None
+        self.unknown: set[int] = set()       # functions in stretches no known compiler explains
         # alternative m2c renderings tried by the draft portfolio
         self.draft_options = [tuple(o.split("+")) for o in getattr(args, "draft_options", "").split(",") if o]
 
@@ -141,11 +142,31 @@ class _Runner:
         """Alternative build recipes of the detected compiler family, usual retail settings first."""
         from ..match.engine import default_pipelines, sweep_specs
 
+        from ..match import custom_pipeline
+        try:                                                  # lanes the project declares ([pipelines.*])
+            declared = custom_pipeline.load(self.cfg.project)
+        except custom_pipeline.CustomPipelineError:
+            declared = {}
+        candidates = default_pipelines(self.cfg) + [custom_pipeline.PREFIX + name for name in declared]
+
+        def is_ido(pipeline: str) -> bool:
+            if custom_pipeline.is_custom(pipeline):
+                return declared[pipeline[len(custom_pipeline.PREFIX):]].family == "ido"
+            return pipeline.startswith("ido")
+
+        def usual(pipeline: str, count: int) -> list:
+            """The usual settings of one pipeline, most common first."""
+            if custom_pipeline.is_custom(pipeline):           # a declared lane states its own usual flags
+                lane = declared[pipeline[len(custom_pipeline.PREFIX):]]
+                return [split_flags(list(flags), pipeline) for flags in [lane.default_flags, *lane.flag_sets] if flags]
+            return sweep_specs([pipeline])[:count]
+
         def alternatives(family):
-            pipelines = [p for p in default_pipelines(self.cfg)
-                         if (p.startswith("ido")) == (family == "ido") and p != self.spec.pipeline]
+            pipelines = [p for p in candidates if is_ido(p) == (family == "ido") and p != self.spec.pipeline]
             if family is None:
-                pipelines = [p for p in default_pipelines(self.cfg) if p != self.spec.pipeline]
+                pipelines = [p for p in candidates if p != self.spec.pipeline]
+            ruled_out = self.ruled_out(vram, size)
+            pipelines = [p for p in pipelines if p not in ruled_out]
             out, seen = [], set()
             if self.recipe_map is not None:
                 for row in self.recipe_map.candidates(vram, 4):      # proven nearby, nearest first
@@ -171,19 +192,33 @@ class _Runner:
                 return pipeline[:3] if pipeline[:3] in ("ido", "kmc") else pipeline
             ordered = [split_flags(list(self.spec.flags), pipeline) for pipeline in pipelines
                        if dialect(pipeline) == dialect(self.spec.pipeline)]
-            swept = [sweep_specs([pipeline])[:max(1, limit // max(1, len(pipelines)))] for pipeline in pipelines]
+            # Lanes the project declares for further compilers come last: calibration (which tries
+            # every recipe) decides whether the title was built by one of them; trying each of them
+            # on every function of a title built by another compiler only costs builds.
+            lanes = [p for p in pipelines if custom_pipeline.is_custom(p)]
+            pipelines = [p for p in pipelines if not custom_pipeline.is_custom(p)]
+            swept = [usual(pipeline, max(1, limit // max(1, len(pipelines)))) for pipeline in pipelines]
             ordered += [specs[0] for specs in swept if specs]
             # optimisation levels: of the current recipe when its compiler is a candidate for this
             # function, and of each other candidate compiler's usual settings
-            current_is_candidate = family is None or self.spec.pipeline.startswith("ido") == (family == "ido")
+            current_is_candidate = family is None or is_ido(self.spec.pipeline) == (family == "ido")
             bases = ([self.spec] if current_is_candidate else []) + list(ordered)
-            for other in ("-O1", "-O3", "-O2"):
+            for other in ("-O1", "-O3", "-O2", "unoptimised"):
                 for base in bases:
                     level = next((f for f in base.flags if re.fullmatch(r"-O\d?", f)), None)
-                    if level is not None and level != other:
-                        ordered.append(split_flags([other if f == level else f for f in base.flags], base.pipeline))
+                    # unoptimised code is requested as -g from IDO and as -O0 from the others
+                    wanted = ("-g" if is_ido(base.pipeline) else "-O0") if other == "unoptimised" else other
+                    if level is not None and level != wanted:
+                        ordered.append(split_flags([wanted if f == level else f for f in base.flags], base.pipeline))
             for rank in range(1, max((len(specs) for specs in swept), default=0)):
                 ordered += [specs[rank] for specs in swept if rank < len(specs)]
+            for lane in lanes:
+                for spec in usual(lane, 1):
+                    ordered.append(spec)
+                    level = next((f for f in spec.flags if re.fullmatch(r"-O\d?", f)), None)
+                    wanted = "-g" if is_ido(lane) else "-O0"
+                    if level is not None:                     # and the same compiler without optimisation
+                        ordered.append(split_flags([wanted if f == level else f for f in spec.flags], lane))
             for spec in ordered:
                 key = (spec.pipeline, tuple(sorted(spec.flags)))
                 if key in seen or (spec.pipeline, tuple(spec.flags)) in seen:
@@ -275,7 +310,29 @@ class _Runner:
                     if normal not in texts:
                         texts.add(normal)
                         out.append((f"{label}/{kind}", normal))
+            # recipe-specific rewrites of the first drafts (n64dk.match.redraft): computed from the
+            # target's own machine code, e.g. the frame layout of an unoptimised build
+            from ..match import redraft
+            for label, text in list(out)[:2]:
+                def read(address: int):
+                    at = address - self.target.delta
+                    rom = self.target.rom
+                    return int.from_bytes(rom[at:at + 4], "big") if 0 <= at <= len(rom) - 4 else None
+                for kind, variant in redraft.variants(text, name, code=code, vram=vram, pipeline=self.spec.pipeline,
+                                                      flags=tuple(self.spec.flags), family=family, read=read):
+                    if variant not in texts:
+                        texts.add(variant)
+                        out.append((f"{label}/{kind}", variant))
             return out
+        def assembly():
+            """(source, proof) for a hand-written function whose assembly assembles back to its bytes."""
+            from ..match import handasm
+            offset = vram - self.target.delta
+            code = self.target.rom[offset:offset + size]
+            return handasm.attempt(name, code, vram, self.cfg, names,
+                                   m2c_bridge.find_jump_tables(self.target.rom, self.target.delta, vram, size))
+
+        draft.assembly = assembly
         return draft
 
     def strict(self, vram: int, size: int, filename: str, starts: set[int] | None):
@@ -303,6 +360,53 @@ class _Runner:
             return verifymod.strict_compare(elf, self.target.rom, self.target.vram_to_rom, vram, size, symbols,
                                             spec.section_bases, None, starts).as_dict()
         return check
+
+    def find_unknown(self, functions) -> dict | None:
+        """Stretches of the image no compiler of the marks table explains (``idioms.unknown_stretches``).
+        Their functions are still drafted and tried under the recipes; the variant search is not
+        run on them (measured on the title that showed the case: 812 such functions, 26 matched,
+        none by the search, three quarters of the title's builds)."""
+        from ..match import idioms
+        self.unknown: set[int] = set()
+        if getattr(self, "_idiom_table", None) is None:
+            self._idiom_table = idioms.Table.load()
+        if not self._idiom_table.classes:
+            return None
+        marked = []
+        for _name, vram, size in functions:
+            offset = vram - self.target.delta
+            code = self.target.rom[offset:offset + size]
+            if size >= 8 and len(code) == size:
+                marked.append((vram, idioms.features(code, vram, sequences=False)))
+        found = idioms.unknown_stretches(marked, self._idiom_table)
+        for row in found:
+            self.unknown.update(vram for vram, _marks in marked if row["start"] <= vram <= row["end"])
+        if not found:
+            return None
+        return {"functions": len(self.unknown),
+                "stretches": [{"start": f"0x{row['start']:08X}", "end": f"0x{row['end']:08X}",
+                               "functions": row["functions"], "marks": row["marks"]} for row in found]}
+
+    def ruled_out(self, vram: int, size: int) -> set[str]:
+        """Compiler lanes this function's own machine code rules out: lanes none of whose proven
+        functions ever showed an encoding or convention the function has (``n64dk.match.idioms``;
+        on 5,429 proven functions of sixteen titles the true lane was never among them)."""
+        from ..match import idioms
+        if getattr(self, "_idiom_table", None) is None:
+            self._idiom_table = idioms.Table.load()
+        table = self._idiom_table
+        if not table.classes:
+            return set()
+        offset = vram - self.target.delta
+        marks = idioms.features(self.target.rom[offset:offset + size], vram, sequences=False)
+        excluded = table.excluded(marks)
+        out = set()
+        for lane in {name.split()[0] for name in table.classes}:
+            classes = [name for name, entry in table.classes.items()
+                       if name.split()[0] == lane and entry["functions"] >= 200]
+            if classes and all(name in excluded for name in classes):
+                out.add(lane)
+        return out
 
     def label(self, spec=None) -> str:
         spec = spec or self.spec
@@ -424,6 +528,186 @@ def _twin_pass(store, image: str, todo, target, runner, names, emit, starts) -> 
 _BASIC_TYPEDEF = re.compile(r"(?m)^[ \t]*typedef\s+[^;{}]*?\b(?:s8|u8|s16|u16|s32|u32|s64|u64|f32|f64)\s*;[ \t]*\n?")
 
 
+def _unit_recipe_pass(store, image: str, todo, target, runner, names, emit, starts, args, settled=None) -> dict:
+    """Retry unresolved functions under the recipe proven for their own object.
+
+    Every function of one object was built by one compiler invocation.  The sweep attempts each
+    function on its own: its recipe is the image's, or whichever alternative happened to score
+    lowest on a draft, and the search then continues under that one.  Once the sweep has matched
+    some members of an object (``n64dk.analysis.units``: a run of functions closed by alignment
+    padding), their recipe is evidence about the others.  A function that is still unresolved and
+    was attempted under a different recipe than its nearest matched neighbour in the same object
+    is started again from its drafts under that neighbour's recipe.  The stored case stands when
+    the new attempt ends further away."""
+    if runner.recipe_map is None:
+        return {"retried": 0}
+    proven = 0
+    for known in store.all():
+        if known.image == image and known.status in ("exact", "assumed") and known.recipe:
+            pipeline, _, flags = known.recipe.partition(" ")
+            runner.recipe_map.add(known.vram, known.size, pipeline, shlex.split(flags))
+            proven += 1
+    if not proven:
+        return {"retried": 0}
+    rows = []
+    for name, vram, size in todo:
+        case = store.get(resolvemod.case_id(image, vram, size))
+        if case is None or case.status not in ("open", "near", "does-not-build"):
+            continue
+        if settled is not None and settled(vram):
+            continue                                          # its region's recipe was established and tried
+        ranked = runner.recipe_map.candidates(vram, 1)
+        if not ranked or not ranked[0]["same_unit"]:
+            continue
+        label = f"{ranked[0]['pipeline']} {' '.join(ranked[0]['flags'])}"
+        if label == case.recipe or any(stage.get("stage") == "unit-recipe" and stage.get("recipe") == label
+                                       for stage in case.stages):
+            continue                                          # already attempted under this recipe
+        rows.append((name, vram, size, ranked[0], label))
+    return {**_retry_under_recipes(store, image, rows, target, runner, names, emit, starts, args, "unit-recipe"),
+            "proven_members": proven}
+
+
+def _retry_under_recipes(store, image: str, rows, target, runner, names, emit, starts, args, stage: str) -> dict:
+    """Start each ``(name, vram, size, {"pipeline", "flags"}, label)`` again from its drafts under
+    that recipe.  The stored case stands when the new attempt ends further away."""
+    totals = {"retried": 0, "improved": 0, "exact": 0, "assumed": 0}
+    lock = threading.Lock()
+
+    def one(row):
+        name, vram, size, recipe, label = row
+        before = store.get(resolvemod.case_id(image, vram, size))
+        spec = split_flags(list(recipe["flags"]), recipe["pipeline"])
+        spec.section_bases.update(runner.spec.section_bases)
+        spec.symbols.update(runner.spec.symbols)
+        evaluate = runner.evaluator(vram, size, f"{name}.c", spec)
+        offset = vram - target.delta
+        try:
+            case = resolvemod.resolve(store, image, name, vram, target.rom[offset:offset + size], evaluate,
+                                      draft=runner.drafter(name, vram, size, evaluate, names),
+                                      flow=runner.flow(vram, size), neighbours=starts, budget=args.budget,
+                                      search_ceiling=getattr(args, "search_ceiling", resolvemod.SEARCH_CEILING),
+                                      jobs=2, emit=emit, pipeline=spec.pipeline, recipe_label=label, rom_offset=offset,
+                                      strict=runner.strict(vram, size, f"{name}.c", starts), recipes=None, fresh=True)
+        except Exception as error:                           # one bad function must not stop the pass
+            if emit:
+                emit({"event": "case-error", "name": name, "error": str(error)[-300:]})
+            return None
+        case.stages.append({"stage": stage, "recipe": label, "kept": case.recipe == label})
+        store.put(case)
+        rank = {"exact": 0, "assumed": 1, "near": 2}
+        better = rank.get(case.status, 3) < rank.get(before.status, 3) or (
+            rank.get(case.status, 3) == rank.get(before.status, 3) and case.best_score is not None
+            and (before.best_score is None or case.best_score < before.best_score))
+        with lock:
+            totals["retried"] += 1
+            totals["improved"] += bool(better)
+            totals["exact"] += case.status == "exact"
+            totals["assumed"] += case.status == "assumed"
+        if emit:
+            emit({"event": stage, "name": name, "recipe": label, "status": case.status,
+                  "score": case.best_score, "before": before.status})
+        return case
+
+    if not rows:
+        return {**totals, "cases": {}}
+    with ThreadPoolExecutor(max(1, min(len(rows), (args.jobs or 8)))) as pool:
+        cases = {case.case_id: case for case in pool.map(one, rows) if case is not None}
+    return {**totals, "cases": cases}
+
+
+# A function above this size is drafted and built under its recipe, and that is all: no other
+# recipes, no variant search.  Measured on sixteen titles, 5% of functions are larger and hold 37%
+# of the code; the translators for unoptimised builds match some of them outright (23 of 447 on
+# four titles), and searching them costs the most and returns the least.
+LARGE_FUNCTION = 0x400
+
+REGION_EVIDENCE_LIMIT = 400      # matched functions rebuilt under the other recipes, spread over the image
+REGION_RECIPES = 6               # recipes compared (the most common among the matches)
+
+
+def _region_recipe_pass(store, image: str, todo, target, runner, names, emit, starts, args) -> dict:
+    """Retry unresolved functions under the recipe of the region they lie in.
+
+    The sweep records the first recipe that matched each function, which under-reports: a
+    function matched under the image's recipe was never tried under another.  Here the matched
+    functions' own sources are rebuilt under the other recipes the image has shown (positive
+    tests on sources known to compile), the image is segmented into the stretches one recipe
+    explains (``n64dk.match.regions``), and every unresolved function attempted under a different
+    recipe than its region's is started again under it."""
+    from ..match import handasm
+    from ..match import regions as regionmod
+    matched = [case for case in store.all()
+               if case.image == image and case.status in ("exact", "assumed") and case.recipe
+               and case.best_digest and case.recipe != handasm.RECIPE]
+    tally: dict[str, int] = {}
+    for case in matched:
+        tally[case.recipe] = tally.get(case.recipe, 0) + 1
+    default = runner.label()
+    candidates = [label for label, count in sorted(tally.items(), key=lambda item: (-item[1], item[0]))
+                  if count >= regionmod.MIN_SUPPORT][:REGION_RECIPES]
+    if len(candidates) < 2:
+        return {"retried": 0, "recipes": candidates, "reason": "one recipe explains every match"}
+
+    def dialect(label: str) -> str:
+        pipeline = label.partition(" ")[0]
+        return "ido" if pipeline.startswith("ido") else "gcc" if pipeline[:3] in ("kmc", "sn") else pipeline
+
+    def spec_of(label: str):
+        pipeline, _, flags = label.partition(" ")
+        spec = split_flags(shlex.split(flags), pipeline)
+        spec.section_bases.update(runner.spec.section_bases)
+        spec.symbols.update(runner.spec.symbols)
+        return spec
+
+    matched.sort(key=lambda case: case.vram)
+    step = max(1, -(-len(matched) // REGION_EVIDENCE_LIMIT))
+    sampled = matched[::step]
+    evidence: dict[int, set[str]] = {case.vram: {case.recipe} for case in matched}
+    pairs = [(case, label) for case in sampled for label in candidates
+             if label != case.recipe and dialect(label) == dialect(case.recipe)]
+
+    def reproduces(pair) -> bool:
+        case, label = pair
+        text = store.source(case.best_digest)
+        if text is None:
+            return False
+        try:
+            evaluation, _code = runner.evaluator(case.vram, case.size, f"{case.name}.c", spec_of(label))(text)
+        except Exception:                                    # noqa: BLE001 - no evidence from this pair
+            return False
+        return bool(evaluation.exact)
+
+    builds = 0
+    if pairs:
+        with ThreadPoolExecutor(max(1, min(len(pairs), (args.jobs or 8)))) as pool:
+            for (case, label), same in zip(pairs, pool.map(reproduces, pairs)):
+                builds += 1
+                if same:
+                    evidence[case.vram].add(label)
+    order = [default] + [label for label in candidates if label != default]
+    found = regionmod.Regions.build(evidence, sorted(starts or []), None, order)
+    summary = found.summary()
+    rows = []
+    for name, vram, size in todo:
+        case = store.get(resolvemod.case_id(image, vram, size))
+        if case is None or case.status not in ("open", "near", "does-not-build"):
+            continue
+        label = found.recipe_at(vram)
+        if label is None or label == case.recipe or any(
+                stage.get("stage") in ("region-recipe", "unit-recipe") and stage.get("recipe") == label
+                for stage in case.stages):
+            continue
+        pipeline, _, flags = label.partition(" ")
+        rows.append((name, vram, size, {"pipeline": pipeline, "flags": shlex.split(flags)}, label))
+    if emit:
+        emit({"event": "recipe-regions", "regions": summary["regions"], "evidence_builds": builds,
+              "retry": len(rows)})
+    return {**_retry_under_recipes(store, image, rows, target, runner, names, emit, starts, args, "region-recipe"),
+            "regions": summary["regions"], "evidence_builds": builds, "matched_sampled": len(sampled),
+            "_settled": lambda vram: found.recipe_at(vram) is not None}
+
+
 def prepare_answer(text: str) -> str:
     """A refiner's answer as a buildable unit: the kit's typedef prelude in front, and the
     answer's own redefinitions of those basic types removed (a duplicate typedef is an error
@@ -460,6 +744,36 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
         rows = rows[:settings.max_cases]
     totals = {"attempted": 0, "improved": 0, "exact": 0, "assumed": 0, "calls": 0, "errors": 0}
     lock = threading.Lock()
+    from .. import mips
+
+    def references(code: bytes, vram: int) -> set[int]:
+        try:
+            return {ref.address for ref in mips.scan_refs(code, vram)}
+        except Exception:
+            return set()
+
+    # worked examples: every function of this image already identical from scratch, by recipe;
+    # functions the refiner settles join them, so later cases learn from earlier ones
+    examples: dict[str, refinemod.Examples] = {}
+
+    def remember(case) -> None:
+        if case is None or case.status not in ("exact", "assumed") or not case.best_digest or settings.examples <= 0:
+            return
+        text = store.source(case.best_digest)
+        offset = case.vram - target.delta
+        if not text or offset < 0 or offset + case.size > len(target.rom):
+            return
+        code = target.rom[offset:offset + case.size]
+        if case.size > 0x140:
+            return
+        examples.setdefault(case.recipe or "", refinemod.Examples()).add(
+            case.name, case.vram, case.size, references(code, case.vram),
+            m2c_bridge.emit_asm(case.name, code, case.vram, names, []), text)
+
+    if settings.examples > 0:
+        for known in store.all():
+            if known.image == image:
+                remember(known)
 
     def one(row):
         _score, size, name, vram = row
@@ -500,13 +814,29 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
 
         best_source = store.source(case.best_digest) if case.best_digest else None
         best = primary(best_source)[0] if best_source else None
+        failed_draft = None
+        if best_source is None:
+            # a draft that did not build still shows the recovered structure, and its compiler
+            # output says what to fix
+            kept = next((stage for stage in reversed(case.stages) if stage.get("source_digest")), None)
+            text = store.source(kept["source_digest"]) if kept else None
+            if text:
+                failed_draft = (refinemod.Examples.body(text), refinemod._strip_paths(kept.get("error") or ""))
         tables = m2c_bridge.find_jump_tables(target.rom, target.delta, vram, size)
         assembly = m2c_bridge.emit_asm(name, code, vram, names, tables)
         declarations = ""
         if runner.rendered is not None and vram in runner.facts:
             declarations = runner.rendered.focused(runner.facts[vram], vram, True, typedefs=False)
-        result = refinemod.refine(name, settings, evaluate, assembly, case.recipe or runner.label(spec), best_source,
-                                  best, case.causes, prepare=prepare_answer, declarations=declarations, emit=emit)
+        recipe_label = case.recipe or runner.label(spec)
+        own = references(code, vram)
+
+        def shown():
+            pool = examples.get(recipe_label)
+            return pool.pick(vram, own, settings.examples) if pool else []
+
+        result = refinemod.refine(name, settings, evaluate, assembly, recipe_label, best_source,
+                                  best, case.causes, prepare=prepare_answer, declarations=declarations, emit=emit,
+                                  examples=shown, failed_draft=failed_draft)
         stage = {"stage": "refine", "signature": signature,
                  "rounds": result["rounds"], "calls": result["calls"],
                  "history": result["history"], "improved": result["improved"], "errors": result["errors"][:2]}
@@ -522,6 +852,7 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
             case.builds += before
         case.stages.append(stage)
         store.put(case)
+        remember(case)
         with lock:
             totals["attempted"] += 1
             totals["improved"] += bool(result["improved"])
@@ -538,6 +869,19 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
         refined = [c for c in pool.map(one, rows)]
     totals["cases"] = {c.case_id: c for c in refined}
     return totals
+
+
+def only_names(value) -> set[str]:
+    """Function names from ``--only-names``: comma-separated names and/or ``@file`` (one per line)."""
+    out: set[str] = set()
+    for item in ([value] if isinstance(value, str) else list(value or [])):
+        for part in str(item).split(","):
+            part = part.strip()
+            if part.startswith("@"):
+                out.update(line.strip() for line in Path(part[1:]).read_text().split("\n") if line.strip())
+            elif part:
+                out.add(part)
+    return out
 
 
 def worker_count(requested: int | None, functions: int, memory_per_worker_mb: int = 0,
@@ -730,6 +1074,9 @@ def resolve_hard(args):
         todo = [f for f in inside if not any(a <= f[1] - target.delta < a + n for a, n in covered)]
     skip = set(getattr(args, "skip_vrams", None) or ())          # e.g. recovered by an earlier stage
     todo = [f for f in todo if f[1] not in skip]
+    chosen_names = only_names(getattr(args, "only_names", None))
+    if chosen_names:                                             # a named set: nothing else is attempted
+        todo = [f for f in todo if f[0] in chosen_names]
     todo.sort(key=lambda f: f[2])
     if args.max_size:
         todo = [f for f in todo if f[2] <= args.max_size]
@@ -740,12 +1087,24 @@ def resolve_hard(args):
     store = resolvemod.CaseStore(_state(args, cfg))
     emit, handle = _events(args.events)
     image, started = _image_label(args), time.time()
+    only = set(getattr(args, "only_statuses", None) or ())
+    if only:                                                  # a pass over stored cases of these statuses only
+        def wanted(function):
+            case = store.get(resolvemod.case_id(image, function[1], function[2]))
+            return case is not None and case.status in only
+        todo = [f for f in todo if wanted(f)]
     inner = 4 if (args.jobs or 8) >= 8 else 2
     try:
         with tempfile.TemporaryDirectory(prefix="n64dk-resolve-") as work:
             runner = _Runner(args, cfg, target, syms, Path(work))
             context_info = runner.auto_context(functions, names, store.root, image)
             recipe_info = runner.learn_recipes(functions, matched_rows)
+            try:
+                unknown_info = runner.find_unknown(functions)
+            except Exception:                                # noqa: BLE001 - a hint, never a reason to stop
+                runner.unknown, unknown_info = set(), None
+            if unknown_info and emit:
+                emit({"event": "unknown-toolchain", **unknown_info})
 
             def one(function, store=store, emit=emit, inner=inner):
                 name, vram, size = function
@@ -757,12 +1116,16 @@ def resolve_hard(args):
                                               draft=None if args.no_draft else runner.drafter(name, vram, size,
                                                                                               evaluate, names),
                                               flow=runner.flow(vram, size), neighbours=starts, budget=args.budget,
-                                              search_ceiling=getattr(args, "search_ceiling",
-                                                                     resolvemod.SEARCH_CEILING),
+                                              search_ceiling=(1 if ((vram in runner.unknown and
+                                                                    getattr(args, "skip_unknown_search", False)) or
+                                                                   size > LARGE_FUNCTION) else
+                                                              getattr(args, "search_ceiling",
+                                                                      resolvemod.SEARCH_CEILING)),
+                                              cross_recipes=getattr(args, "cross_recipes", None),
                                               jobs=inner, force=args.force, emit=emit, pipeline=spec.pipeline,
                                               recipe_label=runner.label(spec), rom_offset=offset,
                                               strict=runner.strict(vram, size, f"{name}.c", starts),
-                                              recipes=None if args.no_recipes else runner.recipes(vram, size,
+                                              recipes=None if args.no_recipes or size > LARGE_FUNCTION else runner.recipes(vram, size,
                                                                                                   f"{name}.c"))
                 except Exception as error:                   # one bad function must not stop the sweep
                     if emit:
@@ -830,6 +1193,31 @@ def resolve_hard(args):
             if twins:
                 replaced = {c.case_id for c in twins}
                 cases = [c for c in cases if c.case_id not in replaced] + twins
+            unit_info = None
+            region_enabled = bool(getattr(args, "region_recipes", False))
+            unit_enabled = bool(getattr(args, "unit_recipes", False))
+            if (region_enabled or unit_enabled) and not only and not args.limit and not args.no_draft:
+                # regions first (a recipe that explains a whole stretch), then the nearest proven
+                # neighbour inside a closed object for what the regions left
+                region_info = None
+                if region_enabled:
+                    try:
+                        region_info = _region_recipe_pass(store, image, todo, target, runner, names, emit, starts, args)
+                    except Exception as error:                # noqa: BLE001 - a retry pass must not cost the sweep
+                        region_info = {"error": f"{type(error).__name__}: {error}"[-300:]}
+                if region_info:
+                    retried = region_info.pop("cases", {})
+                    cases = [c for c in cases if c.case_id not in retried] + list(retried.values())
+                # (measured: where a region's recipe is known, the nearest neighbour's adds nothing)
+                settled = region_info.pop("_settled", None) if region_info else None
+                if unit_enabled:
+                    unit_info = _unit_recipe_pass(store, image, todo, target, runner, names, emit, starts, args, settled)
+                    retried = unit_info.pop("cases", {})
+                    cases = [c for c in cases if c.case_id not in retried] + list(retried.values())
+                    unit_info["regions"] = region_info
+                elif region_info is not None:
+                    unit_info = {"regions": region_info, "retried": 0,
+                                 "reason": "nearest-unit recipe retry disabled"}
             refine_info = None
             from ..match import refine as refinemod
             settings = getattr(args, "refine", None) or refinemod.Settings.from_table(
@@ -855,6 +1243,7 @@ def resolve_hard(args):
                 "exact_per_hour": round(len(exact) * 3600 / elapsed, 1) if elapsed else None,
                 "context": context_info, "recipes": recipe_info, "twins": len(twins),
                 "workers": workers, "worker_errors": worker_errors, "refine": refine_info,
+                "unit_recipes": unit_info, "unknown_toolchain": unknown_info,
                 "padding_trimmed": trimmed,
                 "queue": [{k: g[k] for k in ("cause", "meaning", "functions", "bytes", "expected_progress")}
                           | {"best": g["best"][:args.show]} for g in queue["queue"]],
@@ -872,10 +1261,23 @@ def _hard_args(p):
     p.add_argument("--manifest", action="append", default=[], metavar="FILE[=PIPELINE]",
                    help="manifest of already matched code (repeatable); with =PIPELINE its rows also teach the "
                         "per-unit recipe map")
+    p.add_argument("--region-recipes", action="store_true",
+                   help="experimental: segment the image into recipe regions and retry under each region's recipe "
+                        "(measured 3/126; off by default)")
+    p.add_argument("--unit-recipes", action="store_true",
+                   help="experimental: retry from a nearby unit's recipe (measured 0/165; off by default)")
+    p.add_argument("--skip-unknown-search", action="store_true",
+                   help="experimental: suppress variant search in regions classified as an unknown toolchain; "
+                        "classification remains advisory by default")
+    p.add_argument("--only-names", action="append",
+                   help="attempt only these functions: comma-separated names or @FILE (one per line); repeatable")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--max-size", type=_int, default=0)
     p.add_argument("--min-size", type=_int, default=4)
     p.add_argument("--every", type=int, default=1, help="take every Nth function (sampling for benchmarks)")
+    p.add_argument("--cross-recipes", type=int,
+                   help="alternative recipes tried on the best drafts when none is exact (default: "
+                        f"{resolvemod.CROSS_RECIPES}; a calibration sample uses many more)")
     p.add_argument("--keep-padding", action="store_true",
                    help="resolve catalogue intervals as given, including trailing alignment padding")
     p.add_argument("--refine-command",

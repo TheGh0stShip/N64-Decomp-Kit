@@ -218,8 +218,9 @@ transform_list.arguments = _transform_list_args
 
 @command("transform-apply", "Apply a digest-pinned, reversible transformation proposal")
 def transform_apply(args):
+    from ..outputs import file_output
     source_path = Path(args.source)
-    output_path = Path(args.output)
+    output_path = file_output(args.output, "output")
     if source_path.resolve() == output_path.resolve():
         raise ValueError("refusing an in-place transformation; use a separate output path")
     payload = json.loads(Path(args.proposal).read_text())

@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from ..analysis import flow as flowmod
 from ..analysis.flow import AT, SAVED, TEMPS, Flow, reg_name
 
+SYSTEM_INSTRUCTIONS = frozenset({"mfc0", "mtc0", "dmfc0", "dmtc0", "eret", "tlbr", "tlbwi", "tlbwr", "tlbp", "cache"})
+
 TAXONOMY = {
     "boundary.fragment": "range starts inside another function's body",
     "boundary.false_split": "control leaves the range by a branch or by running off its end",
@@ -206,8 +208,11 @@ def target_causes(flow: Flow, neighbours: set[int] | None = None) -> list[Cause]
     odd = [i for i in flow.insns if i.word and i.op != ".word"
            and rabbitizer.Instruction(i.word, i.vram).isLikelyHandwritten()]
     kernel = [i for i in flow.insns if (set(i.uses) | set(i.defs)) & {26, 27}]
+    # System instructions have no C spelling in these compilers: one is enough to be certain.
+    system = [i for i in flow.insns if i.op in SYSTEM_INSTRUCTIONS]
+    odd = odd or system
     if odd or kernel:
-        bag.add("assembly.handwritten", 0.85 if (odd and kernel) or len(odd) > 2 else 0.6,
+        bag.add("assembly.handwritten", 0.9 if system else 0.85 if (odd and kernel) or len(odd) > 2 else 0.6,
                 (f"{len(odd)} instruction(s) compilers do not emit (first: {odd[0].text})" if odd else "")
                 + ("; uses $k0/$k1" if kernel else ""),
                 "confirm against SDK assembly sources; credit only with positive provenance")

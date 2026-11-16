@@ -104,6 +104,72 @@ functions = [
             self.assertTrue(all(row["state"] == "claimed" for row in rows))
             self.assertTrue(all(row["ownership_state"] == "manifest_nonexact" for row in rows))
 
+    def test_manifest_offsets_use_the_declared_image_placement(self):
+        """An analysis image holds the program at file offset 0x1000 (-> 0x80000400) while the
+        catalogue section's own ``rom`` is 0.  Manifest offsets are image-file offsets: with the
+        image declared, the inventory must place a row where the matcher does, not 0x1000 later."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); config = root / "config"; config.mkdir()
+            (config / "functions_resident.toml").write_text('''
+[[section]]
+vram = 0x80000400
+rom = 0
+size = 0x40
+functions = [
+  { name = "first", vram = 0x80000400, size = 0x10 },
+  { name = "second", vram = 0x80000410, size = 0x10 },
+  { name = "third", vram = 0x80000420, size = 0x20 },
+]
+''')
+            (config / "matching_kmc_units.tsv").write_text("0x1010\t0x10\tsrc/second.c\t-O2\n")
+            (root / "src").mkdir(); (root / "src/second.c").write_text("int second(void) { return 0; }\n")
+            undeclared = {row["name"]: row["state"] for row in inventory.build(root)["functions"]}
+            self.assertEqual(undeclared["second"], "remaining")       # the old reading puts the row elsewhere
+            (root / "n64dk.toml").write_text('[images.resident]\npath = "image.bin"\nvram_delta = 0x7FFFF400\n')
+            self.assertEqual(inventory.image_delta(root, "resident"), 0x7FFFF400)
+            rows = {row["name"]: row for row in inventory.build(root)["functions"]}
+            self.assertNotEqual(rows["second"]["state"], "remaining")
+            self.assertEqual(rows["second"].get("owner"), "src/second.c")
+            self.assertEqual(rows["third"]["state"], "remaining")       # no longer claimed by the shifted row
+            self.assertEqual(rows["first"]["state"], "remaining")
+
+    def test_inventory_and_image_registry_place_a_manifest_row_at_the_same_function(self):
+        """One coordinate rule, two readers.  The registry puts a manifest row at
+        ``offset + vram_delta`` in link space and the catalogue ``catalogue_shift`` above that; the
+        inventory must credit the catalogue function at exactly that address, also when the
+        catalogue is shifted."""
+        from n64dk.match import images
+        for shift in (0, 0x4724):
+            with self.subTest(catalogue_shift=shift), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); config = root / "config"; config.mkdir()
+                base = 0x800AEF00 + shift
+                (config / "functions_overlay.toml").write_text(f'''
+[[section]]
+vram = 0x{base:X}
+rom = 0
+size = 0x40
+functions = [
+  {{ name = "first", vram = 0x{base:X}, size = 0x10 }},
+  {{ name = "second", vram = 0x{base + 0x10:X}, size = 0x10 }},
+  {{ name = "third", vram = 0x{base + 0x20:X}, size = 0x20 }},
+]
+''')
+                (config / "matching_kmc_units.tsv").write_text("0x2010\t0x10\tsrc/second.c\t-O2\n")
+                (root / "src").mkdir(); (root / "src/second.c").write_text("int second(void) { return 0; }\n")
+                (root / "image.bin").write_bytes(bytes(0x3000))
+                (root / "n64dk.toml").write_text(
+                    f'[images.overlay]\npath = "image.bin"\nvram_delta = 0x{0x800AEF00 - 0x2000:X}\n'
+                    f'catalogue = "config/functions_overlay.toml"\ncatalogue_shift = 0x{shift:X}\n'
+                    'manifests = ["config/matching_kmc_units.tsv"]\n')
+                spec = images.resolve(root, "overlay")
+                [row] = images._manifest_rows(spec)
+                registry_catalogue_vram = row.vram + spec.catalogue_shift
+                owned = [r for r in inventory.build(root)["functions"] if r.get("owner") == "src/second.c"]
+                self.assertEqual([r["name"] for r in owned], ["second"])
+                self.assertEqual(int(str(owned[0]["vram"]), 0) if isinstance(owned[0]["vram"], str) else owned[0]["vram"],
+                                 registry_catalogue_vram)
+                self.assertEqual(inventory.image_delta(root, "overlay"), spec.delta + spec.catalogue_shift)
+
     def test_callee_save_store_is_not_semantic_live_in(self):
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / "function.bin"

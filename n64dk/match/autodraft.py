@@ -55,15 +55,71 @@ _UNDECLARED = re.compile(_LINE + r"(?:`(\w+)' undeclared|'(\w+)' undefined)")
 _UNARY = re.compile(_LINE + r"(?:invalid type argument of `unary \*'|Dereferenced a non-pointer)")
 _VOID_VALUE = re.compile(_LINE + r"void value not ignored")
 _VOID_ARITHMETIC = re.compile(_LINE + r"(?:Unacceptable operand of '[-+]'|Bad operand type for \+= or -=)")
-_ARGUMENT_COUNT = re.compile(_LINE + r"(?:Number of arguments doesn't agree with the number in the declaration|"
+_ARGUMENT_COUNT = re.compile(_LINE + r"(?:(?:The n|N)umber of arguments doesn't agree with the number in the declaration|"
                              r"too (?:few|many) arguments to function)")
 _REDECLARED = re.compile(_LINE + r"redeclaration of [`'](\w+)'")
 _VOID_DEREFERENCE = re.compile(_LINE + r"(?:warning: dereferencing `void \*' pointer|"
                                r"Reference of an expression of void type or an incomplete type)")
 _POINTER_INTEGER = re.compile(_LINE + r"illegal combination of pointer and integer")
+_NOT_CALLABLE = re.compile(_LINE + r"(?:Non-function name referenced in function call|called object is not a function)")
+_STARRED_CALL = re.compile(r"(?<![\w)\]])(\*+)((?!M2C_)[A-Za-z_]\w*)\(")
+_STARRED_NAME = re.compile(r"(?<![\w)\]*])\*([A-Za-z_]\w*)\b(?!\s*\()")
+_INTEGER_MINUS_ADDRESS = re.compile(r"((?:\b0x[0-9A-Fa-f]+|\b\w+|\)))(\s*-\s*)&(\w+)")
+_POINTER_COMPARE = re.compile(_LINE + r"Unacceptable operand of == or !=")
+_NULL_TO_INTEGER = re.compile(_LINE + r"Constants must have arithmetic type")
 _DEREF = re.compile(r"(?<![\w)\]])\*\(")
-_BODY = re.compile(r"(?m)^[\w \*]+\([^;{}]*\)\s*\{\n")
+# a definition starts in column 0: an indented ``if (...) {`` is a nested block, not a body
+_BODY = re.compile(r"(?m)^[A-Za-z_][\w \*]*\([^;{}]*\)\s*\{\n")
 _IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+def _closing(text: str, opening: int) -> int | None:
+    """Index of the parenthesis that closes the one at ``opening``, or None."""
+    depth = 0
+    for index in range(opening, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def call_through_loaded_pointer(line: str) -> str:
+    """``*M2C_FIELD(p, T (***)(...), n)(args)`` -> ``(*M2C_FIELD(p, T (***)(...), n))(args)``.
+
+    A call binds tighter than ``*``, so the decompiler's rendering of a call through a function
+    pointer loaded from a table (a virtual call: object -> table -> function) calls the table
+    itself.  Parenthesising the dereference is what the instructions do."""
+    at = 0
+    while True:
+        at = line.find("*M2C_FIELD(", at)
+        if at < 0:
+            return line
+        end = _closing(line, at + len("*M2C_FIELD"))
+        if end is not None and line[end + 1:].lstrip().startswith("("):
+            line = line[:at] + "(" + line[at:end + 1] + ")" + line[end + 1:]
+            at = end + 2
+        else:
+            at += 1
+
+
+def call_through_dereference(line: str) -> str:
+    """``*(table + i)(args)`` -> ``((s32 (*)()) *(table + i))(args)``: a function pointer read from
+    a computed address and called."""
+    at = 0
+    while True:
+        found = _DEREF.search(line, at)
+        if found is None:
+            return line
+        start = found.start()
+        end = _closing(line, start + 1)
+        if end is not None and line[end + 1:].lstrip().startswith("("):
+            line = line[:start] + "((s32 (*)()) " + line[start:end + 1] + ")" + line[end + 1:]
+            at = end + len("((s32 (*)()) ") + 2
+        else:
+            at = start + 1
 
 
 def repair(source: str, error: str) -> str | None:
@@ -77,6 +133,9 @@ def repair(source: str, error: str) -> str | None:
     * a call through a function-pointer cast, or to a callee, whose argument count disagrees
       with a guessed prototype makes that prototype unprototyped;
     * an assignment mixing pointer and integer casts the right-hand side to the target's type.
+    * a call through a function pointer loaded from a table is parenthesised so the dereference
+      happens before the call;
+    * an integer constant minus the address of a symbol casts the address to an integer.
     These make the draft compile so it can be scored; types still need a human or model."""
     lines = source.split("\n")
 
@@ -95,6 +154,14 @@ def repair(source: str, error: str) -> str | None:
     if found and line_of(found) is not None:
         number = line_of(found)
         fixed = _DEREF.sub("*(s32 *)(", lines[number])
+        if fixed == lines[number]:
+            # ``*name`` where the draft declared ``name`` as an integer: it holds an address
+            def as_pointer(found_name):
+                name = found_name.group(1)
+                declared = re.search(rf"(?m)^\s+(?:s8|u8|s16|u16|s32|u32|M2C_UNK)\s+{re.escape(name)}\s*[;=]", source)
+                parameter = re.search(rf"[(,]\s*(?:s8|u8|s16|u16|s32|u32|M2C_UNK)\s+{re.escape(name)}\s*[,)]", source)
+                return f"*(s32 *){name}" if declared or parameter else found_name.group(0)
+            fixed = _STARRED_NAME.sub(as_pointer, lines[number])
         if fixed != lines[number]:
             lines[number] = fixed
             return "\n".join(lines)
@@ -113,6 +180,11 @@ def repair(source: str, error: str) -> str | None:
                         lines[number]):
             del lines[number]
             return "\n".join(lines)
+    found = _VOID_DEREFERENCE.search(error) or _VOID_VALUE.search(error)
+    if found and line_of(found) is not None and "*(void *)" in lines[line_of(found)]:
+        # a word read through a ``void *`` cast (a hardware register, an absolute address)
+        lines[line_of(found)] = lines[line_of(found)].replace("*(void *)", "*(s32 *)")
+        return "\n".join(lines)
     found = _VOID_DEREFERENCE.search(error)
     if found and line_of(found) is not None:
         # ``*p`` with ``void *p``: the draft meant a word
@@ -126,17 +198,74 @@ def repair(source: str, error: str) -> str | None:
             changed = re.sub(rf"\bvoid \*(?=\s*{re.escape(name)}\b\s*[;,)=])", "s8 *", source)
             if changed != source:
                 return changed
+        # ``M2C_FIELD(p, void **, n) + i``: arithmetic on a loaded ``void *`` is byte arithmetic
+        number = line_of(found)
+        fixed = re.sub(r"\bvoid \*\*(?=\s*,)", "s8 **", lines[number])
+        if fixed != lines[number]:
+            lines[number] = fixed
+            return "\n".join(lines)
+        # ``CONSTANT - &symbol``: an integer minus an address is integer arithmetic on the address
+        number = line_of(found)
+        fixed = _INTEGER_MINUS_ADDRESS.sub(r"\1\2(s32) &\3", lines[number])
+        if fixed != lines[number]:
+            lines[number] = fixed
+            return "\n".join(lines)
+    found = _NOT_CALLABLE.search(error)
+    if found and line_of(found) is not None:
+        number = line_of(found)
+        fixed = call_through_loaded_pointer(lines[number])
+        if fixed == lines[number]:
+            # ``**p(args)``: the same precedence slip on a plain variable.  The loaded value is
+            # called, whatever type the draft gave the variable.
+            fixed = _STARRED_CALL.sub(r"((s32 (*)()) \1\2)(", lines[number])
+        if fixed == lines[number]:
+            fixed = call_through_dereference(lines[number])
+        if fixed != lines[number]:
+            lines[number] = fixed
+            return "\n".join(lines)
     found = _ARGUMENT_COUNT.search(error)
     if found and line_of(found) is not None:
         number = line_of(found)
-        fixed = re.sub(r"\(\*\*\)\([^()]*\)", "(**)()", lines[number])
+        # a guessed prototype inside a function-pointer cast, at any depth of indirection
+        fixed = re.sub(r"\((\*+)\)\([^()]+\)", r"(\1)()", lines[number])
         if fixed != lines[number]:
             lines[number] = fixed
             return "\n".join(lines)
         for callee in re.findall(r"\b(\w+)\(", lines[number]):
-            changed = re.sub(rf"(?m)^([\w \*]+?\b{re.escape(callee)})\([^;{{}}()]+\);", r"\1();", source)
+            # a declaration starts in column 0; an indented ``callee(a, b);`` is the call itself
+            changed = re.sub(rf"(?m)^([A-Za-z_][\w \*]*?\b{re.escape(callee)})\([^;{{}}()]+\);", r"\1();", source)
             if changed != source:
                 return changed
+        # no declaration to relax: the compiler's own prototype of a built-in (memcpy, strlen, ...)
+        # is in force.  Calling through a cast keeps the direct call and drops that prototype.
+        named = re.search(r"arguments to function [`'](\w+)'", error)
+        if named and not re.search(rf"(?m)^[A-Za-z_][\w \*]*?\b{re.escape(named.group(1))}\s*\(", source):
+            fixed = re.sub(rf"(?<![\w)]){re.escape(named.group(1))}\(", f"((s32 (*)()) {named.group(1)})(", lines[number])
+            if fixed != lines[number]:
+                lines[number] = fixed
+                return "\n".join(lines)
+    found = _POINTER_COMPARE.search(error)
+    if found and line_of(found) is not None:
+        # a pointer compared with an integer (IDO rejects it): the comparison is of the address
+        number = line_of(found)
+        fixed = lines[number]
+        for name in dict.fromkeys(_IDENT.findall(lines[number])):
+            if not re.search(rf"\*\s*{re.escape(name)}\s*[;,)=]", source):
+                continue                                     # not declared as a pointer
+            fixed = re.sub(rf"(?<![\w.>])(?<!\(s32\) ){re.escape(name)}\b(?=\s*(?:==|!=))", f"(s32) {name}", fixed)
+            fixed = re.sub(rf"((?:==|!=)\s*)(?<!\(s32\) ){re.escape(name)}\b(?![\w(\[.]|\s*->)", rf"\1(s32) {name}", fixed)
+        if fixed == lines[number]:                           # an address expression on one side
+            fixed = re.sub(r"(?<!\(s32\) )(?<![\w)\]&])&(?=[A-Za-z_])", "(s32) &", lines[number])
+        if fixed != lines[number]:
+            lines[number] = fixed
+            return "\n".join(lines)
+    found = _NULL_TO_INTEGER.search(error)
+    if found and line_of(found) is not None:
+        number = line_of(found)
+        fixed = re.sub(r"=\s*NULL\s*;", "= 0;", lines[number])
+        if fixed != lines[number]:
+            lines[number] = fixed
+            return "\n".join(lines)
     found = _POINTER_INTEGER.search(error)
     if found and line_of(found) is not None:
         number = line_of(found)
