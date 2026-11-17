@@ -21,7 +21,8 @@ Provenance classes (what a component *is*), kept apart on purpose:
                               source and a negative control, never an N64 lane by itself
 ``speculation``               named in discussion without artefact or evidence
 
-Dispositions (where an investigated item ends): ``implemented-verified``, ``comparative-only``,
+Dispositions (where an investigated item ends): ``implemented-verified``, ``implemented-unvalidated``
+(built and usable, but that it is what a retail build used is a hypothesis), ``comparative-only``,
 ``rejected``, ``unavailable``, ``undistributable-local``, ``speculation``.
 """
 from __future__ import annotations
@@ -35,8 +36,8 @@ ROLES = ("driver", "preprocessor", "frontend", "optimizer", "codegen", "compiler
          "assembler", "object-converter", "linker", "archiver", "post-link", "emulator", "library")
 PROVENANCE = ("authentic-n64", "authentic-n64-component", "authentic-assembler-linker", "reconstructed",
               "comparative", "speculation")
-DISPOSITIONS = ("implemented-verified", "comparative-only", "rejected", "unavailable", "undistributable-local",
-                "speculation")
+DISPOSITIONS = ("implemented-verified", "implemented-unvalidated", "comparative-only", "rejected", "unavailable",
+                "undistributable-local", "speculation")
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,11 @@ COMPONENTS: tuple[Component, ...] = (
     _c("kit/asn64-converter", "assembler-macro", "kit ASN64-compatible assembly converter", "round 10",
        "reconstructed", "implemented-verified", "n64dk/match/asn64.py", "", (), "", "Python",
        notes="rewrites KMC cc1 output to the conventions of SN's asn64 before a modern GNU as"),
+    _c("kit/at-symbol-loads", "assembler-macro", "kit expansion of symbol loads through $at", "round 11",
+       "reconstructed", "implemented-unvalidated", "n64dk/match/normalize.py (at_symbol_loads)", "", (), "", "Python",
+       notes="emulates an assembler that expands lw/lh/lb rD,sym through $at (seen in retail code; KMC as 2.6, "
+             "GNU as 2.9.1, ASN64 2.56/2.72/2.81 and IRIX as all use rD); offered only to functions whose own "
+             "code shows the form"),
     _c("binutils/as", "assembler", "GNU as (modern binutils, mips-linux-gnu)", "2.42", "reconstructed",
        "implemented-verified", "distribution package", "", ("usr/bin/mips-linux-gnu-as",), "mips-binutils",
        "x86-64 ELF", licence="GPL", notes="encodes move as or; used with --no-pad-sections behind converters"),
@@ -299,6 +305,10 @@ RECIPES: dict[str, Recipe] = {
     "kmc+builtin": Recipe("kmc+builtin", _kmc([Stage("normalize", "kit/asn64-converter", (), "assembly text",
                                                       "assembly text", "built-in normaliser"),
                                                 Stage("assemble", "kmc/as", (), "assembly text", "ELF relocatable")])),
+    "kmc+atload": Recipe("kmc+atload", _kmc([Stage("expand", "kit/at-symbol-loads", (), "assembly text",
+                                                    "assembly text", "symbol loads through $at (emulated assembler)"),
+                                              Stage("assemble", "kmc/as", (), "assembly text", "ELF relocatable",
+                                                    "reorder on")])),
     "kmc+asn64": Recipe("kmc+asn64", _kmc([Stage("convert", "kit/asn64-converter", (), "assembly text",
                                                   "assembly text"),
                                             Stage("assemble", "binutils/as", ("--no-pad-sections",), "assembly text",

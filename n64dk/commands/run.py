@@ -2,7 +2,10 @@
 
 For each image named in the project's ``[images.<name>]`` configuration::
 
-    boundaries  ->  donors  ->  resolve  ->  strict queue  ->  ledger
+    discovery  ->  boundaries  ->  donors  ->  resolve  ->  strict queue  ->  ledger
+
+* **discovery**   the catalogue checked against call, pointer and prologue evidence
+                  (``n64dk.analysis.coverage``); an incomplete one is repaired into ``<out>/discovery``;
 
 * **boundaries**  boundary operations the catalogue needs (reported; never applied to the project);
 * **donors**      functions that are machine-code-identical to code already matched in another
@@ -103,7 +106,7 @@ DOUBT_SAMPLE = 96
 
 
 def calibrate_recipe(resolve_hard, resolve_options, state: Path, image: str, rows, skip, sample: int,
-                     delta: int | None = None) -> dict:
+                     delta: int | None = None, region: tuple[int, int] | None = None) -> dict:
     """Resolve a spread sample of small functions with every available recipe tried on each, and
     return the recipe most of the byte-identical ones were built with.
 
@@ -116,12 +119,16 @@ def calibrate_recipe(resolve_hard, resolve_options, state: Path, image: str, row
     if not eligible:
         return {"sample": 0, "identical": 0, "recipes": {}, "chosen": None, "reason": "no functions in the size window"}
     every = max(1, len(eligible) // sample)
+    extra = {}
+    if region is not None:                               # only this region's functions
+        extra["only_names"] = [",".join(sorted({row[0] for row in eligible}))]
     result = resolve_hard(resolve_options(min_size=low, max_size=high, every=every, limit=sample,
-                                          cross_recipes=64, refine=None, budget=40))
+                                          cross_recipes=64, refine=None, budget=40, provisional=True,
+                                          write_scope=False if region is not None else True, **extra))
     store = resolvemod.CaseStore(state)
     try:
         cases = [case for case in store.all() if case.image == image and case.status in ("exact", "assumed")
-                 and low <= case.size <= high]
+                 and low <= case.size <= high and (region is None or region[0] <= case.vram <= region[1])]
     finally:
         store.close()
     tally: dict[str, int] = {}
@@ -136,6 +143,45 @@ def calibrate_recipe(resolve_hard, resolve_options, state: Path, image: str, row
     return {"sample": result.get("functions"), "identical": len(cases), "recipes": dict(ranked[:8]),
             "chosen": chosen, "seconds": result.get("seconds"),
             "reason": None if chosen else "fewer than three sample functions were byte-identical under any recipe"}
+
+
+REGION_MIN_FUNCTIONS = 40      # a region calibrated on its own needs this many functions
+REGION_MIN_SAMPLE = 24
+
+
+def calibrate_regions(resolve_hard, resolve_options, state: Path, image: str, rows, skip, sample: int,
+                      delta: int, data: bytes, emit=None) -> dict:
+    """Regional calibration: the image's toolchain regions (``n64dk.match.toolchain_regions``)
+    each calibrated on a sample of their own small functions, so a region built by another recipe
+    than the rest is not decided by the majority.  Returns ``{"regions": [...], "map": [...]}``
+    where ``map`` holds the regions that chose a recipe (start, end, pipeline, flags) for
+    ``resolve-hard``'s ``region_map``.  Regions without enough functions or a choice keep the
+    image's recipe."""
+    from ..match import toolchain_regions as tcmod
+    found = tcmod.reconstruct(data, delta, rows)
+    regions = [r for r in found.get("regions") or [] if r["functions"] >= REGION_MIN_FUNCTIONS
+               and r["verdict"] != "assembly"]
+    if len(regions) < 2:
+        return {"regions": [], "map": [], "reason": "fewer than two regions large enough to calibrate apart"}
+    total = sum(r["functions"] for r in regions)
+    out, mapping = [], []
+    for region in regions:
+        lo, hi = int(region["start"], 16), int(region["end"], 16)
+        inside = [row for row in rows if lo <= row[1] <= hi]
+        share = max(REGION_MIN_SAMPLE, round(sample * region["functions"] / total))
+        found_here = calibrate_recipe(resolve_hard, resolve_options, state, image, inside, skip, share, delta,
+                                      region=(lo, hi))
+        chosen = found_here.get("chosen")
+        out.append({"start": region["start"], "end": region["end"], "functions": region["functions"],
+                    "verdict": region["verdict"], "sample": found_here.get("sample"),
+                    "identical": found_here.get("identical"), "recipes": found_here.get("recipes"),
+                    "chosen": (chosen or {}).get("label")})
+        if chosen:
+            mapping.append({"start": lo, "end": hi, "pipeline": chosen["pipeline"], "flags": chosen["flags"],
+                            "label": chosen["label"]})
+        if emit:
+            emit("stage", image=image, stage="calibrate-region", start=region["start"], chosen=(chosen or {}).get("label"))
+    return {"regions": out, "map": mapping}
 
 
 def refine_settings(settings: dict, args):
@@ -218,7 +264,7 @@ def resolve_options_for(args, settings: dict, *, mode, project: Path, spec, jobs
             state=str(out / "state"), events=str(events), no_draft=False, no_recipes=False,
             draft_portfolio=True, draft_options=settings.get("draft_options", ""), force=False,
             skip_vrams=recovered, addr=None, size=None, cross_recipes=getattr(args, "cross_recipes", None),
-            only_names=getattr(args, "only_names", None),
+            only_names=getattr(args, "only_names", None), order=getattr(args, "order", None),
             region_recipes=bool(getattr(args, "region_recipes", False) or
                                 settings.get("region_recipes", False)),
             unit_recipes=bool(getattr(args, "unit_recipes", False) or
@@ -226,7 +272,9 @@ def resolve_options_for(args, settings: dict, *, mode, project: Path, spec, jobs
             skip_unknown_search=bool(getattr(args, "skip_unknown_search", False) or
                                      settings.get("skip_unknown_search", False)),
             search_economics=bool(getattr(args, "search_economics", False) or
-                                  settings.get("search_economics", False)))
+                                  settings.get("search_economics", False)),
+            recipe_gate=bool(settings.get("recipe_gate", True) if getattr(args, "recipe_gate", None) is None
+                             else args.recipe_gate))
         for key, value in overrides.items():
             setattr(options, key, value)
         return options
@@ -350,6 +398,38 @@ def _decompile_run(args):
 
     report = {"project": str(project), "images": {}, "resources": resource_plan.as_dict()}
     emit("resource-plan", **resource_plan.as_dict())
+    # --- 0. discovery: is each catalogue complete enough to decompile against?  An incomplete one
+    # is repaired from call, pointer and prologue evidence into the run directory (never the
+    # project), and the report says so: a percentage over a catalogue that misses code is not one.
+    repaired: dict[str, Path] = {}
+    placed: dict = {}                    # segments the discovery stage placed from the ROM
+    names = list(names)
+    discovery_mode = getattr(args, "discovery", None) or "repair"
+    if discovery_mode != "off" and "discovery" not in args.skip_stage:
+        from .discovery import run_audit
+        try:
+            with profiler.stage("discovery", "*"):
+                found = run_audit(project, names, out / "discovery", repair=discovery_mode == "repair")
+            report["discovery"] = discovery_summary(found)
+            repaired = {name: Path(img["repair"]["catalogue"]) for name, img in found["images"].items()
+                        if (img.get("repair") or {}).get("catalogue")}
+            for name, info in (found.get("extra_images") or {}).items():
+                placed[name] = imagemod.ImageSpec(name, Path(info["bin"]), int(info["vram"], 16),
+                                                  Path(info["catalogue"]))
+                if args.all_images or not args.image:
+                    names.append(name)
+        except Exception as error:                           # noqa: BLE001 - reported; the run goes on
+            report["discovery"] = {"error": f"{type(error).__name__}: {error}"[-300:]}
+        emit("stage", image="*", stage="discovery", result=report["discovery"])
+
+    def resolve_spec(name: str):
+        if name in placed:
+            return placed[name]
+        spec = imagemod.resolve(project, name)
+        if name in repaired:
+            import dataclasses
+            spec = dataclasses.replace(spec, catalogue=repaired[name], _rows=None)
+        return spec
     # a library of earlier runs: every other title in it is a donor, and this run joins it at the end
     from ..match import library as libmod
     library = Path(args.library).expanduser().resolve() if getattr(args, "library", None) else None
@@ -358,13 +438,13 @@ def _decompile_run(args):
     specs_seen = []
     # every function start of the title, whichever image it is in: a unit may call across images
     title_starts: set[int] = set()
-    for name in sorted(registry):
+    for name in sorted(set(registry) | set(placed)):
         try:
-            title_starts.update(vram for _n, vram, _s in imagemod.resolve(project, name).rows())
+            title_starts.update(vram for _n, vram, _s in resolve_spec(name).rows())
         except Exception:                                    # noqa: BLE001 - an image without a catalogue
             pass
     for name in names:
-        spec = imagemod.resolve(project, name)
+        spec = resolve_spec(name)
         settings = _settings(project, spec.name)
         folder = out / spec.name
         rows = spec.rows()
@@ -486,6 +566,19 @@ def _decompile_run(args):
                             emit("stage", image=spec.name, stage="recipe-doubt", share=found["share"])
                     except Exception:                            # noqa: BLE001 - a hint, never a reason to stop
                         pass
+                regional = bool(getattr(args, "regional_calibration", False) or settings.get("regional_calibration"))
+                if sample > 0 and "calibrate" not in args.skip_stage and regional:
+                    def calibrate_by_region():
+                        return calibrate_regions(resolve_hard, resolve_options, out / "state", spec.name, rows,
+                                                 recovered, sample, delta, data, emit)
+                    try:
+                        image_report["calibrate_regions"], _cached = _stage(
+                            folder, "calibrate_regions", _profiled(profiler, "calibrate-regions", spec.name,
+                                                                   calibrate_by_region), args.redo,
+                            _identity(base=stage_identity, sample=sample, donors=sorted(recovered)))
+                        held["region_map"] = image_report["calibrate_regions"].get("map") or []
+                    except Exception as error:
+                        image_report["calibrate_regions"] = {"error": str(error)[-300:]}
                 if sample > 0 and "calibrate" not in args.skip_stage:
                     def calibrate():
                         return calibrate_recipe(resolve_hard, resolve_options, out / "state", spec.name, rows, recovered,
@@ -502,9 +595,23 @@ def _decompile_run(args):
                 overrides = held["overrides"] = {}
                 if chosen_recipe:
                     overrides = held["overrides"] = {"pipeline": chosen_recipe["pipeline"], "flags": chosen_recipe["flags"]}
+                if held.get("region_map"):
+                    overrides = held["overrides"] = {**overrides, "region_map": held["region_map"]}
                 try:
+                    call = dict(overrides)
+                    if resume:
+                        # Round 1 was cut short: a case the interrupted sweep finished is not swept
+                        # again (that would continue it from its stored source, a second and different
+                        # pass, and repeat builds).  Calibration samples still marked provisional, and
+                        # functions without a case, are swept as an uninterrupted run would sweep them.
+                        finished = finished_cases(out / "state", spec.name)
+                        if finished:
+                            # applied after the selection (size window, --limit), so the resumed
+                            # sweep covers exactly the functions the original one selected
+                            call["resume_finished"] = finished
+                            image_report["resume_skipped_finished"] = len(finished)
                     image_report["resolve"] = _profiled(profiler, "resolve", spec.name,
-                                                        lambda: resolve_hard(resolve_options(**overrides)))()
+                                                        lambda: resolve_hard(resolve_options(**call)))()
                 except Exception as error:
                     image_report["resolve"] = {"error": str(error)[-300:]}
                 # --- 3b. declare: settle byte-identical cases that only wait for an address to be declared
@@ -592,6 +699,33 @@ def _decompile_run(args):
             except Exception as error:                       # an observation failure never costs the run
                 image_report["solver"] = {"observation_error": f"{type(error).__name__}: {error}"[-300:]}
 
+        # --- 3d. toolchain regions (builds nothing): ranked recipes per region, component mismatches,
+        #     abstention and dossiers, with the run's exact cases as proof
+        if "resolve" in plan:
+            try:
+                from ..match import toolchain_regions as tcmod
+                store = resolvemod.CaseStore(out / "state", readonly=True)
+                try:
+                    image_cases = [case for case in store.all() if case.image == spec.name]
+                finally:
+                    store.close()
+                from ..match import transform_classes as transforms
+                tally: dict[str, int] = {}
+                for case in image_cases:
+                    if case.status == "exact":
+                        found = transforms.provenance(case.stages)
+                        key = found["class"] or "as drafted"
+                        tally[key] = tally.get(key, 0) + 1
+                        tally["with frame scaffolding"] = tally.get("with frame scaffolding", 0) + found["scaffolding"]
+                image_report["exact_provenance"] = tally
+                regions = tcmod.reconstruct(data, delta, rows, cases=image_cases)
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / "toolchain_regions.json").write_text(json.dumps(regions, indent=1) + "\n")
+                image_report["toolchain_regions"] = {**(regions.get("summary") or {}),
+                                                     "file": str(folder / "toolchain_regions.json")}
+            except Exception as error:                       # noqa: BLE001 - an analysis, never the run's failure
+                image_report["toolchain_regions"] = {"observation_error": f"{type(error).__name__}: {error}"[-300:]}
+
         # --- 4. strict queue
         store = resolvemod.CaseStore(out / "state")
         try:
@@ -655,6 +789,7 @@ def _decompile_run(args):
     (out / "report.json").write_text(json.dumps(report, indent=1, default=str))
     (out / "report.md").write_text(_markdown(report))
     return {"status": report["status"], "failed_stages": report["failed_stages"],
+            "discovery": {k: v for k, v in (report.get("discovery") or {}).items() if k != "images"},
             "report": str(out / "report.md"), "events": str(events),
             "images": {name: _headline(item) for name, item in report["images"].items()},
             "seconds": report["seconds"]}
@@ -688,6 +823,11 @@ def solver_outputs(out: Path, image: str, mode, observations, *, rows, data: byt
     exact = {case.vram: case.name for case in cases if case.status == "exact"}
     boundary = solver.boundary_operations(boundary_file)
     recipes = solver.recipe_confidence(cases)
+    try:
+        from ..match import toolchain_regions as tcmod
+        reconstruction = tcmod.reconstruct(data, delta, rows, cases=cases)
+    except Exception:                                        # noqa: BLE001 - dossier context, never the run's failure
+        reconstruction = {}
     records, by_cause = [], {}
     for case in sorted(cases, key=lambda c: c.vram):
         if case.status not in solver.UNRESOLVED:
@@ -700,13 +840,22 @@ def solver_outputs(out: Path, image: str, mode, observations, *, rows, data: byt
         records.append(solver.dossier(case, decision, observations,
                                       related=[{"name": n, "relation": r} for n, r in related],
                                       boundary=boundary.get(case.vram, []), stop=stop.get("reason") or "",
-                                      image_recipes=recipes))
+                                      image_recipes=recipes,
+                                      region=tcmod.region_of(reconstruction, case.vram) if reconstruction else None))
         group = by_cause.setdefault(decision.cause, {"functions": 0, "bytes": 0, "next": {}})
         group["functions"] += 1
         group["bytes"] += case.size
         key = decision.technique or "stop"
         group["next"][key] = group["next"].get(key, 0) + 1
     solver.write_json(out / "solver" / f"hard_queue_{image}.json", records)
+    ledger_path = out / "solver" / f"attempts_{image}.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ledger_path.with_suffix(".tmp")
+    with temporary.open("w") as handle:
+        for entry in solver.attempts(cases, observations):
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    temporary.replace(ledger_path)
+    sieve_table = solver.sieve(cases, recovered=len(recovered))
     warning = None
     if mode.require_reasons and found["unexplained"]:
         warning = (f"effort {mode.name} requires a recorded reason for every function not attempted: "
@@ -715,8 +864,51 @@ def solver_outputs(out: Path, image: str, mode, observations, *, rows, data: byt
             "coverage_warning": warning,
             "coverage": {k: found[k] for k in ("functions", "attempted", "not_attempted", "unexplained", "reasons")},
             "remaining_by_cause": dict(sorted(by_cause.items(), key=lambda kv: -kv[1]["bytes"])),
+            "sieve": sieve_table,
             "files": {"rounds": str(out / "rounds.jsonl"), "coverage": str(out / "solver" / f"coverage_{image}.json"),
-                      "hard_queue": str(out / "solver" / f"hard_queue_{image}.json")}}
+                      "hard_queue": str(out / "solver" / f"hard_queue_{image}.json"),
+                      "attempts": str(ledger_path)}}
+
+
+def finished_cases(state: Path, image: str) -> set[int]:
+    """Link-space addresses of the cases of ``image`` whose ladder finished (a case is stored only
+    when its ladder ends), less calibration samples still marked provisional."""
+    if not Path(state).is_dir():
+        return set()
+    store = resolvemod.CaseStore(state, readonly=True)
+    try:
+        return {case.vram for case in store.all() if case.image == image
+                and not any(stage.get("stage") == "provisional" for stage in case.stages)}
+    finally:
+        store.close()
+
+
+def discovery_summary(found: dict) -> dict:
+    """Per image: the audit's verdict before and after repair, and what the repair added."""
+    images = {}
+    for name, img in found["images"].items():
+        repair = img.get("repair") or {}
+        images[name] = {"verdict": img.get("verdict"), "coverage": img.get("coverage"),
+                        "functions": img.get("functions"), "reasons": img.get("reasons"),
+                        "missing_call_targets": (img.get("direct_calls") or {}).get("missing"),
+                        "unmapped_call_targets": (img.get("direct_calls") or {}).get("unmapped"),
+                        "framed_functions_outside": (img.get("prologues_outside") or {}).get("walk_as_functions"),
+                        "repaired_functions": repair.get("added", 0), "repaired_bytes": repair.get("bytes", 0),
+                        "verdict_after": repair.get("verdict_after", img.get("verdict")),
+                        "coverage_after": repair.get("coverage_after", img.get("coverage")),
+                        "functions_after": repair.get("functions_after", img.get("functions")),
+                        # what remains after repair (round 11: the summary used to carry only the
+                        # pre-repair reasons, which overstated what was still missing)
+                        "reasons_after": repair.get("reasons_after", img.get("reasons"))}
+    verdict = found.get("verdict")
+    return {"verdict_before": found.get("verdict_before", verdict), "verdict": verdict,
+            "rom_reasons": found.get("rom_reasons"),
+            "placed": [{k: p[k] for k in ("name", "rom", "rom_end", "vram", "landed", "functions")}
+                       for p in found.get("placed") or []],
+            "warning": (None if verdict != "incomplete" else
+                        "the function catalogue is incomplete even after repair: every count and percentage in "
+                        "this report is over the catalogue, not over the title's code"),
+            "images": images}
 
 
 def _rows_of(manifest: str, delta: int):
@@ -743,6 +935,19 @@ def _headline(item: dict) -> dict:
 
 def _markdown(report: dict) -> str:
     lines = [f"# decompile-run report", "", f"Project: `{report['project']}`  ", f"Wall time: {report.get('seconds')} s", ""]
+    found = report.get("discovery") or {}
+    if found.get("verdict"):
+        lines.append(f"Discovery: catalogue {found['verdict']}"
+                     + (f" (before repair: {found['verdict_before']})" if found.get("verdict_before") != found["verdict"] else ""))
+        for name, img in (found.get("images") or {}).items():
+            lines.append(f"- {name}: {img['verdict_after']}, coverage {img['coverage_after']}"
+                         + (f", +{img['repaired_functions']} functions from call/pointer/prologue evidence"
+                            if img.get("repaired_functions") else ""))
+            if img.get("verdict_after") != "complete":
+                lines += [f"  - {reason}" for reason in (img.get("reasons_after") or [])[:4]]
+        if found.get("warning"):
+            lines.append(f"- WARNING: {found['warning']}")
+        lines.append("")
     for name, item in report["images"].items():
         head = _headline(item)
         lines += [f"## {name}", "", f"- catalogued functions: {head['functions']}",
@@ -765,6 +970,12 @@ def _markdown(report: dict) -> str:
             lines.append(f"- refiner: asked about {info.get('attempted')} cases in {info.get('calls')} calls; "
                          f"{info.get('improved')} improved, {info.get('exact')} became exact, "
                          f"{info.get('assumed')} byte-identical awaiting symbols, {info.get('errors')} call errors")
+        if item.get("exact_provenance"):
+            lines.append(f"- exact functions by what their source went through (n64dk.match.transform_classes): "
+                         f"{item['exact_provenance']}")
+        if (item.get("toolchain_regions") or {}).get("functions_by_verdict"):
+            lines.append(f"- toolchain regions: {item['toolchain_regions']['functions_by_verdict']} "
+                         f"(`{item['toolchain_regions'].get('file')}`)")
         if item.get("boundaries"):
             lines.append(f"- boundary operations proposed: {item['boundaries'].get('operations')}")
         if item.get("ledger") and "totals" in item["ledger"]:
@@ -780,6 +991,11 @@ def _markdown(report: dict) -> str:
             lines.append(f"- coverage: {cover.get('attempted')} of {cover.get('functions')} catalogued functions "
                          f"attempted, {cover.get('not_attempted')} not attempted (each with a recorded reason), "
                          f"{cover.get('unexplained')} unexplained")
+            if solved.get("sieve"):
+                lines += ["", "| sieve stage | settled | builds |", "|---|---:|---:|"]
+                lines += [f"| {name} | {row['settled']} | {row['builds']} |"
+                          for name, row in solved["sieve"]["stages"].items() if row["settled"] or row["builds"]]
+                lines.append(f"| unresolved | {solved['sieve']['unresolved']} | |")
             if solved.get("remaining_by_cause"):
                 lines += ["", "| primary cause | functions | bytes | next action |", "|---|---:|---:|---|"]
                 lines += [f"| {cause} | {g['functions']} | {g['bytes']} | "
@@ -856,12 +1072,23 @@ def _args(p):
                    help="skip the variant search when the best draft scores above this "
                         "(default: [run] search_ceiling, else the resolver's measured default; 0: always search)")
     p.add_argument("--limit", type=int, default=0, help="at most this many functions per image (smallest first)")
+    p.add_argument("--order", default=None,
+                   help="attempt order within a pass: size (default), reverse, shuffle:SEED; for determinism checks")
+    p.add_argument("--regional-calibration", action="store_true", default=None,
+                   help="calibrate each toolchain region (n64dk.match.toolchain_regions) on its own functions and "
+                        "start every function from its region's recipe (experimental; off by default until measured)")
     p.add_argument("--region-recipes", action="store_true", default=None,
                    help="enable the experimental region-recipe retry (measured 3/126; off by default)")
     p.add_argument("--unit-recipes", action="store_true", default=None,
                    help="enable the experimental nearest-unit recipe retry (measured 0/165; off by default)")
     p.add_argument("--skip-unknown-search", action="store_true",
                    help="experimental: skip variant search in unknown-toolchain regions; advisory only by default")
+    p.add_argument("--recipe-gate", dest="recipe_gate", action="store_true", default=None,
+                   help="run the wide recipe retry only for functions with unoptimised-code evidence (in the "
+                        "function or its neighbourhood) or another compiler family (default; [run] recipe_gate). "
+                        "Measured offline: 0 exact lost on 3 held-out blind titles, 67K builds saved")
+    p.add_argument("--no-recipe-gate", dest="recipe_gate", action="store_false",
+                   help="run the wide recipe retry on every far function (round-10 behaviour)")
     p.add_argument("--search-economics", action="store_true", default=None,
                    help="stop the variant search in a stratum (recipe x first-draft distance) whose searches have "
                         "returned nothing after a fixed spend, probing it now and then (n64dk.match.economics)")
@@ -872,7 +1099,11 @@ def _args(p):
     p.add_argument("--min-confidence", type=float, default=0.8)
     p.add_argument("--strict-only", action="store_true", help="queue only strictly exact cases")
     p.add_argument("--skip-stage", action="append", default=[],
-                   choices=["boundaries", "donors", "resolve", "ledger"])
+                   choices=["discovery", "boundaries", "donors", "resolve", "ledger"])
+    p.add_argument("--discovery", choices=("repair", "audit", "off"), default=None,
+                   help="discovery gate before every stage (default repair): audit each catalogue against call, "
+                        "pointer and prologue evidence; repair adds evidence-backed functions to an incomplete "
+                        "catalogue in the run directory (never the project); audit only reports")
     p.add_argument("--redo", action="store_true", help="recompute checkpointed stages")
 
 

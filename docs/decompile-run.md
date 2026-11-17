@@ -96,6 +96,7 @@ are still surveyed as a handful of functions.
 
 | stage | what it does | output |
 |---|---|---|
+| discovery | audits every image against call, branch, pointer, prologue, datamap and placement evidence; by default repairs evidence-backed omissions in a run-local catalogue without modifying the project | `discovery.json`, `discovery/`, repaired `functions.toml` plus `*.unrepaired.toml` |
 | boundaries | reconciles catalogue starts with call targets, prologues, padding and fragment chains; proposes reversible operations only | `<image>/boundary_operations.json` |
 | donors | looks every function up, relocation-masked, in the donor index; a hit is rebuilt from the donor's source with this title's symbols and compared | `<image>/donors/`, `stage_donors.json` |
 | resolve | for each remaining function: declarations recovered from the machine code, a portfolio of drafts (plain, with callee/own prototypes, loop-normal, type-narrowed), compile repair, recipe selection, one search over all transformation families, twin reuse | `state/` (case store) |
@@ -110,6 +111,13 @@ addresses have been declared since); any other case continues from its stored be
 the recipe that source was built with, and the stored case stays when the new attempt ends
 further from the target.
 
+The discovery policy is `--discovery repair` by default. `--discovery audit` reports without
+repairing and `--discovery off` restores the previous behavior. A report that remains
+`incomplete` after repair warns that every percentage is over an incomplete catalogue.
+`toolchain-regions` and each run report separately describe stretches that fit known recipes,
+are uncertain, or differ in a compiler/assembler component; these classifications guide and
+explain work but do not grant matching credit.
+
 **What the resolve stage does beyond drafting.**
 
 - *Padding.* A catalogue interval that runs to the next function includes the zero words that
@@ -117,7 +125,9 @@ further from the target.
   (`resolve-hard --keep-padding` restores the old behaviour); the summary counts what was trimmed.
 - *Drafts × recipes.* When no draft is exact under the configured recipe, the best drafts are
   built under the sibling compilers with the same flags and under the other optimisation levels
-  of each (`-O1`, `-O3`).
+  of each (`-O1`, `-O3`). By default, the broad retry is gated by unoptimised-code evidence in
+  the function or its catalogue neighbourhood; `--no-recipe-gate` restores the earlier retry
+  for every far case.
 - *Frame fit.* When the candidate's stack frame differs from the target's, every stack-relative
   instruction differs and the score says nothing about the rest. The difference is measured, so
   the repair is computed: temporaries that only name a sub-expression are substituted, and the
@@ -134,6 +144,11 @@ Every compiler/assembler subprocess has a timeout and its own process group. Tim
 terminates the group, so abandoned compiler children cannot continue consuming memory or I/O.
 Object-cache identities cover the source, recursively included headers, pipeline, flags,
 normalizer, environment and tool binaries.
+
+When m2c is importable, drafting uses a bounded fork-server pool by default. The server imports m2c
+once but forks a fresh, timeout-controlled child for every draft, and is covered by the same
+resource tokens, process-group cleanup and parent-death handling as other tools.
+`N64DK_M2C_SERVER=0` selects the command-line path for diagnosis or comparison.
 
 **Where the search is not tried.** The variant search runs only when the best draft is within
 `--search-ceiling` of the target (default 40, `[run] search_ceiling`, 0 to always search). Over

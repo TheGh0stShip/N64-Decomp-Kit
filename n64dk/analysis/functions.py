@@ -231,7 +231,8 @@ def _after_function_end(img: "Image", at: int, padding: int = 7) -> bool:
 
 
 class Analyser:
-    def __init__(self, image: Image, entry: int, text_hint_end: int | None = None, text_lo: int | None = None):
+    def __init__(self, image: Image, entry: int, text_hint_end: int | None = None, text_lo: int | None = None,
+                 scan_evidence: bool = True):
         self.img = image
         self.entry = entry
         self.text_lo = entry if text_lo is None else text_lo
@@ -250,6 +251,8 @@ class Analyser:
         # target and every aligned word in the image that points into it.
         self.evidence: set[int] = set()
         self.jal_targets: set[int] = set()
+        if not scan_evidence:                   # walking only (coverage audits): no resync evidence
+            return
         for _, w in mips.iter_words(image.data):
             if w >> 26 == 3:
                 self.jal_targets.add((image.vram & 0xF0000000) | ((w & 0x3FFFFFF) << 2))

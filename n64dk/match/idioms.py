@@ -378,8 +378,20 @@ def stretches(functions: list[tuple[int, frozenset[str]]], table: Table, window:
 
 
 def _tail(seen: int, of: int, rate: float) -> float:
-    """Probability of ``seen`` or more among ``of`` when each has probability ``rate``."""
-    return sum(math.comb(of, k) * rate ** k * (1.0 - rate) ** (of - k) for k in range(seen, of + 1))
+    """Probability of ``seen`` or more among ``of`` when each has probability ``rate``.  Terms are
+    computed in log space: ``math.comb`` of a large image's function count overflows a float."""
+    if seen <= 0:
+        return 1.0
+    if seen > of or rate <= 0.0:
+        return 0.0
+    if rate >= 1.0:
+        return 1.0
+    log_rate, log_rest = math.log(rate), math.log1p(-rate)
+    base = math.lgamma(of + 1)
+    total = 0.0
+    for k in range(seen, of + 1):
+        total += math.exp(base - math.lgamma(k + 1) - math.lgamma(of - k + 1) + k * log_rate + (of - k) * log_rest)
+    return min(1.0, total)
 
 
 def unknown_stretches(functions: list[tuple[int, frozenset[str]]], table: Table,

@@ -1,5 +1,4 @@
 """Assembly normalizers placed between GCC ``-S`` and an old GNU assembler.
-
 ``builtin`` makes KMC GCC 2.7.2 output deterministic for GNU as 2.x in the way the
 BattleTanx project's normalizer starts out (tools/normalize_kmc_gcc_asm.py, GPL-3.0): GCC
 already wraps the transfers whose delay slots it filled in ``.set noreorder`` regions, so
@@ -64,3 +63,25 @@ def run_hook(command: str, src: Path, dst: Path, cwd: Path, extra: list[str] | N
         raise RuntimeError("normalizer timed out after 120s") from error
     if proc.returncode:
         raise RuntimeError(f"normalizer failed: {proc.stderr.strip()[-400:]}")
+
+
+_SYMBOL_LOAD = re.compile(r"^(\s*)(lw|lh|lhu|lb|lbu)(\s+)(\$\d+|\$[a-z][a-z0-9]),\s*([A-Za-z_.$][\w.$]*(?:[+-]\d+)?)\s*(#.*)?$")
+
+
+def at_symbol_loads(text: str) -> str:
+    """Assembler component variant ``atload``: an integer load from a bare symbol (``lw $4,g``,
+    which GNU as, KMC as, ASN64 and IRIX as all expand through the destination register) expanded
+    through ``$at`` instead: ``lui $at,%hi(g)`` then ``lw $4,%lo(g)($at)``.  Retail code of some
+    titles holds exactly this form (round 11, TOOLCHAIN_REGIONS.md: no installed assembler makes
+    it).  Behaviour-preserving: the same value reaches the same register; ``$at`` is the
+    assembler's temporary.  Everything else is left for the assembler."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = _SYMBOL_LOAD.match(line.rstrip("\n"))
+        if not m:
+            out.append(line)
+            continue
+        indent, op, _space, reg, sym, _comment = m.groups()
+        out.append(f"{indent}.set\tnoat\n{indent}lui\t$1,%hi({sym})\n{indent}{op}\t{reg},%lo({sym})($1)\n"
+                   f"{indent}.set\tat\n")
+    return "".join(out)

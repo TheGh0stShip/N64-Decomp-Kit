@@ -515,6 +515,23 @@ class CoverageAndDossierTest(unittest.TestCase):
         self.assertEqual([row["technique"] for row in record["ladder"]], ["drafts", "recipe", "iterate"])
         self.assertEqual(record["next_action"], "search")
 
+    def test_dossier_names_the_region_and_what_would_reopen_it(self):
+        case = _case("x", 0x80001000, top="frame.size", stages=[
+            {"stage": "frame-fit", "tried": 6, "chosen": "pad 8 top", "score": 30}])
+        region = {"start": "0x80000000", "end": "0x80002000", "verdict": "unknown",
+                  "ranked": [{"recipe": "kmc+as -O2", "share": 0.4}],
+                  "component_mismatches": [{"component": "assembler: global loads expanded through $at"}],
+                  "unknown_marks": ["at=direct-load"]}
+        observations = solver.Observations()
+        decision = solver.decide(case, solver.MODES["normal"], observations)
+        record = solver.dossier(case, decision, observations, region=region)
+        self.assertEqual(record["toolchain_region"]["verdict"], "unknown")
+        self.assertTrue(record["transformations_of_best_source"]["scaffolding"])
+        reopen = " | ".join(record["reopen_on"])
+        self.assertIn("global loads expanded through $at", reopen)
+        self.assertIn("stack frame", reopen)
+        self.assertIsNone(solver.dossier(case, decision, observations)["toolchain_region"])
+
     def test_call_graph_links_callers_and_callees(self):
         delta = 0x80000000
         words = [0] * 16
@@ -725,3 +742,37 @@ class InvocationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerAndSieveTest(unittest.TestCase):
+    def _cases(self):
+        drafted = _case("a", 0x80001000, status="exact", score=0,
+                        stages=[{"stage": "drafts", "variants": [{"label": "plain", "score": 0}]}])
+        crossed = _case("b", 0x80001040, status="exact", score=0,
+                        stages=[{"stage": "drafts", "variants": [{"label": "plain", "score": 30}]},
+                                {"stage": "drafts-x-recipes", "tried": 12, "chosen": "kmc -O1", "score": 0}])
+        searched = _case("c", 0x80001080, status="exact", score=0,
+                         stages=[{"stage": "drafts", "variants": [{"label": "plain", "score": 6}]},
+                                 {"stage": "iterate", "builds": 40, "start": 6, "final": 0,
+                                  "helpful_families": ["lifetime", "types"]}])
+        left = _case("d", 0x800010C0, status="open", score=22,
+                     stages=[{"stage": "drafts", "variants": [{"label": "plain", "score": 22}]},
+                             {"stage": "iterate-skipped", "ceiling": 20, "score": 22}])
+        return [drafted, crossed, searched, left]
+
+    def test_sieve_accounts_for_every_case_once(self):
+        table = solver.sieve(self._cases(), recovered=5)
+        settled = {name.split(" ")[0]: row["settled"] for name, row in table["stages"].items()}
+        self.assertEqual((settled["3"], settled["4"], settled["2"], settled["7"]), (5, 1, 1, 1))
+        self.assertEqual(table["unresolved"], 1)
+        self.assertEqual(sum(settled.values()) - 5 + table["unresolved"], 4)
+
+    def test_attempt_ledger_has_every_method_and_a_final_row(self):
+        observations = solver.Observations()
+        observations.facts["main:800010C0:40"] = [{"technique": "search", "round": 2, "outcome": "no-change",
+                                                   "builds": 30, "calls": 0, "digest": "dd"}]
+        rows = solver.attempts(self._cases(), observations)
+        left = [r for r in rows if r["name"] == "d"]
+        self.assertEqual([r["method"] for r in left], ["drafts", "iterate-skipped", "search", "final"])
+        self.assertEqual(left[-1]["outcome"]["status"], "open")
+        self.assertEqual(rows, solver.attempts(self._cases(), observations))      # rebuilt identically

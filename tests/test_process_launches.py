@@ -15,6 +15,8 @@ ALLOWED = {
     "match/custom_pipeline.py": "configured compiler lanes: takes tool tokens, registers the process group",
     "match/runner.py": "project build commands: takes a token, registers the process group",
     "match/refine.py": "the model call: takes the model token",
+    "match/m2c_server.py": "m2c fork server: a light token per draft, registers its process group, the child "
+                           "memory ceiling and the parent-death signal",
     "operations.py": "runs n64dk itself; the tools that process starts take their own tokens",
     "commands/results.py": "runs n64dk itself",
     "commands/candidates.py": "runs n64dk itself (match) and git ls-files for an interactive command",
@@ -55,3 +57,77 @@ class RunToolTest(unittest.TestCase):
         time.sleep(5.5)
         self.assertFalse(marker.exists(), "the grandchild outlived the timeout")
         self.assertEqual(safety._TOOL_GROUPS, set())
+
+
+class ParentDeathTest(unittest.TestCase):
+    """A tool must not outlive an n64dk process killed outright (SIGKILL, the OOM killer)."""
+
+    def _orphan_after_kill(self, mode: str, worker: bool = False) -> bool:
+        import os
+        import signal
+        import subprocess
+        import sys
+        import tempfile
+        import time
+        folder = tempfile.mkdtemp(prefix="n64dk-pdeath-")
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        pidfile = Path(folder) / "pid"
+        script = (f"import os; os.environ['N64DK_PDEATHSIG'] = {mode!r}; os.environ['N64DK_PDEATHSIG_SCOPE'] = 'all'\n"
+                  "from n64dk import safety\n"
+                  f"safety.run_tool(['sh', '-c', 'echo $$ > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; exec sleep 30'],"
+                  " timeout=60)\n") if not worker else (
+                  f"import os, time; os.environ['N64DK_PDEATHSIG'] = {mode!r}\n"
+                  "from n64dk import safety\n"
+                  "pid = os.fork()\n"
+                  "if pid == 0:\n"
+                  "    safety.forked()\n"
+                  f"    open('{pidfile}.tmp', 'w').write(str(os.getpid())); os.rename('{pidfile}.tmp', '{pidfile}')\n"
+                  "    time.sleep(30); os._exit(0)\n"
+                  "time.sleep(60)\n")
+        environment = {**os.environ, "PYTHONPATH": str(ROOT.parent)}
+        parent = subprocess.Popen([sys.executable, "-c", script], env=environment)
+        deadline = time.monotonic() + 20
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(pidfile.exists(), "the tool never started")
+        tool = int(pidfile.read_text())
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(tool, 0)
+            except ProcessLookupError:
+                return False
+            time.sleep(0.05)
+        os.kill(tool, signal.SIGKILL)                       # clean up what survived
+        return True
+
+    @unittest.skipUnless(__import__("sys").platform.startswith("linux"), "Linux parent-death signal")
+    def test_tool_dies_with_its_killed_parent(self):
+        from n64dk import safety
+        modes = ["prctl"] + (["setpriv"] if __import__("os").access(safety.SETPRIV, __import__("os").X_OK) else [])
+        for mode in modes:
+            with self.subTest(mode=mode):
+                self.assertFalse(self._orphan_after_kill(mode), f"{mode}: the tool outlived its parent")
+
+    @unittest.skipUnless(__import__("sys").platform.startswith("linux"), "Linux parent-death signal")
+    def test_forked_worker_stops_with_its_killed_parent(self):
+        self.assertFalse(self._orphan_after_kill("setpriv", worker=True), "the worker outlived its parent")
+
+    def test_only_long_lived_tools_are_guarded_by_default(self):
+        import os
+        from unittest import mock
+        from n64dk import safety
+        with mock.patch.dict(os.environ, {"N64DK_PDEATHSIG_SCOPE": "long"}):
+            self.assertFalse(safety.guard_wanted(["/x/kmc/gcc", "-c"]))
+            self.assertTrue(safety.guard_wanted(["/x/qemu-irix", "-L", "/r", "/r/cc"]))
+            self.assertTrue(safety.guard_wanted(["/x/bin/m2c", "a.s"]))
+            self.assertTrue(safety.guard_wanted(["cc"], legacy=True))
+        with mock.patch.dict(os.environ, {"N64DK_PDEATHSIG_SCOPE": "all"}):
+            self.assertTrue(safety.guard_wanted(["/x/kmc/gcc"]))
+
+    @unittest.skipUnless(__import__("sys").platform.startswith("linux"), "Linux parent-death signal")
+    def test_without_the_signal_the_tool_survives(self):
+        """The control: proves the test above detects an orphan."""
+        self.assertTrue(self._orphan_after_kill("off"))

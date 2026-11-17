@@ -151,8 +151,10 @@ def run_command(command: list[str], prompt: str, timeout: float, env: dict | Non
     killed on timeout; a non-zero exit or empty output raises :class:`RefineError`."""
     label = Path(command[0]).name
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   start_new_session=True, cwd=cwd, env={**os.environ, **(env or {})})
+        from .. import safety
+        process = subprocess.Popen(safety.death_guarded(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True, cwd=cwd,
+                                   env={**os.environ, **(env or {})}, preexec_fn=safety.child_setup())
     except OSError as error:
         raise RefineError(f"cannot start {label}: {error.strerror or error.__class__.__name__}") from None
     stdout, stderr = bytearray(), bytearray()
@@ -280,7 +282,7 @@ def _strip_paths(text: str) -> str:
 def build_prompt(name: str, recipe: str, assembly: str, best_source: str | None, best_text: str,
                  causes: list[dict], attempts: list[tuple[str, str]], asm_limit: int = 400,
                  declarations: str = "", examples: list[tuple[str, str, str]] | None = None,
-                 failed_draft: tuple[str, str] | None = None) -> str:
+                 failed_draft: tuple[str, str] | None = None, tried: list[str] | None = None) -> str:
     """One round's prompt.  ``examples`` are ``(name, assembly, source)`` of functions of the same
     image that already compile to their exact bytes under this recipe.  ``attempts`` are this conversation's earlier answers with what the
     compiler made of each (most recent last)."""
@@ -312,16 +314,43 @@ def build_prompt(name: str, recipe: str, assembly: str, best_source: str | None,
             evidence = "; ".join(str(e) for e in (cause.get("evidence") or [])[:2])
             parts.append(f"- {cause.get('cause') or cause.get('id')}: {cause.get('meaning', '')}"
                          + (f" ({evidence})" if evidence else ""))
+    if tried:
+        parts += ["", "## What automated search already tried on this function (do not repeat it)"]
+        parts += [f"- {line}" for line in tried[:12]]
     for number, (source, result) in enumerate(attempts, 1):
         parts += ["", f"## Your attempt {number}", "```c", source.strip(), "```", result]
     parts += ["", "Write the next version now: one ```c block, the whole translation unit."]
     return "\n".join(parts) + "\n"
 
 
+def tried_summary(stages: list[dict]) -> list[str]:
+    """The near-miss dossier's attempt history in a line per method, for the prompt: which
+    recipes, frame sizes and transformation families were tried and how close they came."""
+    lines = []
+    for stage in stages or ():
+        kind = stage.get("stage")
+        if kind == "drafts":
+            scores = [v.get("score") for v in stage.get("variants") or [] if v.get("score") is not None]
+            if scores:
+                lines.append(f"{len(stage.get('variants') or [])} decompiler renderings; best difference {min(scores)}")
+        elif kind in ("drafts-x-recipes", "recipe") and stage.get("tried"):
+            lines.append(f"{stage['tried']} builds under other compiler settings"
+                         + (f"; best {stage.get('chosen')} at {stage.get('score')}" if stage.get("chosen") else
+                            "; none was closer"))
+        elif kind == "frame-fit" and stage.get("tried"):
+            lines.append(f"stack frame fitting ({stage['tried']} builds)"
+                         + (f"; kept {stage.get('chosen')}" if stage.get("chosen") else "; no frame size helped"))
+        elif kind == "iterate":
+            helpful = ", ".join(stage.get("helpful_families") or []) or "none"
+            lines.append(f"mechanical source variants ({stage.get('builds')} builds): difference {stage.get('start')} "
+                         f"-> {stage.get('final')}; helpful families: {helpful}")
+    return lines
+
+
 def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, best_source: str | None,
            best_evaluation, causes: list[dict] | None = None, prepare=None, declarations: str = "",
            emit=None, run=run_command, examples=None, failed_draft: tuple[str, str] | None = None,
-           cache: Path | None = None, known: "KnownSource | None" = None) -> dict:
+           cache: Path | None = None, known: "KnownSource | None" = None, tried: list[str] | None = None) -> dict:
     """Converse about one function.  ``evaluate(text) -> (Evaluation, code)``; ``prepare(text)``
     turns an answer into a buildable unit (typedef prelude).  Returns ``{"rounds", "calls",
     "errors", "best_source", "best", "improved", "history"}`` where ``best`` is the Evaluation of
@@ -341,7 +370,7 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
         prompt = build_prompt(name, recipe, assembly, best_text,
                               describe_evaluation(best, settings.diff_limit) if best_text else "",
                               causes or [], attempts[-2:], settings.asm_limit, declarations,
-                              examples() if callable(examples) else examples, failed_draft)
+                              examples() if callable(examples) else examples, failed_draft, tried)
         if len(prompt.encode()) > settings.prompt_limit:
             errors.append(f"prompt exceeds the {settings.prompt_limit}-byte limit")
             history.append({"round": round_number, "error": errors[-1]})

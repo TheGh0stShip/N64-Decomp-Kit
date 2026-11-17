@@ -152,9 +152,10 @@ def build(recipe: Recipe, source: Path, flags: list[str], include_dirs: list[Pat
         with safety.tool_tokens(legacy, safety.tool_family(argv)):   # machine-wide, weighted by measured peak
             try:
                 family = safety.tool_family(argv)
-                launched, rss_report = safety.measured(argv)
+                launched, rss_report = safety.measured(argv, legacy)
                 process = subprocess.Popen(launched, cwd=workdir, env=environment, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT, start_new_session=True)
+                                           stderr=subprocess.STDOUT, start_new_session=True,
+                                           preexec_fn=safety.child_setup(legacy))
                 safety.limit_child(process.pid, legacy)
                 safety.register_tool(process.pid)
             except OSError as error:

@@ -148,3 +148,25 @@ class DeclareAssumedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResumeSweepTest(unittest.TestCase):
+    def test_finished_cases_are_skipped_and_calibration_samples_are_not(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from n64dk.commands.run import finished_cases
+        from n64dk.match import resolve as resolvemod
+        root = Path(tempfile.mkdtemp(prefix="n64dk-resume-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        store = resolvemod.CaseStore(root)
+        try:
+            for vram, stages, image in ((0x80001000, [{"stage": "drafts", "variants": []}], "main"),
+                                        (0x80002000, [{"stage": "provisional", "recipe": "kmc -O2"}], "main"),
+                                        (0x80003000, [], "seg")):
+                store.put(resolvemod.Case(resolvemod.case_id(image, vram, 0x40), image, f"f{vram:x}", vram, 0x40,
+                                          "t", status="open", stages=stages))
+        finally:
+            store.close()
+        self.assertEqual(finished_cases(root, "main"), {0x80001000})
+        self.assertEqual(finished_cases(root / "missing", "main"), set())

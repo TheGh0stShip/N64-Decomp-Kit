@@ -63,19 +63,26 @@ class PadTest(unittest.TestCase):
 
     def test_pad_goes_before_or_after_the_declarations(self):
         top = draftforms.pad(self.SOURCE, "f", 12, "top")
-        self.assertIn("s32 f(s32 a) {\n    s32 pad[3];\n    s32 sp1C;\n    s32 temp_v0;\n", top)
+        self.assertIn("s32 f(s32 a) {\n    s32 pad[3]; /* n64dk: frame padding, reconstruction scaffolding */\n    s32 sp1C;\n    s32 temp_v0;\n", top)
         bottom = draftforms.pad(self.SOURCE, "f", 4, "bottom")
-        self.assertIn("    s32 sp1C;\n    s32 temp_v0;\n    s32 pad;\n\n    sp1C = a;", bottom)
+        self.assertIn("    s32 sp1C;\n    s32 temp_v0;\n    s32 pad; /* n64dk: frame padding, reconstruction scaffolding */\n\n    sp1C = a;", bottom)
 
     def test_pad_name_does_not_collide_and_bad_requests_are_refused(self):
         again = draftforms.pad(draftforms.pad(self.SOURCE, "f", 8, "top"), "f", 4, "top")
-        self.assertIn("    s32 pad2;\n    s32 pad[2];\n", again)
+        self.assertIn("    s32 pad2; /* n64dk: frame padding, reconstruction scaffolding */\n    s32 pad[2]; /* n64dk: frame padding, reconstruction scaffolding */\n", again)
         self.assertIsNone(draftforms.pad(self.SOURCE, "f", 0))
         self.assertIsNone(draftforms.pad(self.SOURCE, "missing", 8))
 
+    def test_padding_is_marked_as_scaffolding(self):
+        from n64dk.match.transform_classes import SCAFFOLD_MARK, provenance
+        self.assertIn(SCAFFOLD_MARK, draftforms.pad(self.SOURCE, "f", 4, "top"))
+        self.assertTrue(provenance([{"stage": "frame-fit", "chosen": "pad 4 top"}])["scaffolding"])
+        self.assertEqual(provenance([{"stage": "iterate", "helpful_families": ["types", "lifetime"]}])["class"],
+                         "exploration")
+
     def test_function_without_declarations(self):
         source = PREAMBLE + "void f(void) {\n    g();\n}\n"
-        self.assertIn("void f(void) {\n    s32 pad[2];\n    g();\n}", draftforms.pad(source, "f", 8, "bottom"))
+        self.assertIn("void f(void) {\n    s32 pad[2]; /* n64dk: frame padding, reconstruction scaffolding */\n    g();\n}", draftforms.pad(source, "f", 8, "bottom"))
 
 
 @unittest.skipUnless(HAVE_PARSER, "pycparser not installed")

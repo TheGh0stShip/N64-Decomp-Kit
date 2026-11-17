@@ -10,8 +10,9 @@ manifests, sources); nothing is hard-coded to one game.
 * **Boot and program image**: header, CIC and checksum; the entry routine (stack, BSS, hand-over);
   an R4300 boot emulator that follows loaders (PI DMA, decompression) and maps the program's
   RAM image back to its ROM sources.
-* **Code**: function boundaries, jump tables and boundary audits; libultra/libaudio
-  identification by masked signatures; compiler and microcode fingerprints.
+* **Code**: function boundaries, jump tables and boundary audits; a discovery-completeness gate
+  that finds evidence-backed code outside the catalogue; libultra/libaudio identification by
+  masked signatures; regional compiler, assembler and microcode fingerprints.
 * **Data**: cross-references, `.data`/`.rodata` split and ownership, typed data units.
 * **Assets**: audio (libaudio banks, sequences, MIDI, libmus, VADPCM to WAV), graphics (F3D,
   F3DEX, F3DEX2, S2DEX display lists, textures to PNG, blob pools), compression (Yay0, Yaz0,
@@ -74,8 +75,11 @@ n64dk decompile-export --project work/title --run work/title/.n64dk/run --out ou
 ```
 
 `decompile-init` discovers loaded images, functions, symbols, compiler evidence and a complete ROM
-ledger. `decompile-run` tries verified donors, compiler-specific draft generators, strict rebuilds,
-bounded source search and an optional external refiner. `decompile-export` keeps four categories
+ledger, then audits and repairs incomplete catalogues from call, pointer and prologue evidence.
+`decompile-run` repeats that discovery gate before trying verified donors, compiler-specific
+draft generators, strict rebuilds, bounded source search and an optional external refiner. It
+records regional toolchain evidence and a durable per-function attempt ledger so interrupted runs
+resume without repeating settled work. `decompile-export` keeps four categories
 separate: strictly verified C, C awaiting independent symbol declarations, verified assembly, and
 generated assembly for code not decompiled. Generated assembly and raw-word fallbacks provide byte
 coverage but never count as C decompilation.
@@ -109,6 +113,8 @@ export, and proof boundaries.
 |---|---|
 | `decompile-init ROM --out PROJECT` | Build a logical-image project, catalogue, symbols, compiler lanes and byte ledger from a bare ROM |
 | `decompile-run --project PROJECT --all-images --out DIR` | Run the checkpointed donor/draft/recipe/search/strict-verification pipeline with bounded resources |
+| `discovery-audit --project PROJECT [--repair]` | Audit catalogue completeness from independent call, branch, pointer, prologue and image-placement evidence; optionally write repaired catalogues outside the project |
+| `toolchain-regions --project PROJECT --out DIR` | Reconstruct ranked compiler/assembler regions, component mismatches and open-set unknown-toolchain dossiers |
 | `decompile-run ... --effort quick\|normal\|deep\|exhaustive`, `--resume DIR`; `decompile-status DIR` | Effort modes, cause-driven later rounds to a fixed point under time/build/model-call budgets, resume, read-only round table and per-function hard-queue dossiers (default `normal` is the single pass above) |
 | `decompile-batch ROM... --out DIR` | Process titles sequentially and share only independently verified donor results |
 | `decompile-export --project PROJECT --run DIR --out DIR` | Export every function with honest C/assembly/unresolved provenance and full ROM-byte coverage |
@@ -218,6 +224,12 @@ unknown-toolchain classifier are retained as experiments but are off by default:
 returns were 3/126, 0/165, and not sufficiently validated, respectively. Enable them explicitly
 with `--region-recipes`, `--unit-recipes`, or `--skip-unknown-search`; ordinary runs still use
 manifest-proven per-unit recipes and report unknown-toolchain evidence without treating it as fact.
+
+Ordinary runs do enable two measured optimizations. The recipe gate avoids a broad recipe retry
+when neither the function nor its neighbours show unoptimised-code evidence; use
+`--no-recipe-gate` for the previous exhaustive retry. When m2c is installed, an isolated fork
+server amortizes Python import cost while retaining a fresh child per draft; set
+`N64DK_M2C_SERVER=0` to use one command-line process per draft.
 
 Run `n64dk COMMAND --help` for every option.
 

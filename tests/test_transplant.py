@@ -443,3 +443,64 @@ class RodataThresholdTest(unittest.TestCase):
                                lambda elf, name: type("S", (), {"align": 8, "name": name})()):
             report = transplant.settle_rodata(rows, target, set())
         self.assertEqual((report["chains"], report["promoted"]), (0, 0))
+
+
+class PartialRodataTest(unittest.TestCase):
+    """A split unit's read-only section padded with zeros where the original unit had more data is
+    settled only up to where the next unit's own code puts its data."""
+
+    def _section(self, data, align=16):
+        return type("S", (), {"align": align, "name": ".rodata", "data": data})()
+
+    def _rows(self, first_state, second_state):
+        from n64dk.match import transplant
+        def row(base, state):
+            return {"verdict": transplant.ASSUMED_VERDICT, "awaiting": {".rodata": f"0x{base:08X}"},
+                    "target_vram": base, "size": 8, "_object": object(), "_elf_spec": (None, {}, {}, None),
+                    "strict": {"sections": [dict(state, section=".rodata", base=f"0x{base:08X}")]}}
+        return [row(0x80000000, first_state), row(0x80000008, second_state)]
+
+    def test_padded_piece_owns_up_to_the_next_unit(self):
+        from unittest import mock
+        from n64dk.match import transplant
+        from n64dk.match.verify import Verdict
+        rom = bytearray(0x40)
+        rom[0:16] = b"\x3f\x80\x00\x01\x40\x20\x10\x08" + b"\x41\x00\x00\x00\x42\x00\x00\x00"
+        first = bytes(rom[0:8]) + bytes(8)                   # 8 bytes of data, 8 of padding
+        sections = {"a": self._section(first), "b": self._section(bytes(rom[8:16]), align=8)}
+        rows = self._rows({"size": 16, "compared": 16, "status": "unverified", "first_diff": "0x8"},
+                          {"size": 8, "compared": 8, "status": "equal"})
+        rows[0]["_object"], rows[1]["_object"] = "a", "b"
+        calls = []
+
+        def strict(elf, *args):
+            calls.append((elf, args[5], args[6]))
+            return Verdict("exact", True, sections=[])
+        with mock.patch.object(transplant.cmp, "find_section", lambda elf, name: sections[elf]), \
+                mock.patch("n64dk.match.verify.strict_compare", strict):
+            report = transplant.settle_rodata(rows, RodataSettlementTest._Target(bytes(rom)), set())
+        self.assertEqual((report["partial_pieces"], report["chains"], report["promoted"], report["promoted_partial"]),
+                         (1, 1, 2, 1))
+        self.assertEqual(calls[0], ("a", {".rodata": 0x80000000}, {".rodata": 8}))
+        self.assertIn("owns 8 bytes", rows[0]["corroborated"][".rodata"])
+
+    def test_padding_at_the_end_of_a_chain_is_not_forgiven(self):
+        from unittest import mock
+        from n64dk.match import transplant
+        rom = bytearray(0x40)
+        rom[0:16] = b"\x3f\x80\x00\x01\x40\x20\x10\x08" + b"\x41\x00\x00\x00\x42\x00\x00\x00"
+        sections = {"a": self._section(bytes(rom[0:8]), align=8),
+                    "b": self._section(bytes(rom[8:12]) + bytes(12))}
+        rows = self._rows({"size": 8, "compared": 8, "status": "equal"},
+                          {"size": 16, "compared": 16, "status": "unverified", "first_diff": "0x4"})
+        rows[0]["_object"], rows[1]["_object"] = "a", "b"
+        with mock.patch.object(transplant.cmp, "find_section", lambda elf, name: sections[elf]), \
+                mock.patch("n64dk.match.verify.strict_compare", lambda *a: self.fail("nothing to verify")):
+            report = transplant.settle_rodata(rows, RodataSettlementTest._Target(bytes(rom)), set())
+        self.assertEqual(report["promoted"], 0)
+
+    def test_nonzero_tail_is_not_padding(self):
+        from n64dk.match import transplant
+        state = {"size": 16, "compared": 16, "status": "unverified", "first_diff": "0x8"}
+        self.assertIsNone(transplant._partial_piece(state, self._section(bytes(8) + b"\x01" + bytes(7))))
+        self.assertIsNotNone(transplant._partial_piece(state, self._section(b"\x01" + bytes(15))))

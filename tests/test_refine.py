@@ -212,6 +212,21 @@ class ExamplesTest(unittest.TestCase):
         self.assertIn("### g", text)
         self.assertLess(text.index("int g(void)"), text.index("## Best C so far"))
 
+    def test_the_dossier_attempt_history_is_in_the_prompt(self):
+        stages = [{"stage": "drafts", "variants": [{"score": 40}, {"score": 31}]},
+                  {"stage": "drafts-x-recipes", "tried": 24, "chosen": "kmc -O1", "score": 18},
+                  {"stage": "frame-fit", "tried": 6, "chosen": None},
+                  {"stage": "iterate", "builds": 120, "start": 18, "final": 9, "helpful_families": ["lifetime"]}]
+        tried = refine.tried_summary(stages)
+        self.assertEqual(len(tried), 4)
+        self.assertIn("best difference 31", tried[0])
+        self.assertIn("no frame size helped", tried[2])
+        text = refine.build_prompt("f", "kmc -O2", "jr $ra", "int f(void) { return 0; }", "differs", [], [],
+                                   tried=tried)
+        self.assertIn("already tried", text)
+        self.assertIn("helpful families: lifetime", text)
+        self.assertNotIn("already tried", refine.build_prompt("f", "kmc -O2", "jr $ra", None, "", [], []))
+
     def test_the_number_of_examples_is_part_of_the_resumable_identity(self):
         one = refine.Settings.from_table({"command": "x", "examples": 0})
         other = refine.Settings.from_table({"command": "x"})

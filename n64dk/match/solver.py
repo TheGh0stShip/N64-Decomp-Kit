@@ -1024,8 +1024,27 @@ _TECHNIQUE_STAGES = ("drafts", "drafts-x-recipes", "frame-fit", "recipe", "itera
                      "unit-recipe", "region-recipe", "twin", "strict-verify", "source", "baseline")
 
 
+def reopen_on(case, decision: "Decision", region: dict | None) -> list[str]:
+    """What new evidence would make this function worth another attempt (the solver's evidence
+    triggers, plus what the dossier itself names as missing)."""
+    out = ["a caller, callee or catalogue neighbour becomes exact (new evidence marks it for the next round)"]
+    if case.status == "assumed" or (case.top_cause or "").startswith(("symbol", "reloc", "data")):
+        out.append("a declaration for a symbol it references is settled")
+    if region and region.get("verdict") in ("unknown", "mismatch"):
+        parts = sorted({m.get("component") for m in region.get("component_mismatches") or [] if m.get("component")})
+        out.append("a tool chain that produces " + (", ".join(parts) if parts else "this region's code") +
+                   " becomes available (the region is not explained by any installed one)")
+    if (case.top_cause or "").startswith("frame"):
+        out.append("type or structure evidence that changes the stack frame (a local's size)")
+    if case.status in ("does-not-build", "needs-source"):
+        out.append("a draft that builds (new declarations or a decompiler rendering)")
+    if decision.technique is None and decision.reason:
+        out.append("an effort mode that allows a technique excluded here: " + str(decision.reason)[:160])
+    return out
+
+
 def dossier(case, decision: Decision, observations: Observations, *, related=(), boundary=(), stop: str = "",
-            image_recipes: dict | None = None) -> dict:
+            image_recipes: dict | None = None, region: dict | None = None) -> dict:
     """The hard-queue record of one function still unresolved at the end of a run."""
     attempted, recipes = [], []
     for stage in case.stages:
@@ -1073,7 +1092,127 @@ def dossier(case, decision: Decision, observations: Observations, *, related=(),
                        "model_calls": sum(int(r.get("calls") or 0) for r in solver_rows)},
             "related_exact": list(related), "next_action": decision.technique,
             "ranked_actions": decision.ranked, "excluded_actions": decision.excluded,
-            "why_stopped": decision.reason or stop}
+            "toolchain_region": None if region is None else {
+                "range": f"{region.get('start')}..{region.get('end')}", "verdict": region.get("verdict"),
+                "ranked": (region.get("ranked") or [])[:2],
+                "component_mismatches": sorted({m.get("component") for m in region.get("component_mismatches") or []
+                                                if m.get("component")}),
+                "unknown_marks": region.get("unknown_marks") or []},
+            "transformations_of_best_source": _provenance(case.stages),
+            "why_stopped": decision.reason or stop,
+            "reopen_on": reopen_on(case, decision, region)}
+
+
+def _provenance(stages) -> dict:
+    from .transform_classes import provenance
+    return provenance(stages)
+
+
+# --------------------------------------------------------------------------- attempt ledger and sieve
+
+# iterate families -> the sieve stage whose kind of change they make
+_FAMILY_STAGE = {"types": 7, "fields": 7, "casts": 7, "volatile": 7, "pointer": 7, "globals": 6,
+                 "control": 8, "expression": 8, "ast-control": 8, "ast-expr": 8, "ast-cast": 7, "callargs": 8,
+                 "lifetime": 9, "order": 9, "scope": 9, "split": 9, "ast-temp": 9, "ast-inline-temp": 9,
+                 "ast-stmt-order": 9, "ast-decl-order": 9, "ast-block": 9, "ast-sameline": 9}
+SIEVE_STAGES = {
+    0: "inventory and byte ledger", 1: "function and image discovery", 2: "regional toolchain reconstruction",
+    3: "SDK, library and known-source donors", 4: "exact as first drafted", 5: "primary decompiler drafts",
+    6: "compile repair and declaration settlement", 7: "types, signedness, pointers, volatility, stack frames",
+    8: "control-flow and expression forms", 9: "registers, lifetimes and scheduling",
+    10: "structural and large-function recovery", 11: "model refinement",
+    12: "verified assembly, raw-word fallback and dossiers"}
+
+
+def attempts(cases, observations: Observations) -> list[dict]:
+    """The durable attempt ledger of an image: one entry per method that ran on a case, from the
+    case's own stages (round 1) and the solver's facts (later rounds), with the recipe, the best
+    source digest, the evidence version (round of the latest new evidence), the builds and the
+    outcome.  Rebuilt from the store each time, so a resumed run never records an attempt twice."""
+    out = []
+    for case in sorted(cases, key=lambda c: (c.image, c.vram)):
+        evidence = observations.evidence.get(case.case_id, 0)
+        base = {"case": case.case_id, "name": case.name, "evidence_version": evidence}
+        for stage in case.stages:
+            kind = stage.get("stage")
+            if kind == "drafts":
+                scores = [v.get("score") for v in stage.get("variants") or []]
+                out.append({**base, "round": 1, "method": "drafts", "builds": len(scores),
+                            "outcome": {"best": min((x for x in scores if x is not None), default=None)}})
+            elif kind in ("drafts-x-recipes", "recipe", "frame-fit"):
+                out.append({**base, "round": 1, "method": kind, "builds": int(stage.get("tried") or 0),
+                            "outcome": {"chosen": stage.get("chosen"), "score": stage.get("score")}})
+            elif kind == "iterate":
+                out.append({**base, "round": 1, "method": "search", "builds": int(stage.get("builds") or 0),
+                            "outcome": {"start": stage.get("start"), "final": stage.get("final"),
+                                        "helpful": stage.get("helpful_families") or []}})
+            elif kind in ("iterate-skipped", "recipe-skipped"):
+                out.append({**base, "round": 1, "method": kind, "builds": 0,
+                            "outcome": {k: v for k, v in stage.items() if k != "stage"}})
+        for fact in observations.facts.get(case.case_id, []):
+            out.append({**base, "round": fact.get("round"), "method": fact.get("technique"),
+                        "builds": fact.get("builds"), "model_calls": fact.get("calls"),
+                        "digest_before": fact.get("digest"),
+                        "outcome": {"result": fact.get("outcome"), "score_before": fact.get("score_before"),
+                                    "score_after": fact.get("score_after")}})
+        out.append({**base, "round": None, "method": "final", "recipe": case.recipe, "digest": case.best_digest,
+                    "builds": case.builds, "outcome": {"status": case.status, "score": case.best_score,
+                                                       "top_cause": case.top_cause}})
+    return out
+
+
+def settled_by(case) -> int | None:
+    """The sieve stage that settled an exact, assumed or assembly case."""
+    if case.status == handasm.STATUS:
+        return 12
+    if case.status not in ("exact", "assumed"):
+        return None
+    stages = {s.get("stage"): s for s in case.stages}
+    if any(s.get("stage") == "refine" and (s.get("exact") or s.get("score") == 0) for s in case.stages):
+        return 11
+    drafts = stages.get("drafts") or {}
+    if any(v.get("score") == 0 for v in drafts.get("variants") or []):
+        return 4
+    if (stages.get("drafts-x-recipes") or {}).get("score") == 0 or (stages.get("recipe") or {}).get("score") == 0:
+        return 2
+    if (stages.get("frame-fit") or {}).get("score") == 0:
+        return 7
+    search = stages.get("iterate") or {}
+    if search.get("final") == 0:
+        helpful = search.get("helpful_families") or []
+        return min((_FAMILY_STAGE.get(f, 9) for f in helpful), default=9)
+    if any(s.get("stage") == "strict-verify" and s.get("origin") == "re-verified" for s in case.stages):
+        return 6
+    return 5
+
+
+def sieve(cases, *, recovered: int = 0, discovery: dict | None = None) -> dict:
+    """Where every function of an image ended, by sieve stage: functions settled at each stage, the
+    builds each stage spent, and what is left unresolved with its primary cause."""
+    settled = {number: 0 for number in SIEVE_STAGES}
+    settled[3] = recovered
+    builds = {number: 0 for number in SIEVE_STAGES}
+    left = 0
+    for case in cases:
+        stage = settled_by(case)
+        if stage is not None:
+            settled[stage] += 1
+        else:
+            left += 1
+        for row in case.stages:
+            kind = row.get("stage")
+            if kind == "drafts":
+                builds[5] += len(row.get("variants") or [])
+            elif kind in ("drafts-x-recipes", "recipe"):
+                builds[2] += int(row.get("tried") or 0)
+            elif kind == "frame-fit":
+                builds[7] += int(row.get("tried") or 0)
+            elif kind == "iterate":
+                builds[8] += int(row.get("builds") or 0)
+    return {"stages": {f"{n} {name}": {"settled": settled[n], "builds": builds[n]} for n, name in SIEVE_STAGES.items()},
+            "unresolved": left, "discovery": discovery or {},
+            "note": "stage 10 (structural, large functions) is not built: its go/no-go measurement decides "
+                    "(docs/large-functions.md); search builds are counted under stage 8"}
 
 
 def boundary_operations(path: Path) -> dict[int, list[dict]]:

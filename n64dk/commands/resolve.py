@@ -169,6 +169,11 @@ class _Runner:
                 return [split_flags(list(flags), pipeline) for flags in [lane.default_flags, *lane.flag_sets] if flags]
             return sweep_specs([pipeline])[:count]
 
+        if "kmc" in self.cfg.available() and "kmc+atload" not in candidates and self.at_loads(vram, size):
+            # the function's own code loads globals through $at, which no installed assembler does
+            # from a bare symbol load: offer the assembler variant that does (evidence-gated)
+            candidates = ["kmc+atload"] + candidates
+
         def alternatives(family):
             pipelines = [p for p in candidates if is_ido(p) == (family == "ido") and p != self.spec.pipeline]
             if family is None:
@@ -391,6 +396,35 @@ class _Runner:
                 "stretches": [{"start": f"0x{row['start']:08X}", "end": f"0x{row['end']:08X}",
                                "functions": row["functions"], "marks": row["marks"]} for row in found]}
 
+    UNOPTIMISED = frozenset({"args=homed", "args=homed-fp", "frame=pointer", "nops=many"})
+    NEIGHBOURHOOD = 12
+
+    def unoptimised_near(self, vram: int) -> bool:
+        """Unoptimised-code marks in the function or in a quarter of its catalogue neighbourhood
+        (``NEIGHBOURHOOD`` functions each side): where the wide recipe retry has paid."""
+        import bisect
+        from ..match import idioms
+        if getattr(self, "_unopt", None) is None:
+            rows = []
+            for _name, start, size in sorted(getattr(self, "functions_for_gate", []), key=lambda r: r[1]):
+                offset = start - self.target.delta
+                code = self.target.rom[offset:offset + size]
+                rows.append((start, bool(idioms.features(code, start, sequences=False) & self.UNOPTIMISED)
+                             if len(code) == size and size >= 8 else False))
+            self._unopt = rows
+            self._unopt_starts = [r[0] for r in rows]
+        index = bisect.bisect_left(self._unopt_starts, vram)
+        if index < len(self._unopt) and self._unopt[index][0] == vram and self._unopt[index][1]:
+            return True
+        window = self._unopt[max(0, index - self.NEIGHBOURHOOD):index + self.NEIGHBOURHOOD + 1]
+        return bool(window) and 4 * sum(flag for _v, flag in window) >= len(window)
+
+    def at_loads(self, vram: int, size: int) -> bool:
+        """The function's code loads a global through ``$at`` right after ``lui $at``."""
+        from ..match import idioms
+        offset = vram - self.target.delta
+        return "at=direct-load" in idioms.features(self.target.rom[offset:offset + size], vram, sequences=False)
+
     def ruled_out(self, vram: int, size: int) -> set[str]:
         """Compiler lanes this function's own machine code rules out: lanes none of whose proven
         functions ever showed an encoding or convention the function has (``n64dk.match.idioms``;
@@ -431,13 +465,21 @@ class _Runner:
         return self.recipe_map.summary() if matched_rows else None
 
     def spec_for(self, vram: int):
-        """The recipe to start from: one proven inside the same object, else the command line's."""
+        """The recipe to start from: one proven inside the same object, else the recipe calibrated
+        for the toolchain region the function lies in (``region_map``, regional calibration),
+        else the command line's."""
         ranked = self.recipe_map.candidates(vram, 1) if self.recipe_map is not None and self.recipe_map.rows else []
         if ranked and ranked[0]["same_unit"]:
             spec = split_flags(list(ranked[0]["flags"]), ranked[0]["pipeline"])
             spec.section_bases.update(self.spec.section_bases)
             spec.symbols.update(self.spec.symbols)
             return spec
+        for region in getattr(self.args, "region_map", None) or ():
+            if region["start"] <= vram <= region["end"]:
+                spec = split_flags(shlex.split(region["flags"]), region["pipeline"])
+                spec.section_bases.update(self.spec.section_bases)
+                spec.symbols.update(self.spec.symbols)
+                return spec
         return self.spec
 
     def flow(self, vram: int, size: int):
@@ -844,7 +886,8 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
 
         result = refinemod.refine(name, settings, evaluate, assembly, recipe_label, best_source,
                                   best, case.causes, prepare=prepare_answer, declarations=declarations, emit=emit,
-                                  examples=shown, failed_draft=failed_draft, cache=answer_cache, known=known)
+                                  examples=shown, failed_draft=failed_draft, cache=answer_cache, known=known,
+                                  tried=refinemod.tried_summary(case.stages))
         stage = {"stage": "refine", "signature": signature, "cost": result["cost"],
                  "known_source": result["known_source"],
                  "rounds": result["rounds"], "calls": result["calls"],
@@ -945,6 +988,7 @@ def resolve_case(args):
     try:
         with tempfile.TemporaryDirectory(prefix="n64dk-resolve-") as work:
             runner = _Runner(args, cfg, target, syms, Path(work))
+            runner.functions_for_gate = functions
             if args.context == "auto":
                 if not args.catalogue:
                     raise SystemExit("--context auto needs --catalogue")
@@ -1019,6 +1063,22 @@ def _shared(p):
 
 
 resolve_case.arguments = _case_args
+
+
+def processing_order(todo: list, order: str | None) -> list:
+    """The order functions are attempted in: ``size`` (default, smallest first, which also balances
+    worker shards), ``reverse`` or ``shuffle:SEED``.  The set is the same in every order; only the
+    determinism checks use the others (every outcome must be the same whatever the order)."""
+    if not order or order == "size":
+        return todo
+    if order == "reverse":
+        return todo[::-1]
+    if order.startswith("shuffle:"):
+        import random
+        shuffled = list(todo)
+        random.Random(int(order.split(":", 1)[1])).shuffle(shuffled)
+        return shuffled
+    raise SystemExit(f"--order {order}: expected size, reverse or shuffle:SEED")
 
 
 @command("resolve-hard", "Run the resolution ladder over every function without matching source and report the queue")
@@ -1106,6 +1166,7 @@ def resolve_hard(args):
         todo = keep(todo, todo[::args.every], f"sampled out (every {args.every}th function)")
     if args.limit:
         todo = keep(todo, todo[:args.limit], f"beyond the run's --limit {args.limit}")
+    todo = processing_order(todo, getattr(args, "order", None))
     store = resolvemod.CaseStore(_state(args, cfg))
     # always observing (predictions and outcomes recorded); changing the search only with
     # --search-economics, the measured gain of which was small (round 10: -2.7% builds)
@@ -1121,6 +1182,11 @@ def resolve_hard(args):
                 for f in sorted(inside, key=lambda f: f[1]) if f[1] in left_out]}, indent=0))
     except OSError:
         pass
+    # a resumed sweep (decompile-run): the selection above is the original run's, unchanged; the
+    # functions it already finished are then not attempted again
+    finished = set(getattr(args, "resume_finished", None) or ())
+    if finished:
+        todo = [f for f in todo if f[1] not in finished]
     emit, handle = _events(args.events)
     image, started = _image_label(args), time.time()
     only = set(getattr(args, "only_statuses", None) or ())
@@ -1133,6 +1199,7 @@ def resolve_hard(args):
     try:
         with tempfile.TemporaryDirectory(prefix="n64dk-resolve-") as work:
             runner = _Runner(args, cfg, target, syms, Path(work))
+            runner.functions_for_gate = functions
             context_info = runner.auto_context(functions, names, store.root, image)
             recipe_info = runner.learn_recipes(functions, matched_rows)
             try:
@@ -1164,6 +1231,9 @@ def resolve_hard(args):
                                               recipes=None if args.no_recipes or size > LARGE_FUNCTION else runner.recipes(vram, size,
                                                                                                   f"{name}.c"),
                                               governor=governor, fresh=bool(getattr(args, "fresh", False)),
+                                              provisional=bool(getattr(args, "provisional", False)),
+                                              wide_recipes=((lambda vram=vram: runner.unoptimised_near(vram))
+                                                            if getattr(args, "recipe_gate", False) else None),
                                               stratum=(f"{image} | {runner.label(spec)} | "
                                                        f"{'unknown toolchain' if vram in runner.unknown else 'known toolchain'}"))
                 except Exception as error:                   # one bad function must not stop the sweep
@@ -1330,6 +1400,8 @@ def _hard_args(p):
     p.add_argument("--only-names", action="append",
                    help="attempt only these functions: comma-separated names or @FILE (one per line); repeatable")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--order", default=None, help="attempt order: size (default), reverse, shuffle:SEED "
+                                                 "(determinism checks; outcomes must not depend on it)")
     p.add_argument("--max-size", type=_int, default=0)
     p.add_argument("--min-size", type=_int, default=4)
     p.add_argument("--every", type=int, default=1, help="take every Nth function (sampling for benchmarks)")

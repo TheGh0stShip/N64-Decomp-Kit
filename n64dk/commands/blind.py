@@ -264,8 +264,57 @@ def build_project(rom_path: Path, out: Path, mode: str = "auto", calibrate: int 
     layout["extracted"] = extract_layout(layout, rom.data, main.data, survey_dir / "extract")
     (survey_dir / "layout.json").write_text(json.dumps(layout, indent=1, default=str) + "\n")
     summary["layout"] = "survey/layout.json"
+    (survey_dir / "blind.json").write_text(json.dumps(summary, indent=1) + "\n")   # read by the audit
+    summary["discovery"] = complete_catalogues(out)
+    summary["functions_all_images_after_repair"] = summary["functions_all_images"] + sum(
+        img.get("repaired_functions", 0) for img in summary["discovery"].get("images", {}).values())
     (survey_dir / "blind.json").write_text(json.dumps(summary, indent=1) + "\n")
     return summary
+
+
+def complete_catalogues(out: Path) -> dict:
+    """The discovery gate on the project just written: audit every image's catalogue and repair an
+    incomplete one in place from call, pointer and prologue evidence (this command owns the survey
+    it writes; the catalogue as first found is kept as ``*.unrepaired.toml``).  The audit is kept
+    in ``survey/discovery_audit.json``."""
+    import os
+    from ..match import images as imagemod
+    from .discovery import run_audit
+    from .run import discovery_summary
+    try:
+        work = out / "survey" / "discovery"
+        found = run_audit(out, None, work, repair=True)
+        tables = []
+        for row in found.get("placed") or []:              # further segments, placed by call targets
+            name = row["name"]
+            for stem in (f"{name}.bin", f"functions_{name}.toml", f"symbol_addrs_{name}.txt"):
+                os.replace(work / stem, out / "survey" / stem)
+            tables += ["", f"[images.{name}]            # ROM {row['rom']}..{row['rom_end']}, raw, placed by "
+                           f"{row['landed']} call targets from other images",
+                       f'path = "survey/{name}.bin"', f"vram_delta = {row['vram']}",
+                       f'catalogue = "survey/functions_{name}.toml"', "manifests = []"]
+        if tables:
+            with (out / "n64dk.toml").open("a") as handle:
+                handle.write("\n".join(tables) + "\n")
+        for name, img in found["images"].items():
+            path = (img.get("repair") or {}).get("catalogue")
+            if not path or name in (found.get("extra_images") or {}):
+                continue
+            spec = imagemod.resolve(out, name)
+            original = spec.catalogue
+            os.replace(original, original.with_name(original.stem + ".unrepaired" + original.suffix))
+            os.replace(path, original)
+            img["repair"]["catalogue"] = str(original.relative_to(out))
+            rows = imagemod.resolve(out, name).rows()
+            symbols = original.with_name(original.name.replace("functions", "symbol_addrs").replace(".toml", ".txt"))
+            if symbols.is_file():
+                kept = [line for line in symbols.read_text().splitlines() if "type:func" not in line]
+                lines = [f"{n} = 0x{v + spec.catalogue_shift:08X}; // type:func size:0x{size:X}" for n, v, size in rows]
+                symbols.write_text("\n".join(lines + kept) + "\n")
+        (out / "survey" / "discovery_audit.json").write_text(json.dumps(found, indent=1) + "\n")
+        return discovery_summary(found)
+    except Exception as error:                               # noqa: BLE001 - the project stays usable
+        return {"error": f"{type(error).__name__}: {error}"[-300:]}
 
 
 def rom_layout(report: dict, extra: list[dict], undecided: list[dict], ledger) -> dict:

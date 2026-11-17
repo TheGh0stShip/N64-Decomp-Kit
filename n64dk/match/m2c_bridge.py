@@ -420,7 +420,15 @@ def draft(name: str, code: bytes, vram: int, compiler: str = "kmc", context: Pat
         result["command"] = argv
         try:
             from .. import safety
-            done = safety.run_tool(argv, kind="light", capture_output=True, text=True, timeout=timeout, cwd=tmp)
+            from . import m2c_server
+            done = None
+            if m2c_server.wanted(found.command):
+                try:
+                    done = m2c_server.run(argv[len(found.command):], tmp, timeout)
+                except RuntimeError:
+                    done = None                                # the server failed: the command line
+            if done is None:
+                done = safety.run_tool(argv, kind="light", capture_output=True, text=True, timeout=timeout, cwd=tmp)
         except subprocess.TimeoutExpired:
             return fail(TIMEOUT, f"m2c timed out after {timeout}s")
         except OSError as exc:

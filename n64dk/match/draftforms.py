@@ -323,7 +323,8 @@ def pad(source: str, name: str, size: int, where: str = "top") -> str | None:
     taken = set(re.findall(r"\bpad\d*\b", body))
     label = next(n for n in ["pad"] + [f"pad{i}" for i in range(2, 64)] if n not in taken)
     words = max(1, (size + 3) // 4)
-    line = f"    s32 {label}{'' if words == 1 else f'[{words}]'};\n"
+    from .transform_classes import SCAFFOLD_MARK
+    line = f"    s32 {label}{'' if words == 1 else f'[{words}]'}; {SCAFFOLD_MARK}\n"
     lines = body.split("\n")
     first = 1 if lines and not lines[0].strip() else 0          # text after the opening brace
     last = first

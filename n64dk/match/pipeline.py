@@ -5,6 +5,8 @@ Pipelines
     kmc+builtin  KMC GCC -S -> built-in normalizer -> KMC GNU as
     kmc+as       KMC GCC -S -> KMC GNU as (assembler reordering left on)
     kmc+asn64    KMC GCC -S -> ASN64-compatible converter -> modern GNU as --no-pad-sections
+    kmc+atload   KMC GCC -S -> integer symbol loads expanded through $at -> KMC GNU as (an assembler
+                 variant seen in retail code that no installed assembler reproduces)
     ido5.3       IDO 5.3 cc -c
     ido7.1       IDO 7.1 cc -c
     as           assembly source -> KMC GNU as
@@ -32,7 +34,7 @@ from pathlib import Path
 from . import asn64, custom_pipeline, normalize
 from .toolchain import Config
 
-PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "ido5.3", "ido7.1", "sn", "as")
+PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "kmc+atload", "ido5.3", "ido7.1", "sn", "as")
 TOOLCHAIN_OF = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}
 _CACHE_LOCK = threading.RLock()
 _CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
@@ -178,11 +180,11 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0, timeout: float | Non
         # the machine's worker ceiling (n64dk.safety.token)
         with safety.tool_tokens(legacy, safety.tool_family(argv)):
             family = safety.tool_family(argv)
-            launched, rss_report = safety.measured(argv)
+            launched, rss_report = safety.measured(argv, legacy)
             proc = subprocess.Popen(launched, cwd=cwd, env=full_env,
                                     stdin=subprocess.PIPE if stdin is not None else None,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                    start_new_session=True)
+                                    start_new_session=True, preexec_fn=safety.child_setup(legacy))
             safety.limit_child(proc.pid, legacy)
             safety.register_tool(proc.pid)            # its own session: killed with the job
             try:
@@ -540,6 +542,9 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
         elif pipe == "kmc+builtin":
             asm = Path(f"{stem}.s")
             asm.write_text(normalize.builtin(raw.read_text(errors="replace")))
+        elif pipe == "kmc+atload":                           # assembler variant: symbol loads through $at
+            asm = Path(f"{stem}.s")
+            asm.write_text(normalize.at_symbol_loads(raw.read_text(errors="replace")))
         _run([kmc / "as", *_as_flags(spec.flags), "-o", obj, asm], unit_dir)
         return retain()
     if pipe == "as":

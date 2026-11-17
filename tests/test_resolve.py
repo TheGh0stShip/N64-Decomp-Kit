@@ -336,6 +336,74 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("case-kept-previous", [e["event"] for e in events])
         self.assertEqual(self.store.get(first.case_id).best_score, 2)
 
+    def _two_recipes(self):
+        narrow = SOURCE.replace("u16 value;", "u8 value;")
+
+        def recipe_a(text):                     # the configured recipe calibration sampled under
+            return iterate.Evaluation(3 if "u16 value;" in text else 6, False, {"counts": {"register": 1}}), WRONG
+
+        def recipe_b(text):                     # the recipe calibration chose: only `narrow` matches
+            exact = "u8 value;" in text
+            outcome = {"proof": {"verdict": "exact"}} if exact else None
+            return iterate.Evaluation(0 if exact else 5, exact, {"counts": {}}, outcome=outcome), \
+                (TARGET if exact else WRONG)
+        return recipe_a, recipe_b, (lambda family: [("plain", SOURCE), ("narrow", narrow)])
+
+    def test_calibration_sample_ends_like_an_unsampled_function(self):
+        """Round 10 (M14): a function calibration had sampled kept its sample's best source and
+        never drafted again under the chosen recipe.  Its outcome must not depend on the sample."""
+        recipe_a, recipe_b, drafts = self._two_recipes()
+        sample = resolve.resolve(self.store, "main", "read", BASE, TARGET, recipe_a, jobs=1, pipeline="kmc",
+                                 recipe_label="kmc -O2", draft=drafts, budget=4, provisional=True)
+        self.assertNotEqual(sample.status, "exact")
+        sampled = resolve.resolve(self.store, "main", "read", BASE, TARGET, recipe_b, jobs=1, pipeline="ido5.3",
+                                  recipe_label="ido5.3 -O2", draft=drafts, budget=4)
+        other = resolve.CaseStore(_scratch("n64dk-resolve-test-"))
+        self.addCleanup(other.close)
+        unsampled = resolve.resolve(other, "main", "read", BASE, TARGET, recipe_b, jobs=1, pipeline="ido5.3",
+                                    recipe_label="ido5.3 -O2", draft=drafts, budget=4)
+        self.assertEqual((sampled.status, sampled.best_score, sampled.recipe),
+                         (unsampled.status, unsampled.best_score, unsampled.recipe))
+        self.assertEqual(sampled.status, "exact")
+        self.assertFalse([s for s in sampled.stages if s["stage"] == "provisional"])
+
+    def test_better_calibration_result_is_kept_and_no_longer_provisional(self):
+        recipe_a, _recipe_b, drafts = self._two_recipes()
+
+        def far(text):
+            return iterate.Evaluation(9, False, {"counts": {"register": 9}}), WRONG
+        resolve.resolve(self.store, "main", "read", BASE, TARGET, recipe_a, jobs=1, pipeline="kmc",
+                        recipe_label="kmc -O2", draft=drafts, budget=4, provisional=True)
+        calls = []
+
+        def counted(text):
+            calls.append(text)
+            return far(text)
+        kept = resolve.resolve(self.store, "main", "read", BASE, TARGET, counted, jobs=1, pipeline="ido5.3",
+                               recipe_label="ido5.3 -O2", draft=drafts, budget=4)
+        self.assertEqual((kept.best_score, kept.recipe), (3, "kmc -O2"))
+        self.assertTrue(calls)                                   # drafted again under the chosen recipe
+        stored = self.store.get(kept.case_id)
+        self.assertFalse([s for s in stored.stages if s["stage"] == "provisional"])
+
+    def test_wide_recipe_retry_is_gated_on_evidence(self):
+        def far(text):
+            return iterate.Evaluation(80, False, {"counts": {"instruction": 20}, "entries": []}), WRONG
+        tried = []
+
+        def recipes(family):
+            tried.append(family)
+            return [("kmc -O1", "kmc", far)]
+        arguments = dict(jobs=1, pipeline="kmc", recipe_label="kmc -O2", source=SOURCE, budget=4, recipes=recipes)
+        case = resolve.resolve(self.store, "main", "read", BASE, TARGET, far, wide_recipes=lambda: False, **arguments)
+        self.assertIn("recipe-skipped", [s["stage"] for s in case.stages])
+        self.assertEqual(tried, [])
+        other = resolve.CaseStore(_scratch("n64dk-resolve-test-"))
+        self.addCleanup(other.close)
+        case = resolve.resolve(other, "main", "read", BASE, TARGET, far, wide_recipes=lambda: True, **arguments)
+        self.assertNotIn("recipe-skipped", [s["stage"] for s in case.stages])
+        self.assertTrue(tried)
+
     def test_exact_without_strict_proof_is_never_persisted(self):
         case = resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate([], proof=False), source=SOURCE,
                                jobs=1, strict=lambda _text, _recipe: {"verdict": "error", "error": "boom"})

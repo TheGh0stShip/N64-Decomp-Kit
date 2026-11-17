@@ -71,6 +71,17 @@ PROBES: dict[str, tuple[str, str]] = {
     "macro_expand": ("macro expansion",
                      "#define SQR(x) ((x) * (x))\n#define CLAMP(x, l, h) ((x) < (l) ? (l) : (x) > (h) ? (h) : (x))\n"
                      "s32 probe(s32 a) { return CLAMP(SQR(a), 0, 100); }"),
+    # macro traces: how the assembler (or the compiler) expands symbol accesses, compare branches
+    # and large constants; the retail code of a region shows which form its tool chain used
+    "global_load": ("macro trace: global load", "extern s32 gA;\ns32 probe(void) { return gA; }"),
+    "global_store": ("macro trace: global store", "extern s32 gA;\nvoid probe(s32 a) { gA = a; }"),
+    "global_index": ("macro trace: indexed global load", "extern s32 gT[];\ns32 probe(s32 i) { return gT[i]; }"),
+    "global_half": ("macro trace: global half load", "extern u16 gH;\ns32 probe(void) { return gH + 1; }"),
+    "global_float": ("macro trace: global float load", "extern f32 gF;\nf32 probe(void) { return gF; }"),
+    "global_addr": ("macro trace: address of a global", "extern s32 gT[];\ns32 *probe(s32 i) { return &gT[i + 2]; }"),
+    "compare_branch": ("macro trace: compare and branch",
+                       "extern s16 gS;\ns32 probe(s32 a, s32 b) { if (a < b) return gS; return a - b; }"),
+    "big_const": ("macro trace: large constant", "u32 probe(u32 a) { return (a & 0x12345678) | 0x80000000; }"),
     # identical tokens, different lines
     "lines_one": ("line attribution: one line",
                   "extern s32 gA, gB;\ns32 probe(s32 a) { s32 t = a + gA; gB = t * 2; return t - gB; }"),
@@ -114,6 +125,29 @@ def masked_text(object_path: Path, function: str = "probe") -> str | None:
     return hashlib.sha256(b"".join(word.to_bytes(4, "big") for word in masked)).hexdigest()[:16] + f":{len(code)}"
 
 
+def probe_code(object_path: Path, function: str = "probe") -> bytes | None:
+    """The function's code, padding stripped (relocated fields as the object holds them)."""
+    from ..elf import Elf
+    from .transplant import strip_padding
+    elf = Elf.load(object_path)
+    text = next((section for section in elf.sections if section.name == ".text"), None)
+    symbol = next((sym for sym in elf.symbols if sym.name == function and 0 < sym.section < len(elf.sections)
+                   and elf.sections[sym.section].name == ".text"), None)
+    if text is None or symbol is None:
+        return None
+    size = symbol.size or (len(text.data) - symbol.value)
+    return strip_padding(text.data[symbol.value:symbol.value + size])
+
+
+def component_marks(code: bytes | None) -> list[str]:
+    """The tool-chain component marks (``toolchain_regions.COMPONENTS``) a probe's code shows."""
+    from . import idioms
+    from .toolchain_regions import COMPONENTS
+    if not code:
+        return []
+    return sorted(m for m in idioms.features(code, 0x80000000, sequences=False) if m in COMPONENTS)
+
+
 def lanes_to_probe(root: Path) -> dict[str, tuple[tuple[str, ...], ...]]:
     """Built-in lanes with their flag sets, plus every installed configured lane with its
     default flags and usual settings."""
@@ -150,13 +184,14 @@ def run(root: Path, work: Path, probes: list[str] | None = None, lanes: list[str
     for name in names:
         (sources / f"{name}.c").write_text(probe_source(name))
     table: dict[str, dict[str, str | None]] = {}
+    marks: dict[str, dict[str, list[str]]] = {}
     errors: dict[str, dict[str, str]] = {}
     nondeterministic: dict[str, list[str]] = {}
     started = time.time()
     for lane, sets in plan.items():
         for flags in sets:
             key = f"{lane} {' '.join(flags)}"
-            row, failed, unstable = {}, {}, []
+            row, failed, unstable, traces = {}, {}, [], {}
             for name in names:
                 results = []
                 for attempt in range(repeat):
@@ -165,6 +200,8 @@ def run(root: Path, work: Path, probes: list[str] | None = None, lanes: list[str
                             built = build(sources / f"{name}.c", split_flags(list(flags), lane), configs[attempt],
                                           Path(scratch), includes=[])
                             results.append(masked_text(built))
+                            if attempt == 0:
+                                traces[name] = component_marks(probe_code(built))
                         except (BuildError, OSError, ValueError, RuntimeError) as error:
                             results.append(None)
                             failed[name] = str(error)[:200]
@@ -172,6 +209,7 @@ def run(root: Path, work: Path, probes: list[str] | None = None, lanes: list[str
                     unstable.append(name)
                 row[name] = results[0]
             table[key] = row
+            marks[key] = traces
             if failed:
                 errors[key] = failed
             if unstable:
@@ -179,7 +217,13 @@ def run(root: Path, work: Path, probes: list[str] | None = None, lanes: list[str
             emit("recipe", recipe=key, built=sum(1 for value in row.values() if value), failed=len(failed),
                  nondeterministic=len(unstable), seconds=round(time.time() - started))
     return {"probes": {name: PROBES[name][0] for name in names}, "table": table, "errors": errors,
-            "nondeterministic": nondeterministic, **analyse(table), "seconds": round(time.time() - started, 1)}
+            "nondeterministic": nondeterministic, **analyse(table), "marks": marks,
+            "lane_marks": lane_marks(marks), "seconds": round(time.time() - started, 1)}
+
+
+def lane_marks(marks: dict[str, dict[str, list[str]]]) -> dict[str, list[str]]:
+    """recipe -> every component mark any of its probes showed: what that tool chain can produce."""
+    return {key: sorted({mark for found in row.values() for mark in found}) for key, row in marks.items()}
 
 
 def analyse(table: dict[str, dict[str, str | None]]) -> dict:

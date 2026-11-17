@@ -1099,19 +1099,48 @@ def rodata_chains(pieces: list[dict], rom: bytes, vram_to_rom) -> list[list[dict
     its own code points to, whose contents the strict comparison found there.  A piece joins the
     chain when it starts exactly where the previous one ends, rounded up to its own alignment,
     and the bytes in between are zero.  Each address was derived from a different unit's code;
-    that they abut, which no single derivation implies, is what a chain adds."""
+    that they abut, which no single derivation implies, is what a chain adds.
+
+    A *partial* piece (``partial``: its section equals the image up to ``size`` bytes and is zero
+    padding after, where the image holds something else) ends where the next piece begins: the
+    next piece must start inside its verified bytes, after its last non-zero byte (``min_end``)
+    and at the next piece's own alignment.  The partial piece then owns exactly the bytes before
+    that start (``owned``); everything after belongs to the next unit, whose own code points
+    there.  Nothing is forgiven: the owned bytes are equal, and the rest is another unit's."""
     chains: list[list[dict]] = []
     for piece in sorted(pieces, key=lambda p: p["address"]):
         if chains:
             last = chains[-1][-1]
-            end = last["address"] + last["size"]
-            aligned = (end + piece["align"] - 1) // piece["align"] * piece["align"]
-            gap = rom[vram_to_rom(end):vram_to_rom(piece["address"])] if piece["address"] >= end else None
-            if piece["address"] == aligned and gap is not None and not any(gap):
-                chains[-1].append(piece)
-                continue
+            if last.get("partial"):
+                lo, hi = last["address"] + last.get("min_end", 0), last["address"] + last["size"]
+                if lo <= piece["address"] <= hi and piece["address"] > last["address"] \
+                        and piece["address"] % max(1, piece["align"]) == 0:
+                    last["owned"] = piece["address"] - last["address"]
+                    chains[-1].append(piece)
+                    continue
+            else:
+                end = last["address"] + last["size"]
+                aligned = (end + piece["align"] - 1) // piece["align"] * piece["align"]
+                gap = rom[vram_to_rom(end):vram_to_rom(piece["address"])] if piece["address"] >= end else None
+                if piece["address"] == aligned and gap is not None and not any(gap):
+                    chains[-1].append(piece)
+                    continue
         chains.append([piece])
     return chains
+
+
+def _partial_piece(state: dict, section) -> dict | None:
+    """The verified extent of a read-only section that equals the image except for trailing zero
+    padding shorter than its alignment (a split unit pads its own section; the original
+    translation unit had more data there)."""
+    data = getattr(section, "data", None)
+    if state.get("status") != "unverified" or not state.get("first_diff") or data is None:
+        return None
+    size, first = state.get("size") or 0, int(str(state["first_diff"]), 16)
+    if not 0 < first < size or len(data) < size or any(data[first:size]) or size - first >= max(1, section.align):
+        return None
+    nonzero = max((i + 1 for i, byte in enumerate(data[:first]) if byte), default=0)
+    return {"size": first, "min_end": nonzero, "partial": True}
 
 
 def settle_rodata(rows: list[dict], target, function_starts: set[int] | None) -> dict:
@@ -1120,6 +1149,7 @@ def settle_rodata(rows: list[dict], target, function_starts: set[int] | None) ->
     Units placed end to end are confirmed together: a chain of at least SETTLE_MIN_PIECES pieces,
     SETTLE_MIN_BYTES bytes and SETTLE_MIN_NONZERO non-zero bytes (a lone 4-byte float confirms
     nothing).  Each awaiting row of an accepted chain is verified again with its section base
+    (and, for a partial piece, the size it owns: up to where the next unit's data starts)
     declared, and promoted only when the strict comparison calls it exact."""
     from .verify import strict_compare
     pieces = []
@@ -1129,14 +1159,25 @@ def settle_rodata(rows: list[dict], target, function_starts: set[int] | None) ->
             continue
         for state in (row.get("strict") or {}).get("sections", []):
             section = cmp.find_section(elf, state.get("section")) if state.get("section") in RODATA else None
-            if section is None or state.get("status") != "equal" or state.get("compared") != state.get("size") \
-                    or not state.get("size"):
+            if section is None or state.get("compared") != state.get("size") or not state.get("size"):
                 continue
-            pieces.append({"address": int(state["base"], 16), "size": state["size"], "align": section.align,
-                           "name": section.name, "row": row})
-    accepted, report = [], {"pieces": len(pieces), "chains": 0, "promoted": 0, "rows_rechecked": 0}
+            piece = {"address": int(state["base"], 16), "size": state["size"], "align": section.align,
+                     "name": section.name, "row": row}
+            if state.get("status") != "equal":
+                partial = _partial_piece(state, section)
+                if partial is None:
+                    continue
+                piece.update(partial)
+            pieces.append(piece)
+    accepted, report = [], {"pieces": len(pieces), "partial_pieces": sum(1 for p in pieces if p.get("partial")),
+                            "chains": 0, "promoted": 0, "promoted_partial": 0, "rows_rechecked": 0}
     for chain in rodata_chains(pieces, target.rom, target.vram_to_rom):
-        start, end = chain[0]["address"], chain[-1]["address"] + chain[-1]["size"]
+        while chain and chain[-1].get("partial") and "owned" not in chain[-1]:
+            chain = chain[:-1]                               # nothing establishes where it ends
+        if not chain:
+            continue
+        start = chain[0]["address"]
+        end = chain[-1]["address"] + chain[-1].get("owned", chain[-1]["size"])
         body = target.rom[target.vram_to_rom(start):target.vram_to_rom(end)]
         if len(chain) >= SETTLE_MIN_PIECES and len(body) >= SETTLE_MIN_BYTES and \
                 sum(1 for byte in body if byte) >= SETTLE_MIN_NONZERO:
@@ -1148,16 +1189,19 @@ def settle_rodata(rows: list[dict], target, function_starts: set[int] | None) ->
             continue
         spec, declared, _bases, _source = row["_elf_spec"]
         report["rows_rechecked"] += 1
+        sizes = {piece["name"]: piece["owned"]} if piece.get("partial") else None
         verdict = strict_compare(row["_object"], target.rom, target.vram_to_rom, row["target_vram"], row["size"],
-                                 declared, {piece["name"]: piece["address"]}, None, function_starts)
+                                 declared, {piece["name"]: piece["address"]}, sizes, function_starts)
         if verdict.verdict == "exact" and verdict.text_equal and not verdict.assumptions:
             row["verdict"] = EXACT_VERDICT
             row["strict"] = verdict.as_dict()
             row.pop("awaiting", None)
             row.setdefault("corroborated", {})[piece["name"]] = (
                 f"one of {length} read-only sections lying end to end over {size} bytes, each at the address "
-                f"its own code points to")
+                f"its own code points to" + (f"; owns {piece['owned']} bytes, up to where the next unit's data "
+                                              f"begins" if piece.get("partial") else ""))
             report["promoted"] += 1
+            report["promoted_partial"] += bool(piece.get("partial"))
     return report
 
 

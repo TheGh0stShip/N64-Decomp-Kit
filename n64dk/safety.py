@@ -29,6 +29,7 @@ import json
 import os
 import shutil
 import signal
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -544,7 +545,16 @@ def register_child(pid: int) -> None:
 
 
 def forked() -> None:
-    """Call first thing in a forked worker: the parent's registrations are not its own."""
+    """Call first thing in a forked worker: the parent's registrations are not its own, and the
+    worker stops (SIGTERM: its tools' groups killed, see ``_terminate``) when its parent dies."""
+    if sys.platform.startswith("linux") and pdeathsig_mode() != "off":
+        try:
+            parent = os.getppid()
+            _libc().prctl(1, signal.SIGTERM, 0, 0, 0)        # PR_SET_PDEATHSIG
+            if os.getppid() != parent or parent == 1:
+                os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:                                    # noqa: BLE001 - a guard, never a failure
+            pass
     with _REGISTRY_LOCK:
         _TOOL_GROUPS.clear()
         _CHILDREN.clear()
@@ -622,17 +632,93 @@ def record_peak(family: str, peak_mb: float) -> None:
         entry["peak_samples"] = entry.get("peak_samples", 0) + 1
 
 
-def measured(argv) -> tuple[list[str], Path | None]:
-    """With ``N64DK_MEASURE_RSS=1``: the command run under ``/usr/bin/time`` writing the tool's
-    peak RSS (KB) to a file, so its high-water mark is its own and not inherited from this
-    process.  Otherwise the command unchanged."""
+# --- parent death ---------------------------------------------------------------------------
+# Tools run in their own sessions so a job can kill their whole group; nothing kills them when
+# the n64dk process itself is killed outright (SIGKILL, the OOM killer) outside a heavy-job scope.
+# The parent-death signal closes that gap on Linux: the kernel sends the tool SIGKILL when the
+# thread that started it exits.  ``setpriv`` (util-linux) sets it with one extra exec and no code
+# in the forked child; ``prctl`` sets it from the forked child (ctypes) before exec.
+# Which tools get it (``N64DK_PDEATHSIG_SCOPE``): ``long`` (default) guards what can run long
+# or stay large when orphaned: emulated compilers, the draft generator, the permuter and the model
+# call; a native compiler pass lives milliseconds, and guarding it costs about 0.7 ms of CPU per
+# launch (measured, bench/safety), several percent of a run.  ``all`` guards every tool.  Forked
+# Python workers always get SIGTERM on parent death (``forked``), so they stop their own tools.
+PDEATHSIG_MODES = ("setpriv", "prctl", "off")
+DEFAULT_PDEATHSIG = "setpriv"
+SETPRIV = "/usr/bin/setpriv"
+LONG_FAMILIES = ("m2c", "permuter", "qemu", "wibo")
+_LIBC = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        import ctypes
+        _LIBC = ctypes.CDLL(None, use_errno=True)
+    return _LIBC
+
+
+def guard_wanted(argv=(), legacy: bool = False, long: bool = False) -> bool:
+    """Whether a tool launched with ``argv`` gets the parent-death signal."""
+    if os.environ.get("N64DK_PDEATHSIG_SCOPE") == "all":
+        return True
+    family = tool_family(argv) if argv else ""
+    first = os.path.basename(str(argv[0])) if argv else ""
+    return legacy or long or any(name in family or name in first for name in LONG_FAMILIES)
+
+
+def pdeathsig_mode() -> str:
+    """``N64DK_PDEATHSIG`` (setpriv, prctl, off); ``off`` where the platform has neither."""
+    mode = os.environ.get("N64DK_PDEATHSIG", DEFAULT_PDEATHSIG)
+    if mode not in PDEATHSIG_MODES:
+        mode = DEFAULT_PDEATHSIG
+    if not sys.platform.startswith("linux"):
+        return "off"
+    if mode == "setpriv" and not os.access(SETPRIV, os.X_OK):
+        return "prctl"
+    return mode
+
+
+def child_setup(guard: bool = True):
+    """``preexec_fn`` for ``prctl`` mode (else None): SIGKILL on parent death, and exit at once if
+    the parent is already gone (it may have died between fork and prctl)."""
+    if not guard or pdeathsig_mode() != "prctl":
+        return None
+    libc, parent = _libc(), os.getpid()
+
+    def setup():
+        libc.prctl(1, signal.SIGKILL, 0, 0, 0)            # PR_SET_PDEATHSIG
+        if os.getppid() != parent:
+            os._exit(127)
+    return setup
+
+
+def death_guarded(argv, guard: bool = True) -> list[str]:
+    """The command under ``setpriv --pdeathsig KILL`` in setpriv mode when guarded, else unchanged.
+    A program that certainly cannot start (a bare name not on PATH, an absolute path that does not
+    exist) is left unwrapped, so its launch fails as it always did instead of as setpriv's exit 127."""
+    import shutil
+    words = [str(word) for word in argv]
+    if not guard or pdeathsig_mode() != "setpriv" or not words:
+        return words
+    program = words[0]
+    if (os.sep not in program and shutil.which(program) is None) or \
+            (os.path.isabs(program) and not os.path.exists(program)):
+        return words
+    return [SETPRIV, "--pdeathsig", "KILL", "--"] + words
+
+
+def measured(argv, guard: bool = False) -> tuple[list[str], Path | None]:
+    """The command as launched: under ``setpriv --pdeathsig KILL`` (see :func:`pdeathsig_mode`),
+    and with ``N64DK_MEASURE_RSS=1`` under ``/usr/bin/time`` writing the tool's peak RSS (KB) to a
+    file, so its high-water mark is its own and not inherited from this process."""
     words = [str(word) for word in argv]
     if os.environ.get("N64DK_MEASURE_RSS") != "1" or not os.path.exists("/usr/bin/time"):
-        return words, None
+        return death_guarded(words, guard), None
     import tempfile
     handle, name = tempfile.mkstemp(prefix="n64dk-rss-")
     os.close(handle)
-    return ["/usr/bin/time", "-f", "%M", "-o", name, *words], Path(name)
+    return death_guarded(["/usr/bin/time", "-f", "%M", "-o", name, *words], guard), Path(name)
 
 
 def collect_peak(family: str, report: Path | None) -> None:
@@ -737,10 +823,12 @@ def run_tool(argv, *, kind: str = "light", timeout: float | None = None, input=N
         tokens = tool_tokens(legacy=False, family=tool_family(argv)) if kind == "compile" else token(kind)
     pipe = subprocess.PIPE if capture_output else None
     family = tool_family(argv)
-    argv, report = measured(argv)
+    guard = guard_wanted(argv, legacy=kind in ("legacy", "model"))
+    argv, report = measured(argv, guard)
     with tokens:
         process = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env, text=text, start_new_session=True,
-                                   stdin=subprocess.PIPE if input is not None else None, stdout=pipe, stderr=pipe)
+                                   stdin=subprocess.PIPE if input is not None else None, stdout=pipe, stderr=pipe,
+                                   preexec_fn=child_setup(guard))
         limit_child(process.pid, kind == "legacy")
         register_tool(process.pid)
         try:

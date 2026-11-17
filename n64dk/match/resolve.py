@@ -190,7 +190,8 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
             near: int = 10, emit=None, pipeline: str | None = None, recipes=None, strict=None,
             recipe_label: str = "", rom_offset: int | None = None,
             search_ceiling: int | None = SEARCH_CEILING, frame_fit: bool = True,
-            cross_recipes: int | None = None, fresh: bool = False, governor=None, stratum: str = "") -> Case:
+            cross_recipes: int | None = None, fresh: bool = False, governor=None, stratum: str = "",
+            provisional: bool = False, wide_recipes=None) -> Case:
     """Run the ladder for one function and store the case.
 
     ``evaluate(text) -> (iterate.Evaluation, relocated candidate bytes or None)``;
@@ -203,7 +204,12 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     case to ``open``); ``emit(event_dict)`` receives progress events.  ``fresh`` starts again from
     the drafts under the given recipe instead of continuing the stored case (whose best source
     and recipe may be what kept it from matching); the stored case still stands when the new
-    attempt ends further away."""
+    attempt ends further away.  ``wide_recipes`` (optional, ``() -> bool``) gates the wide recipe
+    retry after the baseline: when given and false, and the draft builds under a recipe of the
+    detected family, the retry is skipped (round 11: it paid only on unoptimised code).
+    ``provisional`` marks the case as a sample (recipe calibration):
+    the next ordinary resolve of an unsettled provisional case starts fresh in the same way, so a
+    function's outcome does not depend on whether calibration happened to sample it."""
     size, digest = len(target), hashlib.sha256(target).hexdigest()
     key = case_id(image, vram, size)
 
@@ -237,7 +243,12 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
                 store.put(previous)
                 event("case-exact", top_cause=previous.top_cause, score=previous.best_score, builds=previous.builds)
         return previous
+    if previous is not None and not provisional and source is None and draft is not None \
+            and any(stage.get("stage") == "provisional" for stage in previous.stages):
+        fresh = True                     # a calibration sample: draft again under this recipe
     case = Case(key, image, name, vram, size, digest, recipe=recipe_label, rom_offset=rom_offset)
+    if provisional:
+        case.stages.append({"stage": "provisional", "recipe": recipe_label})
     if previous is not None and not fresh:
         case.closed_families, case.best_digest, case.best_score = (previous.closed_families, previous.best_digest,
                                                                    previous.best_score)
@@ -266,6 +277,8 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
                                        and (done.best_score is None or done.best_score > previous.best_score))
             if worse:
                 previous.builds = done.builds + previous.builds
+                if not provisional:              # drafted again under this recipe: no longer a sample
+                    previous.stages = [st for st in previous.stages if st.get("stage") != "provisional"]
                 store.put(previous)
                 event("case-kept-previous", status=previous.status, score=previous.best_score,
                       rerun_status=done.status, rerun_score=done.best_score)
@@ -476,7 +489,13 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         base = run(text)
         case.builds += 1
     wrong_family = family is not None and pipeline is not None and causemod.pipeline_family(pipeline) != family
-    if recipes is not None and not base.exact and (wrong_family or base.score is None or base.score > 4 * near):
+    gated = (wide_recipes is not None and not wrong_family and base.score is not None
+             and base.score > 4 * near and not wide_recipes())
+    if gated:
+        case.stages.append({"stage": "recipe-skipped", "reason": "no unoptimised-code evidence in the function "
+                                                                  "or its neighbours; family agrees"})
+    if recipes is not None and not base.exact and not gated and (wrong_family or base.score is None
+                                                                  or base.score > 4 * near):
         tried, chosen = 0, None
         for label, recipe_pipeline, recipe_evaluate in recipes(family):
             evaluation, code = recipe_evaluate(text)
