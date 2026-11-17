@@ -36,6 +36,28 @@ PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "ido5.3", "ido7.1
 TOOLCHAIN_OF = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}
 _CACHE_LOCK = threading.RLock()
 _CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
+_REQUESTED = {"builds": 0}
+_OBJECT_KEYS: set[str] = set()         # identities of the objects asked for (source, closure, flags, tools)
+_SOURCE_TEXTS: set[str] = set()        # distinct source texts compiled
+
+
+def reset_counters() -> None:
+    """Start this process's build counters afresh (a forked worker: the parent reports its own)."""
+    with _CACHE_LOCK:
+        _REQUESTED["builds"] = 0
+        _OBJECT_KEYS.clear()
+        _SOURCE_TEXTS.clear()
+        for key in _CACHE_STATS:
+            _CACHE_STATS[key] = 0
+
+
+def build_counters() -> dict:
+    """What this process asked the compilers for: builds requested, distinct objects and source
+    texts among them (prefixes of their identities, so processes' counters can be merged),
+    cache hits and misses."""
+    with _CACHE_LOCK:
+        return {"requested": _REQUESTED["builds"], "hits": _CACHE_STATS["hits"], "misses": _CACHE_STATS["misses"],
+                "object_keys": sorted(_OBJECT_KEYS), "source_texts": sorted(_SOURCE_TEXTS)}
 _PIPELINE_STATS = {"compiler_seconds": 0.0, "assembler_seconds": 0.0,
                    "object_conversion_seconds": 0.0, "tool_invocations": 0}
 _INCLUDE_FILE_CACHE: dict[str, tuple[int, int, int, str, bytes]] = {}
@@ -131,6 +153,14 @@ def split_flags(flags: list[str], pipeline: str) -> BuildSpec:
     return spec
 
 
+def _diagnostic(text: str, head: int = 600, tail: int = 400) -> str:
+    """A compiler's diagnostics, bounded: the first errors (the cause; what follows is often
+    consequence) and the last ones."""
+    if len(text) <= head + tail + 40:
+        return text
+    return f"{text[:head]}\n[... {len(text) - head - tail} characters ...]\n{text[-tail:]}"
+
+
 def _run(argv, cwd, env=None, stdin=None, retries: int = 0, timeout: float | None = None):
     """Run a tool; ``retries`` re-runs it after a crash (a pass reported as killed by a signal),
     which the statically recompiled IDO binaries occasionally suffer under parallel load."""
@@ -140,29 +170,44 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0, timeout: float | Non
     started = time.monotonic()
     if timeout is None:
         timeout = tool_timeout()
+    from .. import safety
+    legacy = any(marker in str(argv[0]) for marker in ("wibo", "qemu"))
     for _attempt in range(retries + 1):
-        proc = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=full_env,
-                                stdin=subprocess.PIPE if stdin is not None else None,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                start_new_session=True)
-        try:
-            stdout, stderr = proc.communicate(stdin, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Compilers often leave pass executables behind.  Terminate the whole private
-            # process group so a timed-out tranche worker cannot leak cc1/uopt/wibo children.
-            _kill_group(proc)
-            stdout, stderr = proc.communicate()
-            raise BuildError(f"{Path(str(argv[0])).name} timed out after {timeout:g}s") from None
-        except BaseException:
-            _kill_group(proc)
-            proc.communicate()
-            raise
+        safety.throttle()
+        # one machine-wide token per tool process: every n64dk process together stays within
+        # the machine's worker ceiling (n64dk.safety.token)
+        with safety.tool_tokens(legacy, safety.tool_family(argv)):
+            family = safety.tool_family(argv)
+            launched, rss_report = safety.measured(argv)
+            proc = subprocess.Popen(launched, cwd=cwd, env=full_env,
+                                    stdin=subprocess.PIPE if stdin is not None else None,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    start_new_session=True)
+            safety.limit_child(proc.pid, legacy)
+            safety.register_tool(proc.pid)            # its own session: killed with the job
+            try:
+                # reaped with wait4: the tool's peak RSS and CPU time are kept (safety.TOOL_USAGE)
+                stdout, stderr = safety.communicate(proc, family, stdin, timeout)
+            except subprocess.TimeoutExpired:
+                # Compilers often leave pass executables behind: communicate killed the whole
+                # private process group, so a timed-out worker cannot leak cc1/uopt/wibo children.
+                raise BuildError(f"{Path(str(argv[0])).name} timed out after {timeout:g}s") from None
+            except BaseException:
+                _kill_group(proc)
+                try:
+                    proc.wait(timeout=10)       # the group was killed; streams may be closed
+                except Exception:
+                    pass
+                raise
+            finally:
+                safety.unregister_tool(proc.pid)
+                safety.collect_peak(family, rss_report)
         proc.stdout, proc.stderr = stdout, stderr
         crashed = proc.returncode < 0 or "died due to signal" in (proc.stderr or "")
         if not (proc.returncode and crashed):
             break
     if proc.returncode:
-        raise BuildError(f"{Path(str(argv[0])).name} failed: {(proc.stderr or proc.stdout).strip()[-600:]}")
+        raise BuildError(f"{Path(str(argv[0])).name} failed: {_diagnostic((proc.stderr or proc.stdout).strip())}")
     executable = Path(str(argv[0])).name.lower()
     bucket = ("assembler_seconds" if executable in {"as", "asn64.exe"} or executable.endswith("-as") else
               "object_conversion_seconds" if "obj-parser" in executable else "compiler_seconds")
@@ -258,6 +303,24 @@ def _include_closure_digest(source: Path, roots: tuple[Path, ...],
     return digest.hexdigest()
 
 
+_FILE_DIGESTS: dict[str, tuple[tuple, bytes]] = {}
+
+
+def _file_digest(path: Path) -> bytes:
+    """SHA-256 of a tool file, recomputed only when its size, mtime or inode changes (every build
+    reaches here; reading a compiler's megabytes each time cost a third of the kit's own CPU)."""
+    stat = path.stat()
+    key = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+    with _CACHE_LOCK:
+        known = _FILE_DIGESTS.get(str(path))
+    if known and known[0] == key:
+        return known[1]
+    digest = hashlib.sha256(path.read_bytes()).digest()
+    with _CACHE_LOCK:
+        _FILE_DIGESTS[str(path)] = (key, digest)
+    return digest
+
+
 def _compiler_digest(cfg: Config, pipeline: str) -> str:
     if custom_pipeline.is_custom(pipeline):
         # a configured lane is identified by its recipe text and the tools it names
@@ -271,10 +334,10 @@ def _compiler_digest(cfg: Config, pipeline: str) -> str:
         from .toolchain import PROFILES
         for name in PROFILES[key].required:
             path = root / name
-            if path.is_file(): digest.update(path.read_bytes())
+            if path.is_file(): digest.update(_file_digest(path))
     if pipeline == "kmc+asn64":
         gas = cfg.gnu_as()
-        if gas and Path(gas[0]).is_file(): digest.update(Path(gas[0]).read_bytes())
+        if gas and Path(gas[0]).is_file(): digest.update(_file_digest(Path(gas[0])))
     return digest.hexdigest()
 
 
@@ -418,6 +481,9 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
     cache_key = hashlib.sha256(identity.encode()).hexdigest()
     cache = cfg.project / ".n64dk" / "object-cache" / cache_key[:2] / f"{cache_key}.o"
     with _CACHE_LOCK:
+        _REQUESTED["builds"] += 1
+        _OBJECT_KEYS.add(cache_key[:16])
+        _SOURCE_TEXTS.add(json.loads(identity)["source"][:16])
         if cache.is_file():
             _CACHE_STATS["hits"] += 1
             shutil.copy2(cache, obj)

@@ -18,6 +18,7 @@ class Section:
     link: int
     info: int
     data: bytes
+    align: int = 1
 
 
 @dataclass
@@ -44,7 +45,7 @@ class Elf:
         for i, s in enumerate(raw):
             name = strtab[s[0]:strtab.index(b"\0", s[0])].decode()
             body = b"" if s[1] == 8 else data[s[4]:s[4] + s[5]]  # SHT_NOBITS
-            self.sections.append(Section(i, name, s[1], s[4], s[5], s[6], s[7], body))
+            self.sections.append(Section(i, name, s[1], s[4], s[5], s[6], s[7], body, max(1, s[8])))
         self.symbols = self._symbols()
 
     @classmethod

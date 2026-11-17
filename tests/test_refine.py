@@ -231,3 +231,81 @@ class FailedDraftTest(unittest.TestCase):
         text = refine.build_prompt("f", "ido5.3 -O2", "jr $ra", "void f(void) {}", "differs", [], [],
                                    failed_draft=("void f(void) { *x(); }", "line 1: error"))
         self.assertNotIn("does not compile", text)
+
+
+class BoundedModelStageTest(unittest.TestCase):
+    """The model stage is opt-in, one call at a time by default, cached, accounted, and blind
+    evaluation is protected from showing or crediting known source."""
+
+    def test_one_call_at_a_time_by_default(self):
+        self.assertEqual(refine.Settings(command=["x"]).jobs, 1)
+        self.assertEqual(refine.Settings.from_table({"command": "x"}).jobs, 1)
+        self.assertIsNone(refine.Settings.from_table({}))                 # no command: no stage
+
+    def test_answers_are_cached_by_prompt_and_cost_is_counted(self):
+        import tempfile
+        from pathlib import Path
+        cache = Path(tempfile.mkdtemp(prefix="n64dk-test-refine-cache-"))
+        settings = refine.Settings(command=["refiner"], rounds=1)
+        run, prompts = scripted(fenced(NEAR))
+        first = refine.refine("read", settings, evaluate, "lh $v0, 4($a0)", "ido5.3 -O2", None, None, run=run,
+                              cache=cache)
+        self.assertEqual(first["cost"]["calls"], 1)
+        self.assertGreater(first["cost"]["prompt_bytes"], 0)
+        run_again, prompts_again = scripted(fenced(EXACT))                # would answer differently
+        second = refine.refine("read", settings, evaluate, "lh $v0, 4($a0)", "ido5.3 -O2", None, None,
+                               run=run_again, cache=cache)
+        self.assertEqual((second["cost"]["calls"], second["cost"]["cached"]), (0, 1))
+        self.assertEqual(prompts_again, [])                               # the command was not run
+        self.assertEqual(second["best"].score, first["best"].score)
+
+    def test_a_prompt_holding_known_source_is_not_sent(self):
+        known = refine.KnownSource(refine.KnownSource._body_lines(
+            "void f(void) {\n    gSomeGlobalTable[index].field = computeValue(argument);\n}\n"))
+        run, prompts = scripted(fenced(EXACT))
+        result = refine.refine("read", refine.Settings(command=["refiner"], rounds=1), evaluate,
+                               "lh $v0, 4($a0)", "ido5.3 -O2",
+                               "s32 read(Thing *thing) {\n    gSomeGlobalTable[index].field = computeValue(argument);\n}\n",
+                               evaluate(NEAR)[0], run=run, known=known)
+        self.assertEqual(prompts, [])
+        self.assertIn("known source", result["errors"][0])
+
+    def test_an_answer_reproducing_known_source_is_flagged(self):
+        published = ("s32 read(Thing *thing) {\n    s16 value;\n    value = thing->field + gOffsetTable[thing->kind];\n"
+                     "    return value + gGlobalAdjustmentForReads;\n}\n")
+        known = refine.KnownSource(refine.KnownSource._body_lines(published))
+        self.assertEqual(len(known.lines), 2)                            # short lines say nothing
+        run, _prompts = scripted(fenced(published))
+        result = refine.refine("read", refine.Settings(command=["refiner"], rounds=1), evaluate,
+                               "lh $v0, 4($a0)", "ido5.3 -O2", None, None, run=run, known=known)
+        self.assertTrue(result["known_source"])
+        self.assertEqual(result["history"][0]["known_source_share"], 1.0)
+        run, _prompts = scripted(fenced(EXACT))
+        clean = refine.refine("read", refine.Settings(command=["refiner"], rounds=1), evaluate,
+                              "lh $v0, 4($a0)", "ido5.3 -O2", None, None, run=run, known=known)
+        self.assertFalse(clean["known_source"])
+
+    def test_known_source_is_part_of_the_resumable_identity(self):
+        self.assertNotEqual(refine.Settings(command=["x"]).signature(),
+                            refine.Settings(command=["x"], known_source=["/tree/split"]).signature())
+
+
+class RefinePassNamesTest(unittest.TestCase):
+    def test_no_loop_rebinds_a_name_the_pass_set_earlier(self):
+        """Regression: ``for known in store.all()`` rebound the known-source guard to a Case, and
+        every refinement run with --refine-known-source failed ('Case' object has no attribute
+        'leaks'); the resolve stage of both images was lost."""
+        import ast
+        import inspect
+        from n64dk.commands import resolve
+        tree = ast.parse(inspect.getsource(resolve._refine_pass))
+        function = tree.body[0]
+        assigned = set()
+        for statement in function.body:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.For):
+                    targets = {n.id for n in ast.walk(node.target) if isinstance(n, ast.Name)}
+                    self.assertFalse(targets & assigned, f"loop rebinds {targets & assigned}")
+            if isinstance(statement, ast.Assign):
+                assigned |= {n.id for t in statement.targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        self.assertIn("known", assigned)

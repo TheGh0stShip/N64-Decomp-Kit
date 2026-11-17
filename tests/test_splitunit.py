@@ -109,6 +109,24 @@ class SplitTest(unittest.TestCase):
         self.assertIn("typedef float f32;", self.out["second"])
 
 
+class InlineAssemblyTest(unittest.TestCase):
+    def test_a_function_with_assembly_in_its_body_is_not_offered(self):
+        text = ("static inline int count(void) { int c; __asm__ volatile(\"mfc0 %0, $9\" : \"=r\"(c)); return c; }\n"
+                "int timed(void) { return count() + 1; }\n"
+                "void raw(void) { asm(\".word 0x03E00008\"); }\n"
+                "int plain(int a) { return a + 1; }\n"
+                "int quoted(void) { return \"asm(\"[0]; }\n")
+        excluded = {}
+        out = splitunit.split(text, "a.c", excluded)
+        self.assertEqual(list(out), ["plain", "quoted"])        # the word inside a literal is not assembly
+        self.assertEqual(excluded, {"timed": "calls an inline helper written in assembly",
+                                    "raw": "inline assembly in its body"})
+
+    def test_functions_come_in_the_order_the_unit_defines_them(self):
+        out = splitunit.split("int zeta(void) { return 1; }\nint alpha(void) { return 2; }\n", "b.c")
+        self.assertEqual(list(out), ["zeta", "alpha"])
+
+
 class HelperTest(unittest.TestCase):
     def test_initialisers_are_removed_declarator_by_declarator(self):
         self.assertEqual(splitunit.externalised("static s32 a = 1, b[2] = { 3, 4 }, c;"), "extern s32 a , b[2] , c;")
@@ -122,3 +140,14 @@ class HelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParenthesisedDeclaratorTest(unittest.TestCase):
+    def test_a_function_typedef_in_parentheses_is_carried(self):
+        """``typedef void (F)(struct S *);`` declares F; it was dropped from every split file
+        that needed it (Dr. Mario 64: hundreds of split functions failed to compile)."""
+        text = ("struct S;\ntypedef void (TransFunc)(struct S *);\n"
+                "typedef struct S { TransFunc *f; int x; } S;\n"
+                "int get(S *s) {\n    return s->x;\n}\n")
+        out = splitunit.split(text, "src/a.c")
+        self.assertIn("typedef void (TransFunc)(struct S *);", out["get"])

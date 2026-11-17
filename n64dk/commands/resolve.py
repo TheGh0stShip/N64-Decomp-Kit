@@ -60,10 +60,11 @@ def _image_label(args) -> str:
 
 def synthesize_context(target, functions, names: dict[int, str], out_dir: Path, label: str,
                        parts: tuple[str, ...] = ("structs", "globals", "prototypes"),
-                       proto_confidence: float = 0.9) -> tuple[Path, str, dict]:
+                       proto_confidence: float = 0.9, headers=()) -> tuple[Path, str, dict]:
     """Recover provisional structs, global declarations and prototypes for a whole image and
-    write them as an m2c context.  Returns (context path, declarations without typedefs for
-    prepending to a draft, summary)."""
+    write them as an m2c context.  ``headers`` (recorded declarations, e.g. from the original
+    build's debug records) come first, and a recovered prototype never replaces a recorded one.
+    Returns (context path, declarations without typedefs for prepending to a draft, summary)."""
     from ..analysis import abi as abimod
     from ..analysis import layouts as layoutmod
     from ..analysis import values as valuemod
@@ -79,12 +80,18 @@ def synthesize_context(target, functions, names: dict[int, str], out_dir: Path, 
     if "globals" not in parts:
         layouts.globals = []
     prototypes = abimod.solve(facts, function_names) if "prototypes" in parts else {}
+    recorded = "".join(Path(header).read_text() for header in headers if Path(header).is_file())
+    declared = set(re.findall(r"^[A-Za-z_][^;{}=]*?\b([A-Za-z_]\w*)\([^;{}]*\);$", recorded, re.M))
+    if declared:
+        prototypes = {vram: proto for vram, proto in prototypes.items()
+                      if {**names, **function_names}.get(vram) not in declared}
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{label}.context.h"
     rendered = layoutmod.Declarations(layouts, prototypes, proto_confidence)
-    path.write_text(rendered.full(typedefs=True))
-    info = {**layoutmod.summary(layouts), "prototypes": len(rendered.confident)}
-    return path, rendered.full(typedefs=False), info, rendered, facts
+    path.write_text(recorded + rendered.full(typedefs=True))
+    info = {**layoutmod.summary(layouts), "prototypes": len(rendered.confident),
+            "recorded_prototypes": len(declared)}
+    return path, recorded + rendered.full(typedefs=False), info, rendered, facts
 
 
 class _Runner:
@@ -106,7 +113,8 @@ class _Runner:
             return None
         parts = tuple(p for p in self.args.context_parts.split(",") if p)
         self.context_path, self.declarations, info, self.rendered, self.facts = synthesize_context(
-            self.target, functions, names, state / "context", label, parts, self.args.proto_confidence)
+            self.target, functions, names, state / "context", label, parts, self.args.proto_confidence,
+            getattr(self.args, "context_headers", None) or ())
         return info
 
     def evaluator(self, vram: int, size: int, filename: str = "candidate.c", spec=None):
@@ -239,14 +247,10 @@ class _Runner:
         text = autodraft.prepare(result["source"])
         if declarations:
             # drop the draft's own guesses for anything the context already declares
-            declared = set(re.findall(r"(?m)^(?:extern\s+)?[\w \*]+?\b(\w+)\s*(?:\(|\[|;)", declarations))
-            kept = []
-            for line in text[len(autodraft.PRELUDE):].split("\n"):
-                found = re.match(r"^(?:extern\s+)?[\w \*]+?\b(\w+)\s*(?:\([^{]*\)|\[[^\]]*\])?;", line)
-                if found and found.group(1) in declared and "{" not in line:
-                    continue
-                kept.append(line)
-            text = autodraft.PRELUDE + "\n" + declarations + "\n".join(kept)
+            # drop the draft's own guesses for what the context declares (top level only: a call
+            # statement inside the body is not a declaration)
+            text = autodraft.PRELUDE + "\n" + declarations + autodraft.drop_redeclared(
+                text[len(autodraft.PRELUDE):], declarations)
         for _attempt in range(12):                           # mechanical compile repairs only
             evaluation, _code = evaluate(text)
             if evaluation.score is not None:
@@ -742,8 +746,12 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
     rows.sort()
     if settings.max_cases:
         rows = rows[:settings.max_cases]
-    totals = {"attempted": 0, "improved": 0, "exact": 0, "assumed": 0, "calls": 0, "errors": 0}
+    totals = {"attempted": 0, "improved": 0, "exact": 0, "assumed": 0, "calls": 0, "errors": 0,
+              "known_source_answers": 0,
+              "cost": {"calls": 0, "cached": 0, "seconds": 0.0, "prompt_bytes": 0, "answer_bytes": 0}}
     lock = threading.Lock()
+    known = refinemod.KnownSource.from_directories(settings.known_source) if settings.known_source else None
+    answer_cache = Path(store.root) / "refine_cache"
     from .. import mips
 
     def references(code: bytes, vram: int) -> set[int]:
@@ -771,9 +779,9 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
             m2c_bridge.emit_asm(case.name, code, case.vram, names, []), text)
 
     if settings.examples > 0:
-        for known in store.all():
-            if known.image == image:
-                remember(known)
+        for stored in store.all():           # not ``known``: that name holds the source guard
+            if stored.image == image:
+                remember(stored)
 
     def one(row):
         _score, size, name, vram = row
@@ -836,8 +844,9 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
 
         result = refinemod.refine(name, settings, evaluate, assembly, recipe_label, best_source,
                                   best, case.causes, prepare=prepare_answer, declarations=declarations, emit=emit,
-                                  examples=shown, failed_draft=failed_draft)
-        stage = {"stage": "refine", "signature": signature,
+                                  examples=shown, failed_draft=failed_draft, cache=answer_cache, known=known)
+        stage = {"stage": "refine", "signature": signature, "cost": result["cost"],
+                 "known_source": result["known_source"],
                  "rounds": result["rounds"], "calls": result["calls"],
                  "history": result["history"], "improved": result["improved"], "errors": result["errors"][:2]}
         if result["improved"]:
@@ -858,6 +867,9 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
             totals["improved"] += bool(result["improved"])
             totals["calls"] += result["calls"]
             totals["errors"] += len(result["errors"])
+            totals["known_source_answers"] += bool(result["known_source"])
+            for key, value in result["cost"].items():
+                totals["cost"][key] = round(totals["cost"][key] + value, 2)
             totals["exact"] += case.status == "exact" and bool(result["improved"])
             totals["assumed"] += case.status == "assumed" and bool(result["improved"])
         if emit:
@@ -1074,17 +1086,41 @@ def resolve_hard(args):
         todo = [f for f in inside if not any(a <= f[1] - target.delta < a + n for a, n in covered)]
     skip = set(getattr(args, "skip_vrams", None) or ())          # e.g. recovered by an earlier stage
     todo = [f for f in todo if f[1] not in skip]
+    # every function this pass leaves out is written down with the reason (``scope_<image>.json``
+    # beside the case store): a function is never left out silently
+    left_out: dict[int, str] = {}
+
+    def keep(rows, kept, reason):
+        kept_vrams = {f[1] for f in kept}
+        for f in rows:
+            if f[1] not in kept_vrams:
+                left_out.setdefault(f[1], reason)
+        return kept
     chosen_names = only_names(getattr(args, "only_names", None))
     if chosen_names:                                             # a named set: nothing else is attempted
-        todo = [f for f in todo if f[0] in chosen_names]
+        todo = keep(todo, [f for f in todo if f[0] in chosen_names], "not in the --only-names set")
     todo.sort(key=lambda f: f[2])
     if args.max_size:
-        todo = [f for f in todo if f[2] <= args.max_size]
+        todo = keep(todo, [f for f in todo if f[2] <= args.max_size], f"larger than the run's --max-size 0x{args.max_size:X}")
     if args.every > 1:
-        todo = todo[::args.every]
+        todo = keep(todo, todo[::args.every], f"sampled out (every {args.every}th function)")
     if args.limit:
-        todo = todo[:args.limit]
+        todo = keep(todo, todo[:args.limit], f"beyond the run's --limit {args.limit}")
     store = resolvemod.CaseStore(_state(args, cfg))
+    # always observing (predictions and outcomes recorded); changing the search only with
+    # --search-economics, the measured gain of which was small (round 10: -2.7% builds)
+    from ..match.economics import Governor
+    governor = Governor(Path(store.root) / f"economics_{_image_label(args)}.json",
+                        active=bool(getattr(args, "search_economics", False)))
+    try:
+        # (a later pass over a named set, ``write_scope=False``, keeps the sweep's scope file)
+        if getattr(args, "write_scope", True):
+            scope = Path(store.root) / f"scope_{_image_label(args)}.json"
+            scope.write_text(json.dumps({"attempted": len(todo), "left_out": [
+                {"vram": f"0x{f[1]:08X}", "name": f[0], "size": f[2], "reason": left_out[f[1]]}
+                for f in sorted(inside, key=lambda f: f[1]) if f[1] in left_out]}, indent=0))
+    except OSError:
+        pass
     emit, handle = _events(args.events)
     image, started = _image_label(args), time.time()
     only = set(getattr(args, "only_statuses", None) or ())
@@ -1126,7 +1162,10 @@ def resolve_hard(args):
                                               recipe_label=runner.label(spec), rom_offset=offset,
                                               strict=runner.strict(vram, size, f"{name}.c", starts),
                                               recipes=None if args.no_recipes or size > LARGE_FUNCTION else runner.recipes(vram, size,
-                                                                                                  f"{name}.c"))
+                                                                                                  f"{name}.c"),
+                                              governor=governor, fresh=bool(getattr(args, "fresh", False)),
+                                              stratum=(f"{image} | {runner.label(spec)} | "
+                                                       f"{'unknown toolchain' if vram in runner.unknown else 'known toolchain'}"))
                 except Exception as error:                   # one bad function must not stop the sweep
                     if emit:
                         emit({"event": "case-error", "name": name, "error": str(error)[-300:]})
@@ -1136,7 +1175,11 @@ def resolve_hard(args):
                                    getattr(args, "worker_memory_mb", 0),
                                    getattr(args, "memory_reserve_mb", 0))
             worker_errors = 0
-            if workers > 1:
+            if getattr(args, "skip_sweep", False):
+                # a later pass that only asks the refiner: the stored cases stand as they are
+                cases = [c for c in (store.get(resolvemod.case_id(image, vram, size)) for _n, vram, size in todo)
+                         if c is not None]
+            elif workers > 1:
                 # The search generates its variants in Python, so threads share one interpreter
                 # lock.  Each worker process takes every Nth function (the list is sorted by size,
                 # so shards are balanced), with its own store connection, event handle and work
@@ -1151,6 +1194,8 @@ def resolve_hard(args):
                     if pid == 0:
                         status = 1
                         try:
+                            from .. import safety
+                            safety.forked()
                             own_store = resolvemod.CaseStore(_state(args, cfg))
                             own_emit, _own_handle = _events(args.events)
                             runner.work = Path(work) / f"worker{index}"
@@ -1161,8 +1206,11 @@ def resolve_hard(args):
                             own_store.close()
                             status = 0
                         finally:
+                            safety.flush_usage()              # the run's profile adds up its tools and builds
                             os._exit(status)                  # never run the parent's cleanup twice
                     children.append(pid)
+                    from .. import safety
+                    safety.register_child(pid)          # SIGTERM reaches the worker too
                 try:
                     for pid in children:
                         _pid, status = os.waitpid(pid, 0)
@@ -1231,6 +1279,14 @@ def resolve_hard(args):
                 refined = refine_info.pop("cases")
                 cases = [c for c in cases if c.case_id not in refined] + list(refined.values())
         elapsed = time.time() - started
+        economics = None
+        if governor is not None:
+            governor.save()
+            ranking = governor.ranking()
+            economics = {"strata": len(ranking), "plateaued": [row["stratum"] for row in ranking if row["plateaued"]],
+                         "searches_skipped": sum(row["skipped"] for row in ranking),
+                         "builds_saved_estimate": sum(row["builds_saved_estimate"] for row in ranking),
+                         "ranking": ranking[:12]}
         queue = resolvemod.hard_queue(cases)
         exact = [c for c in cases if c.status == "exact"]
         return {"image": image, "functions": len(todo), "resolved_cases": len(cases), "statuses": queue["statuses"],
@@ -1242,7 +1298,7 @@ def resolve_hard(args):
                 "seconds": round(elapsed, 1),
                 "exact_per_hour": round(len(exact) * 3600 / elapsed, 1) if elapsed else None,
                 "context": context_info, "recipes": recipe_info, "twins": len(twins),
-                "workers": workers, "worker_errors": worker_errors, "refine": refine_info,
+                "workers": workers, "worker_errors": worker_errors, "refine": refine_info, "economics": economics,
                 "unit_recipes": unit_info, "unknown_toolchain": unknown_info,
                 "padding_trimmed": trimmed,
                 "queue": [{k: g[k] for k in ("cause", "meaning", "functions", "bytes", "expected_progress")}
@@ -1269,6 +1325,8 @@ def _hard_args(p):
     p.add_argument("--skip-unknown-search", action="store_true",
                    help="experimental: suppress variant search in regions classified as an unknown toolchain; "
                         "classification remains advisory by default")
+    p.add_argument("--search-economics", action="store_true",
+                   help="stop the variant search in strata whose searches have returned nothing (n64dk.match.economics)")
     p.add_argument("--only-names", action="append",
                    help="attempt only these functions: comma-separated names or @FILE (one per line); repeatable")
     p.add_argument("--limit", type=int, default=0)
@@ -1289,7 +1347,7 @@ def _hard_args(p):
                    help="ask only about these functions (comma separated, repeatable)")
     p.add_argument("--refine-max-cases", type=int, help="ask about at most this many cases, nearest first")
     p.add_argument("--refine-max-score", type=int, help="ask only about cases at most this far from the target")
-    p.add_argument("--refine-jobs", type=int, help="refiner calls in parallel (default 4)")
+    p.add_argument("--refine-jobs", type=int, help="refiner calls in parallel (default 1)")
     p.add_argument("--workers", type=int, default=1,
                    help="worker processes sharing the sweep (0: automatic, from hardware threads and free "
                         "memory); --jobs is divided among them")

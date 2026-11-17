@@ -85,11 +85,25 @@ def build_project(rom_path: Path, out: Path, mode: str = "auto", calibrate: int 
     survey_dir = out / "survey"
     survey_dir.mkdir(parents=True, exist_ok=True)
     Ledger.write_tsv(result["ledger"], survey_dir / "ledger.tsv")
+    if (report.get("dev_records") or {}).get("runs") or (report.get("dev_records") or {}).get("objects"):
+        from ..analysis import devrecords as devrecmod
+        (survey_dir / "devrecords.json").write_text(json.dumps(devrecmod.scan_rom(rom.data, with_facts=True)["facts"],
+                                                               indent=1) + "\n")
     (survey_dir / "report.json").write_text(json.dumps(report, indent=1, default=str) + "\n")
     (survey_dir / "report.md").write_text(surveymod.render_markdown(report))
     main = program.main()
     # a debug build's frameless functions end in returns nothing reaches: they are not functions
     tails = functions.merge_dead_returns(catalogue, main.data, main.vram) if main.data else {"merged": 0}
+    # the original build's debug records, placed in the image: names, prototypes and types
+    context_headers = []
+    if (survey_dir / "devrecords.json").is_file() and main.data:
+        from ..analysis import devrecords as devrecmod
+        placement, declarations = devrecmod.apply_to_catalogue(
+            json.loads((survey_dir / "devrecords.json").read_text()), main.data, main.vram, catalogue.functions)
+        (survey_dir / "devrecords_placed.json").write_text(json.dumps(placement, indent=1) + "\n")
+        if declarations:
+            (survey_dir / "devrecords_context.h").write_text(declarations)
+            context_headers.append("survey/devrecords_context.h")
     (survey_dir / "functions.toml").write_text(functions.to_toml(catalogue, report["rom"].get("title", "")))
     (survey_dir / "symbol_addrs.txt").write_text(functions.to_symbol_addrs(catalogue))
     main = program.main()
@@ -212,6 +226,8 @@ def build_project(rom_path: Path, out: Path, mode: str = "auto", calibrate: int 
         lanes = compilermod.project_pipelines(Path(toolchain))
     lines += [*image, "", "[run]", f'pipeline = "{pipeline}"            # {why}', f'flags = "{flags}"',
               "symbols = [" + ", ".join(f'"{name}"' for name in symbol_files) + "]",
+              *(["context_headers = [" + ", ".join(f'"{name}"' for name in context_headers)
+                 + "]   # recorded declarations, ahead of recovered ones"] if context_headers else []),
               f"calibrate = {calibrate}                 # functions sampled to measure the title's real recipe",
               "declare_assumed = true         # declare D_<address> data the identical cases lean on, verify again", ""]
     if lanes:

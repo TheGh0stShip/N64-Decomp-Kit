@@ -98,10 +98,23 @@ class Case:
 class CaseStore:
     """SQLite store (WAL) for cases plus content-addressed candidate sources."""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, readonly: bool = False):
         self.root = Path(root)
-        (self.root / "sources").mkdir(parents=True, exist_ok=True)
+        self.readonly = readonly
         self.lock = threading.RLock()            # one connection shared by worker threads
+        if readonly:
+            # Inspection of a finished run leaves no file behind: no WAL or shared-memory file,
+            # no directory.  With a WAL file present (a run still writing, or one that stopped
+            # before a checkpoint) it must be read through, so the store is opened read-only;
+            # without one it is opened immutable, which takes no lock and writes nothing.
+            database = self.root / "cases.sqlite"
+            if not database.is_file():
+                raise FileNotFoundError(database)
+            mode = "mode=ro" if database.with_name("cases.sqlite-wal").exists() else "mode=ro&immutable=1"
+            self.db = sqlite3.connect(f"{database.resolve().as_uri()}?{mode}", uri=True, timeout=60,
+                                      isolation_level=None, check_same_thread=False)
+            return
+        (self.root / "sources").mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.root / "cases.sqlite", timeout=60, isolation_level=None,
                                   check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -177,7 +190,7 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
             near: int = 10, emit=None, pipeline: str | None = None, recipes=None, strict=None,
             recipe_label: str = "", rom_offset: int | None = None,
             search_ceiling: int | None = SEARCH_CEILING, frame_fit: bool = True,
-            cross_recipes: int | None = None, fresh: bool = False) -> Case:
+            cross_recipes: int | None = None, fresh: bool = False, governor=None, stratum: str = "") -> Case:
     """Run the ladder for one function and store the case.
 
     ``evaluate(text) -> (iterate.Evaluation, relocated candidate bytes or None)``;
@@ -515,10 +528,27 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         case.stages.append({"stage": "iterate-skipped", "score": best.score, "ceiling": search_ceiling})
         event("iterate-skipped", score=best.score, ceiling=search_ceiling)
         families = []
+    stratum = (governor.stratum(stratum or recipe_label or pipeline or "", best.score)
+               if governor is not None else None)
+    prediction = governor.predict(stratum) if governor is not None and families and allowance >= 4 \
+        and not best.exact else None
+    if governor is not None and families and allowance >= 4 and not best.exact:
+        allowed, why = governor.allow(stratum)
+        if not allowed:
+            case.stages.append({"stage": "iterate-skipped", "reason": why, "stratum": stratum})
+            event("iterate-skipped", reason=why, stratum=stratum)
+            families = []
     if families and allowance >= 4 and not best.exact:
+        searched_at = time.monotonic()
         result = itermod.descend(best_text, name, run, tuple(families), jobs=jobs, budget=allowance)
         spent = result.get("evaluated", 0)
         case.builds += spent
+        if governor is not None:
+            governor.record(stratum, result.get("start_score"), result.get("final_score"), spent,
+                            bool(result.get("exact")))
+            if prediction is not None:
+                governor.observe(prediction, result.get("start_score"), result.get("final_score"), spent,
+                                 bool(result.get("exact")), time.monotonic() - searched_at)
         improved = result.get("final_score") is not None and result["final_score"] < best.score
         helpful = {row["family"] for row in result.get("sensitivity", []) if row.get("delta", 0) < 0}
         if not improved:

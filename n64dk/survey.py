@@ -76,7 +76,11 @@ def run(rom: Rom, *, mode: str = "auto", lzari_brute: bool = True) -> dict:
     out["rsp_in_text"] = [f"0x{a:08X}..0x{z:08X}" for a, z in rsp or []]
     out["cross_checks"] = _cross_checks(img, cat, dm, rsp or [])
 
-    items, dropped = _ledger(rom, img, dm, au, gfx, assets, rsp or [])
+    from .analysis import devrecords as devrecmod
+    records = stage("dev_records", lambda: devrecmod.scan_rom(rom.data))
+    if records is not None:
+        out["dev_records"] = records["summary"]
+    items, dropped = _ledger(rom, img, dm, au, gfx, assets, rsp or [], records)
     out["ledger_totals"] = Ledger.totals(items)
     out["ledger_categories"] = Ledger.totals(items, "category")
     unknown = [it for it in items if it.cls == "unknown"]
@@ -283,7 +287,7 @@ def scan_graphics(data: bytes, microcode=()) -> dict:
     return {"summary": summary, "pools": pools, "loose": loose}
 
 
-def _ledger(rom: Rom, img, dm, au, gfx, assets, rsp=()) -> tuple[list[Interval], list[Interval]]:
+def _ledger(rom: Rom, img, dm, au, gfx, assets, rsp=(), records=None) -> tuple[list[Interval], list[Interval]]:
     size = len(rom.data)
     led = Ledger(0, size)
     taken: list[tuple[int, int]] = []
@@ -352,6 +356,11 @@ def _ledger(rom: Rom, img, dm, au, gfx, assets, rsp=()) -> tuple[list[Interval],
         for r in gfx["loose"]:
             add(r.start, r.end, "payload", "graphics", kind="display_list", name=f"dl_{r.start:X}",
                 evidence=f"{fam} display list, {len(r.commands)} commands (data not resolvable)")
+    # retained development records: decoded record by record, but weaker than any program,
+    # audio, codec or graphics evidence (clip: only bytes nothing else claims)
+    for span in (records or {}).get("spans", []):
+        add(span["start"], span["end"], "payload", "debug_records", clip=True, kind=span["kind"],
+            name=f"debug_{span['start']:X}", evidence=span["evidence"])
     for it in asset_items:
         if it.category != "compressed":   # a reference, not an understanding of the content
             add(it.start, it.end, "referenced", "loader_range", clip=True, kind=it.kind, name=it.name,

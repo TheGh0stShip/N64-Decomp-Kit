@@ -214,11 +214,12 @@ def build(source: Path, out: Path, version: str, flavour: str, cfg, jobs: int = 
                 defines = [f for f in (unit_recipe(version, flavour, relative)[1] if gcc
                                        else assembly_recipe(version, flavour, relative))
                            if f.startswith("-D") and f not in ("-D_LANGUAGE_C", "-D__USE_ISOC99")]
-                done = subprocess.run(
+                from .. import safety
+                done = safety.run_tool(
                     ["gcc", "-E", "-P", "-undef", "-x", "assembler-with-cpp", "-Dmips=1", "-D_MIPS_SIM_ABI32=1",
                      *dict.fromkeys(_ASM_DEFINES + defines),
                      *[f"-I{path}" for path in (*includes, (source / "src" / relative).parent, source / "src")],
-                     str(source / "src" / relative), "-o", str(text)], capture_output=True, text=True)
+                     str(source / "src" / relative), "-o", str(text)], kind="light", capture_output=True, text=True)
                 if done.returncode != 0:
                     return relative, "as", [], None, done.stderr[-300:]
                 if gcc:

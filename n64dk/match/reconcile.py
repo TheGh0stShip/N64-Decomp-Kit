@@ -364,8 +364,8 @@ def _kind(rel: Path, at_root: bool) -> str | None:
 
 def _tracked(project: Path) -> set[str] | None:
     try:
-        proc = subprocess.run(["git", "-C", str(project), "ls-files", "-z"],
-                              capture_output=True, timeout=60)
+        from .. import safety
+        proc = safety.run_tool(["git", "-C", str(project), "ls-files", "-z"], capture_output=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:

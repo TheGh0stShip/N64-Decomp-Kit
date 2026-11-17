@@ -143,6 +143,16 @@ class StrictCompareTest(unittest.TestCase):
         placed = rom_from(loose_elf, {".rodata": DATA})
         self.assertEqual(strict(loose_elf, placed, {}, {".rodata": DATA}, size=8).verdict, "exact")
 
+    def test_data_outside_the_image_is_unverified_not_different(self):
+        """A range found by code density can end before its data: the bytes are absent, which
+        proves nothing either way (it was reported as a difference before)."""
+        short = self.rom[:DATA - BASE]                                  # the image stops before .data
+        result = strict(elf(TRUTH), short, SYMBOLS, {".data": DATA})
+        self.assertTrue(result.text_equal)
+        self.assertEqual((result.verdict, result.sections[0]["status"], result.sections[0]["held"]),
+                         ("assumed", "unverified", 0))
+        self.assertIn("holds 0 of its", " ".join(result.notes))
+
     def test_extra_code_after_the_owned_size_is_a_mismatch(self):
         self.assertEqual(strict(elf(TRUTH), self.rom, SYMBOLS, {".data": DATA}, size=0x18).verdict, "mismatch")
 

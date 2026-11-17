@@ -109,11 +109,16 @@ export, and proof boundaries.
 |---|---|
 | `decompile-init ROM --out PROJECT` | Build a logical-image project, catalogue, symbols, compiler lanes and byte ledger from a bare ROM |
 | `decompile-run --project PROJECT --all-images --out DIR` | Run the checkpointed donor/draft/recipe/search/strict-verification pipeline with bounded resources |
+| `decompile-run ... --effort quick\|normal\|deep\|exhaustive`, `--resume DIR`; `decompile-status DIR` | Effort modes, cause-driven later rounds to a fixed point under time/build/model-call budgets, resume, read-only round table and per-function hard-queue dossiers (default `normal` is the single pass above) |
 | `decompile-batch ROM... --out DIR` | Process titles sequentially and share only independently verified donor results |
 | `decompile-export --project PROJECT --run DIR --out DIR` | Export every function with honest C/assembly/unresolved provenance and full ROM-byte coverage |
 | `source-donor TREE --project PROJECT` | Measure an existing C source tree and split verified translation units into reusable per-function donors |
 | `sdk-donor TREE --out DIR` | Build version/flavour-specific libultra donor descriptions |
 | `compilers` | Audit or fetch the checksum-pinned catalogue of known retail N64 compilers and usable lanes |
+| `compiler-components` / `compiler-probes` | Toolchain components and recipes with provenance and digests; probe every recipe for determinism, equivalence and stage attribution |
+| `dev-records-scan` / `dev-records-decode` | Find and decode SN/PsyQ object records and SN debug streams left in a ROM, fail-closed, as evidence |
+| `training-corpus-build` / `-audit` / `-stats` / `-explore` / `-evaluate` / `-export` | Exact draft/source pairs from imported trees; held-out evaluation of drafting conditions and learned rules |
+| `jobs` | List heavy jobs on the machine, cancel one with its process group, prune stale leases |
 | `info ROM` | Header, CIC, checksum, main segment, stack, BSS, hand-over, staged boot |
 | `disasm ROM VRAM SIZE` | Disassemble a range of the main segment |
 | `survey ROM --out DIR [--image auto\|static\|emulated] [--require-complete]` | Everything below over the program image; report and ROM ledger |
@@ -244,8 +249,13 @@ report = survey.run(rom)["report"]
   usage, evidence, verification boundary and limitations
 * [docs/autonomous-tranches.md](docs/autonomous-tranches.md): interval inventories, context
   bundles, cross-function scheduling, compact session output and exact-winner preparation
+* [docs/safety.md](docs/safety.md): machine lock, worker tokens, memory and disk floors, leases
+* [docs/toolchain-components.md](docs/toolchain-components.md): component graph, recipes, probes
+* [docs/dev-records.md](docs/dev-records.md): development records left in ROMs
 * [docs/decompile-run.md](docs/decompile-run.md): bare-ROM initialization, unattended stages,
   resource limits, donors, refinement, batch operation and export semantics
+* [docs/solver.md](docs/solver.md): effort modes, primary causes and their techniques, the
+  fixed-point rule, budgets, resume, `decompile-status`, what is observational and what is not
 * [docs/claude-integration-audit.md](docs/claude-integration-audit.md): recovered-lab integration
   ledger, accepted/rejected experiments, verification gates and remaining external limitations
 * [docs/tooling-research.md](docs/tooling-research.md): upstream workflow concepts and the

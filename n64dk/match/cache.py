@@ -66,6 +66,12 @@ class ContentCache:
             raise CacheError(f"corrupt cached object {digest}")
         return data
 
+    def prune(self, max_mb: int | None = None) -> dict:
+        """Keep the stored objects under a size (``N64DK_CACHE_MAX_MB``), least recently used
+        first.  A reference to a removed object reads as a miss and is rebuilt."""
+        from ..safety import prune
+        return prune(self.objects, max_mb)
+
     def contains(self, digest: str) -> bool:
         return self.path(digest).is_file()
 

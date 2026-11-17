@@ -343,6 +343,28 @@ def _trim(words, start: int, end: int, prologues: list[int], delta: int, target_
     return start, end
 
 
+DATA_REACH = 0x80000         # how far past its code a placed region's own data may lie
+
+
+def data_extent(rom_data: bytes, start: int, end: int, delta: int, limit: int) -> tuple[int, int]:
+    """Where the data a placed code range reads ends: its code's address references (lui and a
+    low half) that land past the code, at the same distance between address and ROM offset, and
+    before ``limit`` (the next range that belongs to something else).  Returns the new end and
+    the number of references that set it.  A linked program puts its read-only and initialised
+    data after its code; a range found by code density alone stops where the code does, and the
+    data its functions read would otherwise be outside every image."""
+    from .. import mips
+    vram = (start + delta) & 0xFFFFFFFF
+    code_end = (end + delta) & 0xFFFFFFFF
+    reach = min(limit, end + DATA_REACH, len(rom_data))
+    beyond = [ref.address for ref in mips.scan_refs(rom_data[start:end], vram, call_targets=False)
+              if ref.kind in ("load", "store", "addr") and code_end <= ref.address < (reach + delta) & 0xFFFFFFFF]
+    if not beyond:
+        return end, 0
+    last = max(beyond) - delta + 8                         # a double is the widest single read
+    return min(reach, (last + 15) & ~15), len(beyond)
+
+
 def discover_regions(rom_data: bytes, known: list[tuple[int, int]], skip: list[tuple[int, int]] = ()) -> list[Candidate]:
     """Code that no loader range or stream points at, found by density and placed by one vote over
     the whole ROM.
@@ -442,10 +464,18 @@ def discover_regions(rom_data: bytes, known: list[tuple[int, int]], skip: list[t
                        [q for q in prologues if new_start <= q < new_end],
                        {t for t in targets})
     info = info + trimmed
+    occupied = sorted([(lo, hi) for lo, hi, _p, _t in info] + [tuple(item) for item in skip])
     for index, (start, end, prologues, targets) in enumerate(info):
         candidate = Candidate(start, end, text_bytes=end - start, prologues=len(prologues), calls=len(targets),
                               by_density=True,
                               returns=sum(1 for w in words[start // 4:end // 4] if w == 0x03E00008))
+        if assigned.get(index) is not None:
+            limit = min([lo for lo, _hi in occupied if lo >= end] + [len(rom_data)])
+            data_end, references = data_extent(rom_data, start, end, assigned[index], limit)
+            if data_end > end:
+                candidate.rom_end = data_end
+                candidate.evidence.append(f"data after the code: 0x{data_end - end:X} bytes, up to the furthest of "
+                                          f"{references} references its code makes past its end")
         delta = assigned.get(index)
         if delta is None:
             candidate.reason = "code by density, but no load address is supported by its calls"

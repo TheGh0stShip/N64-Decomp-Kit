@@ -58,7 +58,8 @@ def run_hook(command: str, src: Path, dst: Path, cwd: Path, extra: list[str] | N
         else:
             final.append(a.replace("{input}", str(src)).replace("{output}", str(dst)))
     try:
-        proc = subprocess.run(final, cwd=cwd, capture_output=True, text=True, timeout=120)
+        from .. import safety
+        proc = safety.run_tool(final, kind="light", cwd=cwd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("normalizer timed out after 120s") from error
     if proc.returncode:

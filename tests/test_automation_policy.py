@@ -13,6 +13,7 @@ class AutomationPolicyTests(unittest.TestCase):
         self.assertFalse(args.region_recipes)
         self.assertFalse(args.unit_recipes)
         self.assertFalse(args.skip_unknown_search)
+        self.assertFalse(args.search_economics)
 
     def test_decompile_run_experiments_are_opt_in(self):
         parser = argparse.ArgumentParser()
@@ -21,6 +22,8 @@ class AutomationPolicyTests(unittest.TestCase):
         self.assertFalse(args.region_recipes)
         self.assertFalse(args.unit_recipes)
         self.assertFalse(args.skip_unknown_search)
+        self.assertFalse(args.search_economics)
+        self.assertEqual(args.refine_known_source, [])
 
     def test_experiments_can_be_enabled_explicitly(self):
         parser = argparse.ArgumentParser()

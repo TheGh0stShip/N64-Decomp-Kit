@@ -168,8 +168,19 @@ def strict_compare(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int,
                 continue
             owned = limits.get(name, len(data))
             offset = vram_to_rom(base)
-            want = rom[offset:offset + owned]
             row.update(base=f"0x{base:08X}", compared=owned, base_assumed=assumed)
+            if offset < 0 or offset + owned > len(rom):
+                # the image does not hold these bytes (a range found by code density ends before
+                # its data, or the section belongs to another image): nothing to compare, which
+                # proves nothing either way
+                held = max(0, min(len(rom), offset + owned) - max(0, offset))
+                row.update(status="unverified", held=held)
+                result.notes.append(f"{name}: the image holds {held} of its {owned} bytes at 0x{base:08X}; "
+                                    "its content was not compared")
+                data_ok = False
+                result.sections.append(row)
+                continue
+            want = rom[offset:offset + owned]
             if data[:owned] == want:
                 row["status"] = "equal"
             else:

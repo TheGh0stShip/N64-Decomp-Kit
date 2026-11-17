@@ -307,6 +307,26 @@ class Draft:
 _EXTERN_PROTO = re.compile(r"(?m)^([\w \*]+?\b\w+)\([^;{}]*\);(\s*/\* (?:extern|static) \*/)")
 
 
+# A top-level declaration: no indentation (statements inside a function body are indented in a
+# decompiler draft), at least one type word before the name.
+_TOP_DECLARATION = re.compile(r"^(?:extern\s+|static\s+)?(?:(?:const|volatile|unsigned|signed|struct|union|enum)\s+)*"
+                              r"[A-Za-z_]\w*(?:\s+|\s*\*+\s*)(?:\*+\s*)?(\w+)\s*(?:\([^{]*\)|\[[^\]]*\])?\s*;")
+_DECLARED_NAMES = re.compile(r"(?m)^(?:extern\s+|static\s+)?[\w \*]+?\b(\w+)\s*(?:\(|\[|;)")
+
+
+def drop_redeclared(draft_body: str, declarations: str) -> str:
+    """The draft's own top-level guesses for names ``declarations`` declares, removed; nothing
+    inside a function body is touched (a call statement ``f();`` is not a declaration)."""
+    declared = set(_DECLARED_NAMES.findall(declarations))
+    kept = []
+    for line in draft_body.split("\n"):
+        found = _TOP_DECLARATION.match(line)
+        if found and found.group(1) in declared and "{" not in line:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def prepare(source: str) -> str:
     """Make an m2c ``--valid-syntax`` draft a self-contained C89 file.
 

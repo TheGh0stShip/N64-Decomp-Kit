@@ -39,6 +39,12 @@ from pathlib import Path
 PREFIX = "custom:"
 
 
+
+def _tool_digest(path: Path) -> str:
+    """A tool file's SHA-256, cached by its size, mtime and inode (see pipeline._file_digest)."""
+    from .pipeline import _file_digest
+    return _file_digest(Path(path)).hex()
+
 class CustomPipelineError(RuntimeError):
     pass
 
@@ -61,7 +67,7 @@ class Recipe:
         for value in self.variables.values():
             path = Path(value)
             if path.is_file():
-                parts.append(f"{path.resolve()}:{hashlib.sha256(path.read_bytes()).hexdigest()}")
+                parts.append(f"{path.resolve()}:{_tool_digest(path)}")
             elif path.is_dir():
                 parts.append(f"dir:{path.resolve()}")
         for step in self.steps:
@@ -71,7 +77,7 @@ class Recipe:
                 continue
             path = Path(token)
             if "{" not in token and path.is_absolute() and path.is_file():
-                parts.append(f"tool:{path}:{hashlib.sha256(path.read_bytes()).hexdigest()}")
+                parts.append(f"tool:{path}:{_tool_digest(path)}")
         return "\n".join(parts)
 
 
@@ -140,21 +146,38 @@ def build(recipe: Recipe, source: Path, flags: list[str], include_dirs: list[Pat
             raise CustomPipelineError(f"pipeline {recipe.name} step {number}: unknown placeholder {error}") from None
         if not argv:
             continue
-        try:
-            process = subprocess.Popen(argv, cwd=workdir, env=environment, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-        except OSError as error:
-            raise CustomPipelineError(f"pipeline {recipe.name} step {number}: cannot run {argv[0]}: {error}") from None
-        try:
-            output, _ = process.communicate(timeout=recipe.timeout)
-        except subprocess.TimeoutExpired:
+        from .. import safety
+        safety.throttle()
+        legacy = any(marker in step for marker in ("wibo", "qemu"))
+        with safety.tool_tokens(legacy, safety.tool_family(argv)):   # machine-wide, weighted by measured peak
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            process.communicate()
-            raise CustomPipelineError(f"pipeline {recipe.name} step {number} timed out after "
-                                      f"{recipe.timeout:g}s: {argv[0]}") from None
+                family = safety.tool_family(argv)
+                launched, rss_report = safety.measured(argv)
+                process = subprocess.Popen(launched, cwd=workdir, env=environment, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+                safety.limit_child(process.pid, legacy)
+                safety.register_tool(process.pid)
+            except OSError as error:
+                raise CustomPipelineError(f"pipeline {recipe.name} step {number}: cannot run {argv[0]}: "
+                                          f"{error}") from None
+            try:
+                output, _ = safety.communicate(process, family, None, recipe.timeout)
+            except subprocess.TimeoutExpired:
+                raise CustomPipelineError(f"pipeline {recipe.name} step {number} timed out after "
+                                          f"{recipe.timeout:g}s: {argv[0]}") from None
+            except BaseException:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=10)       # the group was killed; streams may be closed
+                except Exception:
+                    pass
+                raise
+            finally:
+                safety.unregister_tool(process.pid)
+                safety.collect_peak(family, rss_report)
         if process.returncode != 0:
             text = output.decode(errors="replace")[-2000:]
             raise CustomPipelineError(f"pipeline {recipe.name} step {number} failed ({argv[0]}, exit "

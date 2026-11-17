@@ -153,3 +153,24 @@ class NeighbouringProgramsTest(unittest.TestCase):
         code = segment(0x80234560, 200)[:-0x400]
         found = segments.discover_regions(rom_with({0x8040: code}), [])
         self.assertEqual([(c.rom_start, c.vram) for c in found], [(0x8040, 0x80234560)])
+
+
+class DataExtentTest(unittest.TestCase):
+    """A range found by code density is extended over the data its own code reads past its end."""
+
+    def test_the_end_moves_to_the_furthest_read_past_the_code(self):
+        import struct as _struct
+        from n64dk.analysis import segments as seg
+        delta = 0x80100000 - 0x1000                         # the range at ROM 0x1000 runs at 0x80100000
+        code = [0x3C028010, 0x8C420040,                       # lui v0, 0x8010; lw v0, 0x40(v0)  -> 0x80100040
+                0x3C038010, 0xC4640120,                       # lui v1, 0x8010; lwc1 f4, 0x120(v1) -> 0x80100120 (past the code)
+                0x03E00008, 0]
+        rom = bytearray(0x4000)
+        _struct.pack_into(f">{len(code)}I", rom, 0x1000, *code)
+        end = 0x1000 + 4 * len(code)
+        new_end, references = seg.data_extent(bytes(rom), 0x1000, end, delta, len(rom))
+        self.assertEqual((new_end, references), (0x1130, 2))       # both reads land past the 24 bytes of code
+        # never past what belongs to something else
+        self.assertEqual(seg.data_extent(bytes(rom), 0x1000, end, delta, 0x1100), (0x1050, 1))   # the read past the limit is not counted
+        # code that reads nothing past itself keeps its end
+        self.assertEqual(seg.data_extent(bytes(rom), 0x1010, end, delta, len(rom)), (end, 0))       # jr ra; nop

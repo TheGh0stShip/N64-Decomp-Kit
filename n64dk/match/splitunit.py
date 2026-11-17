@@ -128,6 +128,9 @@ def _function_name(head_blank: str) -> str | None:
             depth -= 1
             if depth == 0:
                 found = re.search(r"([A-Za-z_]\w*)\s*$", head[:i])
+                if found is None:
+                    # a parenthesised declarator: ``typedef void (Name)(args);``, ``int (f)(void);``
+                    found = re.search(r"\(\s*([A-Za-z_]\w*)\s*\)\s*$", head[:i])
                 return found.group(1) if found and found.group(1) not in KEYWORDS else None
     return None
 
@@ -367,12 +370,23 @@ def unit_suffix(unit: str) -> str:
     return "__" + hashlib.sha1(unit.encode()).hexdigest()[:6]
 
 
-def split(text: str, unit: str) -> dict[str, str]:
-    """``{function label: source}`` for the functions ``text`` (a preprocessed unit) defines.
+INLINE_ASM = re.compile(r"\b(?:__asm__|__asm|asm)\s*(?:volatile|__volatile__|goto)?\s*\(")
+
+
+def split(text: str, unit: str, excluded: dict | None = None) -> dict[str, str]:
+    """``{function label: source}`` for the functions ``text`` (a preprocessed unit) defines, in
+    the order the unit defines them.
 
     A label is the function's name, with the unit's suffix when the function was local to the
-    unit.  Functions written ``inline`` are helpers of the others, not units of their own."""
+    unit.  Functions written ``inline`` are helpers of the others, not units of their own.
+
+    A function whose body holds an ``asm`` statement is not offered: what it compiles to is in
+    part written by hand (an assembler routine dressed as a function, an encoded instruction), and
+    that part is not a decompilation.  Such functions, and those the inline helpers they call
+    would carry in, are listed in ``excluded`` with the reason."""
     parts = chunks(text)
+    helpers_with_asm = {part.name for part in parts
+                        if part.kind == "function" and part.inline and INLINE_ASM.search(blank_literals(part.text))}
     suffix = unit_suffix(unit)
     local = {name: name + suffix for part in parts for name in part.local}
     by_name: dict[str, list[int]] = {}
@@ -382,6 +396,13 @@ def split(text: str, unit: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for number, part in enumerate(parts):
         if part.kind != "function" or not part.name or part.inline:
+            continue
+        label = local.get(part.name, part.name)
+        body = blank_literals(part.text[len(part.head):])
+        if INLINE_ASM.search(body) or helpers_with_asm & part.uses:
+            if excluded is not None:
+                excluded[label] = ("inline assembly in its body" if INLINE_ASM.search(body)
+                                   else "calls an inline helper written in assembly")
             continue
         wanted, todo = {number}, list(part.uses)
         seen = set(todo)

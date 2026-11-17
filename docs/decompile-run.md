@@ -15,6 +15,11 @@ n64dk --format json decompile-run --project . --all-images --out out/run \
     --donors donors.toml --max-size 0x400 --budget 100
 ```
 
+`--effort quick|normal|deep|exhaustive` chooses how much work follows this pass; the default
+`normal` is the single pass described here. Deep and exhaustive add cause-driven rounds until a
+fixed point or a budget, `--resume RUN` continues a run and `decompile-status RUN` shows its
+rounds: see [solver.md](solver.md).
+
 ## Starting from a ROM alone
 
 A title nobody has worked on has no catalogue, no symbol list and no known compiler.
@@ -140,6 +145,18 @@ The run can be interrupted and restarted: finished stages are read from their ch
 (`--redo` recomputes them) and finished cases from the case store. `--skip-stage NAME` omits a
 stage; `--limit N` and `--max-size` bound a trial run.
 
+**Search economics** (`--search-economics`, off by default) keeps, per stratum (the image, the
+recipe a function is built under, whether the toolchain classifier called its code unknown, and
+how far its first draft is), what the variant search has cost and returned.  A stratum that has had 24 searches and 600 builds without making a function exact or
+bringing one within ten differences is not searched any more, except every eighth function as a
+probe; its cases record `iterate-skipped` with the stratum's numbers, and
+`state/economics_<image>.json` ranks the strata by yield per build.  Nothing is skipped on a
+classification of the target alone.
+
+**Nothing left out silently.**  Every function a resolve pass leaves out (`--max-size`,
+`--limit`, sampling, `--only-names`) is listed with the reason in `state/scope_<image>.json`,
+and the export shows the reason beside `not attempted`.
+
 **Measured experiments that are not defaults.** `--region-recipes` retries unresolved functions
 under a recipe inferred for an address region (3 exact results in 126 measured retries).
 `--unit-recipes` uses a nearby unit's recipe (0/165). `--skip-unknown-search` trusts the
@@ -205,13 +222,21 @@ max_cases = 200                  # nearest first; 0 = all
 max_score = 0                    # only cases at most this far from the target; 0 = all
 statuses = ["near", "open", "does-not-build"]
 max_size = 0x400
-jobs = 4                         # calls in parallel
+jobs = 1                         # calls at once (model work: one at a time unless you raise it)
+known_source = []                # folders of source the author must not be shown (blind evaluation)
 timeout = 600
 ```
 
 or `--refine-command "..."` on `decompile-run` and `resolve-hard`
 (`--refine-rounds`, `--refine-max-cases`, `--refine-max-score`, `--refine-jobs`,
-`resolve-hard --refine-names a,b` to ask about named functions only).
+`resolve-hard --refine-names a,b` to ask about named functions only, `--refine-known-source DIR`).
+
+Answers are cached by the digest of the settings and the prompt (`state/refine_cache/`): a run
+started again asks nothing it has asked before.  Every refine stage records its cost (calls,
+cached answers, seconds, prompt and answer bytes) and the pass reports the totals.  With
+`--refine-known-source DIR` (an imported tree's `split/` folder) a prompt holding a line of that
+source is not sent, and an answer whose body lines are mostly that source is marked
+`known_source`: the author remembered published code, which is not a blind recovery.
 
 The configured command is executable code and runs with the invoking user's OS permissions. Use
 only a trusted local wrapper. It starts in an empty temporary working directory, but this is not a
@@ -380,8 +405,30 @@ What is deliberately not taken from a tree:
   number left out (`symbols_not_written_in_c`).
 
 A macro the tree compares with something (`#if RELEASE >= RELEASE_C`) is tried at each value it
-is compared with.  A unit that needs a header the tree generates during its own build is reported
-as failed.
+is compared with.  Macros are measured first on the units with the most functions still unfound.
+
+**Generated files.**  `--prepare-command SHELL` runs the tree's own generator in a copy (the tree
+is never written), e.g. for SM64 the `textconv` steps that make `text_strings.h`.  A file still
+missing gets a stand-in: `0` where it is included inside an initialiser, nothing elsewhere.  A
+function that needs the real content fails to compile or compiles to other bytes, and the
+comparison refuses it.
+
+**Preprocessing** is done as C89 (`-std=gnu89`, no `__STDC_VERSION__`), as the IDO and KMC GCC
+compilers see it: headers that test the version take their old branch.
+
+**Whole units as well.**  `--units both` writes a second donor (`<name>_units`) made of the
+tree's own units beside the one-function units: a function that only matches when its unit is
+compiled together (shared literals, static data, the unit's layout) is taken through it, with
+the whole unit standing in the title.  On Dr. Mario 64 this verified 4 functions the split could
+not; on SM64 none.
+
+**Every function accounted for.**  `source-donor-account --project P --run RUN --donor-dir DIR
+[--donor a,b] [--out rows.json]` gives each function of the title one cause: `strict`,
+`awaiting-symbols`, `other-donor`, `refused` (with the stage's reason), `near`,
+`tree-function-differs` (placed by source order between two found functions of its unit, with
+the word difference), `tree-function-not-compiled`, `tree-function-assembly` or
+`no-tree-function`.  Measured (round 10): SM64 3,205 strict + 891 awaiting of 4,511 functions;
+Dr. Mario 64 732 strict + 50 awaiting of 1,430.
 
 ## Every function, every byte
 

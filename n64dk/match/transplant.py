@@ -432,6 +432,8 @@ class Hit:
     status: str = "candidate"        # candidate | needs-review | local-inconsistent | constant-differs | partial-unit
     notes: list[str] = field(default_factory=list)
     template: bool = False           # generic code shape (one donor function hit by several targets)
+    lost_lo: bool = False            # near: only %lo halves the pair tracker could not follow differ
+    placed: bool = False             # its place is fixed by its source neighbours (see ``corroborate``)
 
     @property
     def donor(self) -> str:
@@ -509,7 +511,9 @@ def scan(image: bytes, vram_delta: int, functions: list[tuple[str, int, int]], i
             diffs = [i for i, (a, b) in enumerate(zip(dmasked, masked)) if a != b]
             if 0 < len(diffs) <= near_max:
                 hit = Hit(name, vram, len(code), unit, fn, "near", diffs, status="near")
-                if all(_lost_lo(dmasked[i], masked[i]) for i in diffs):
+                bases = {w >> 16 & 31 for w in words_of(code) if w >> 26 == 15}      # registers a lui sets
+                if all(_lost_lo(dmasked[i], masked[i]) and (masked[i] >> 21) & 31 in bases for i in diffs):
+                    hit.lost_lo = True
                     hit.notes.append("only 16-bit immediates of non-stack loads/stores/addiu differ: probably "
                                      "%lo halves the straight-line pair tracker lost (masking too tight)")
                 hits.append(hit)
@@ -523,6 +527,66 @@ def _key(hit: Hit, site: dict) -> tuple[str, int]:
     return hit.donor, site["donor_address"] - site["addend"]
 
 
+def source_order(index: "Index") -> dict[tuple[str, str], tuple[str, int]]:
+    """``{(donor, unit source): (translation unit, position)}`` for donors split one function per
+    unit (``order.json`` beside their sources, see ``n64dk.match.sourcedonor``)."""
+    out = {}
+    for name, info in index.donors.items():
+        path = Path(info.get("root", "")) / "order.json"
+        if not path.is_file():
+            continue
+        try:
+            order = json.loads(path.read_text()).get("order", {})
+        except (OSError, ValueError):
+            continue
+        for unit, labels in order.items():
+            for position, label in enumerate(labels):
+                out[(name, f"{unit[:-2]}/{label}.c")] = (unit, position)
+    return out
+
+
+def corroborate(hits: list[Hit], functions: list[tuple[str, int, int]], order: dict) -> int:
+    """Fix the place of a function whose code stands at several places of the title.
+
+    The same shape at several places (a getter, a setter) says nothing about which of them is
+    this function, and such hits are refused.  Source order says more: a compiler lays a unit's
+    functions out in the order the unit defines them, so a hit right after the place where the
+    unit's previous function was found uniquely (or right before its next one) is this
+    function's place.  Places fixed this way can fix their own neighbours.  Returns how many."""
+    if not order:
+        return 0
+    sequence = [vram for _n, vram, _s in sorted(functions, key=lambda row: row[1])]
+    position = {vram: k for k, vram in enumerate(sequence)}
+    targets: dict[int, set[int]] = defaultdict(set)
+    for hit in hits:
+        if hit.kind == "exact":
+            targets[id(hit.function)].add(hit.vram)
+    where: dict[tuple, int] = {}                          # (donor, unit, position) -> title address
+    for hit in hits:
+        key = order.get((hit.donor, hit.unit["source"]))
+        if hit.kind == "exact" and key and len(targets[id(hit.function)]) == 1:
+            where[(hit.donor, *key)] = hit.vram
+    fixed, changed = 0, True
+    while changed:
+        changed = False
+        for hit in hits:
+            key = order.get((hit.donor, hit.unit["source"]))
+            if hit.kind != "exact" or hit.placed or not key or len(targets[id(hit.function)]) < 2 \
+                    or hit.vram not in position:
+                continue
+            unit, k = key
+            before, after = where.get((hit.donor, unit, k - 1)), where.get((hit.donor, unit, k + 1))
+            here = position[hit.vram]
+            if (before is not None and position.get(before) == here - 1) or \
+                    (after is not None and position.get(after) == here + 1):
+                hit.placed = True
+                hit.notes.append("placed by the functions written around it in its unit")
+                where.setdefault((hit.donor, unit, k), hit.vram)
+                fixed += 1
+                changed = True
+    return fixed
+
+
 def transfer(hits: list[Hit]) -> dict:
     """Derive target addresses of donor symbols and check them across all exact hits.
 
@@ -533,7 +597,7 @@ def transfer(hits: list[Hit]) -> dict:
         if hit.kind == "exact":
             targets_per_fn[id(hit.function)].add(hit.vram)
     for hit in hits:
-        if hit.kind == "exact" and len(targets_per_fn[id(hit.function)]) > 1 and hit.sites:
+        if hit.kind == "exact" and len(targets_per_fn[id(hit.function)]) > 1 and hit.sites and not hit.placed:
             hit.template = True
     votes: dict[tuple[str, int], dict[int, list[Hit]]] = defaultdict(lambda: defaultdict(list))
     names: dict[tuple[str, int], str | None] = {}
@@ -688,6 +752,15 @@ def plan(hits: list[Hit], image: bytes, vram_delta: int,
     the bytes before a hit can mimic a donor neighbour (a preceding ``jr ra; nop``)."""
     jobs, partial, done = [], [], set()
     for hit in hits:
+        if hit.kind == "near" and hit.lost_lo and hit.status == "near" and len(hit.unit["functions"]) == 1:
+            # The masking missed a %lo half (its lui is on another path): the masked words
+            # differ, the code may not.  The strict comparison of the rebuilt unit decides.
+            key = (hit.unit["donor"], hit.unit["source"], hit.unit["line"], hit.vram)
+            if key not in done and (starts is None or hit.vram in starts):
+                done.add(key)
+                hit.status = "candidate"
+                jobs.append(Job([hit], hit.unit, hit.vram, hit.unit["core_size"]))
+            continue
         if hit.kind != "exact" or hit.status != "candidate":
             continue
         unit, fn = hit.unit, hit.function
@@ -872,6 +945,7 @@ def verify_job(job: Job, index: Index, target, transfer_result: dict, function_s
         row["donor_vs_target_first_diff"] = _first_raw_diff(dcode, tcode)
         row["cause"] = _cause(row, elf, dcode, unit["vram"])
     row["_elf_spec"] = (spec, declared, dict(tbases), source)
+    row["_object"] = elf
     return row
 
 
@@ -1014,6 +1088,79 @@ def distinct_alternatives(alts: list) -> list:
     return out
 
 
+RODATA = (".rodata", ".rdata")
+SETTLE_MIN_PIECES, SETTLE_MIN_BYTES, SETTLE_MIN_NONZERO = 2, 16, 8
+
+
+def rodata_chains(pieces: list[dict], rom: bytes, vram_to_rom) -> list[list[dict]]:
+    """Chains of rodata pieces that lie end to end in the target.
+
+    A piece is ``{"address", "size", "align", "row"}``: one unit's read-only section at the address
+    its own code points to, whose contents the strict comparison found there.  A piece joins the
+    chain when it starts exactly where the previous one ends, rounded up to its own alignment,
+    and the bytes in between are zero.  Each address was derived from a different unit's code;
+    that they abut, which no single derivation implies, is what a chain adds."""
+    chains: list[list[dict]] = []
+    for piece in sorted(pieces, key=lambda p: p["address"]):
+        if chains:
+            last = chains[-1][-1]
+            end = last["address"] + last["size"]
+            aligned = (end + piece["align"] - 1) // piece["align"] * piece["align"]
+            gap = rom[vram_to_rom(end):vram_to_rom(piece["address"])] if piece["address"] >= end else None
+            if piece["address"] == aligned and gap is not None and not any(gap):
+                chains[-1].append(piece)
+                continue
+        chains.append([piece])
+    return chains
+
+
+def settle_rodata(rows: list[dict], target, function_starts: set[int] | None) -> dict:
+    """Settle byte-identical rows that wait only for their read-only section's address.
+
+    Units placed end to end are confirmed together: a chain of at least SETTLE_MIN_PIECES pieces,
+    SETTLE_MIN_BYTES bytes and SETTLE_MIN_NONZERO non-zero bytes (a lone 4-byte float confirms
+    nothing).  Each awaiting row of an accepted chain is verified again with its section base
+    declared, and promoted only when the strict comparison calls it exact."""
+    from .verify import strict_compare
+    pieces = []
+    for row in rows:
+        elf = row.get("_object")
+        if elf is None or row["verdict"] not in (EXACT_VERDICT, ASSUMED_VERDICT):
+            continue
+        for state in (row.get("strict") or {}).get("sections", []):
+            section = cmp.find_section(elf, state.get("section")) if state.get("section") in RODATA else None
+            if section is None or state.get("status") != "equal" or state.get("compared") != state.get("size") \
+                    or not state.get("size"):
+                continue
+            pieces.append({"address": int(state["base"], 16), "size": state["size"], "align": section.align,
+                           "name": section.name, "row": row})
+    accepted, report = [], {"pieces": len(pieces), "chains": 0, "promoted": 0, "rows_rechecked": 0}
+    for chain in rodata_chains(pieces, target.rom, target.vram_to_rom):
+        start, end = chain[0]["address"], chain[-1]["address"] + chain[-1]["size"]
+        body = target.rom[target.vram_to_rom(start):target.vram_to_rom(end)]
+        if len(chain) >= SETTLE_MIN_PIECES and len(body) >= SETTLE_MIN_BYTES and \
+                sum(1 for byte in body if byte) >= SETTLE_MIN_NONZERO:
+            report["chains"] += 1
+            accepted.extend((piece, len(chain), len(body)) for piece in chain)
+    for piece, length, size in accepted:
+        row = piece["row"]
+        if row["verdict"] != ASSUMED_VERDICT or set(row.get("awaiting") or {}) - set(RODATA):
+            continue
+        spec, declared, _bases, _source = row["_elf_spec"]
+        report["rows_rechecked"] += 1
+        verdict = strict_compare(row["_object"], target.rom, target.vram_to_rom, row["target_vram"], row["size"],
+                                 declared, {piece["name"]: piece["address"]}, None, function_starts)
+        if verdict.verdict == "exact" and verdict.text_equal and not verdict.assumptions:
+            row["verdict"] = EXACT_VERDICT
+            row["strict"] = verdict.as_dict()
+            row.pop("awaiting", None)
+            row.setdefault("corroborated", {})[piece["name"]] = (
+                f"one of {length} read-only sections lying end to end over {size} bytes, each at the address "
+                f"its own code points to")
+            report["promoted"] += 1
+    return report
+
+
 def select_rows(rows: list[dict]) -> list[dict]:
     """Keep non-overlapping exact rows (largest first); overlapped exact rows become ``superseded``."""
     taken: list[tuple[int, int]] = []
@@ -1069,11 +1216,13 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
         return any(a < vram + size and vram < b for a, b in skip)
     todo = [f for f in functions if not skipped(f[1], f[2])]
     hits = scan(target.rom, target.delta, todo, index, near_max)
+    placed_by_order = corroborate(hits, functions, source_order(index))
     xfer = transfer(hits)
     starts = {v for _n, v, _s in functions}
     jobs_list, partial = plan(hits, target.rom, target.delta, starts)
     t_scan = time.time() - t0
     rows: list[dict] = []
+    settled = None
     if verify and jobs_list:
         # one job per target unit address: try donors in order until one is exact
         by_addr: dict[int, list[Job]] = defaultdict(list)
@@ -1099,7 +1248,10 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
                 return best
             with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
                 rows = list(pool.map(attempt, by_addr.values()))
-        rows = select_rows(rows)
+            rows = select_rows(rows)
+            settled = settle_rodata(rows, target, starts | (other_starts or set()))
+        for row in rows:
+            row.pop("_object", None)
     t_verify = time.time() - t0 - t_scan
     # symbol transfer precision against the target catalogue (calls) and symbol file (data)
     precision = {"calls": 0, "calls_at_function_start": 0, "data": 0, "data_at_known_symbol": 0,
@@ -1141,8 +1293,11 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
         "functions_recovered": len({v for r in exact_rows for v in starts if r["target_vram"] <= v < r["target_vram"] + r["size"]}),
         "mismatch_causes": dict(Counter(r.get("cause", "?") for r in rows if r["verdict"] == "mismatch")),
         "template_units_exact": sum(1 for r in exact_rows if r.get("template")),
+        "placed_by_source_order": placed_by_order,
+        "near_units_verified": sum(1 for h in hits if h.kind == "near" and h.status == "candidate"),
         "bytes_recovered": sum(r["size"] for r in exact_rows),
         "data_unverified_units": sum(1 for r in exact_rows if r.get("data_unverified")),
+        "rodata_settlement": settled,
         "symbol_transfer": {"symbols": len(xfer["symbols"]), "contradictions": len(xfer["contradictions"]),
                             "suspicious": len(xfer["suspicious"]), "precision": precision},
         "timing_s": {"scan": round(t_scan, 2), "verify": round(t_verify, 2)},

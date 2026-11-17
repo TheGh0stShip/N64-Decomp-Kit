@@ -107,7 +107,7 @@ def stored_tally(run_out: Path, images: dict) -> dict | None:
     from ..match import resolve as resolvemod
     if not (run_out / "state" / "cases.sqlite").is_file():
         return None
-    store = resolvemod.CaseStore(run_out / "state")
+    store = resolvemod.CaseStore(run_out / "state", readonly=True)
     try:
         cases = store.all()
     finally:
@@ -159,7 +159,7 @@ def diagnosis(run_out: Path, images: dict) -> dict | None:
             unknown[name] = [(int(row["start"], 16), int(row["end"], 16)) for row in found]
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    store = resolvemod.CaseStore(run_out / "state")
+    store = resolvemod.CaseStore(run_out / "state", readonly=True)
     try:
         cases = store.all()
     finally:
@@ -279,6 +279,19 @@ def offer_trees(row: dict, trees: list[Path], out: Path, donors: str | None, too
 @command("decompile-batch", "Run decompile-init and decompile-run over a set of ROMs, one at a time, sharing every "
                             "strictly exact function between them through a library")
 def decompile_batch(args):
+    """One heavy job at a time, with a preflight and a lease (see ``n64dk.safety``); every
+    title's run shares them."""
+    import sys
+    from .. import safety
+    try:
+        with safety.heavy_job("decompile-batch", Path(args.out), wait_for_lock=getattr(args, "wait_for_lock", False),
+                              force=getattr(args, "force_resources", False), argv=sys.argv[1:]):
+            return _decompile_batch(args)
+    except safety.Busy as error:
+        raise SystemExit(str(error)) from None
+
+
+def _decompile_batch(args):
     if args.donors and not Path(args.donors).is_file():
         # A file named on the command line that is not there is the operator's mistake, not a
         # condition of one title: every title would run without donors and report nothing.
@@ -310,6 +323,8 @@ def decompile_batch(args):
                 "--budget", str(args.budget)]
         if args.max_size:
             argv += ["--max-size", hex(args.max_size)]
+        if getattr(args, "search_economics", False):
+            argv += ["--search-economics"]
         if row.get("donors") or args.donors:
             argv += ["--donors", str(Path(row.get("donors") or args.donors).resolve())]
         if args.toolchain_dir:
@@ -389,6 +404,8 @@ def _args(p):
                    help="functions sampled per title to measure its recipe")
     p.add_argument("--budget", type=int, default=100, help="maximum builds per function")
     p.add_argument("--max-size", type=lambda s: int(s, 0), default=0, help="largest function attempted (0: no limit)")
+    p.add_argument("--search-economics", action="store_true",
+                   help="stop searching strata whose searches have returned nothing (see decompile-run)")
     p.add_argument("--workers", type=int, help="worker processes of each run")
     p.add_argument("--refine-command", help="refiner asked about the cases each run leaves (see decompile-run)")
     p.add_argument("--refine-jobs", type=int)
@@ -397,4 +414,10 @@ def _args(p):
     p.add_argument("--force-init", action="store_true", help="survey every ROM again even when its project exists")
 
 
-decompile_batch.arguments = _args
+def _all_args(p):
+    from .run import _guard_arguments
+    _args(p)
+    _guard_arguments(p)
+
+
+decompile_batch.arguments = _all_args

@@ -32,6 +32,18 @@ def _copy(source: Path, target: Path, replacements) -> None:
         shutil.copyfile(source, target)
 
 
+def reproduced_by(outcome: str, disassembled: bool) -> str:
+    """What reproduces a function in the export.  Only a matched outcome is C; a function the
+    export covers with generated (disassembled) assembly is ``assembly (not decompiled)``, never C."""
+    if outcome.startswith("donor-assembly"):
+        return "assembly (donor source)"
+    if outcome == "assembly":
+        return "assembly (hand-written)"
+    if outcome in MATCHED:
+        return "C"
+    return "assembly (not decompiled)" if disassembled else "nothing"
+
+
 def _origin(case) -> str:
     """How a case was matched, from its own record."""
     kinds = [stage.get("stage") for stage in case.stages]
@@ -145,7 +157,7 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     replacements = sorted({(str(run), "<run>"), (str(project), "<project>"), (str(Path.home()), "<home>")},
                           key=lambda pair: -len(pair[0]))
     registry = imagemod.load_registry(project)
-    store = resolvemod.CaseStore(run / "state")
+    store = resolvemod.CaseStore(run / "state", readonly=True)
     try:
         cases = {(case.image, case.vram): case for case in store.all()}
         sources = {key: store.source(case.best_digest) for key, case in cases.items()
@@ -179,9 +191,12 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                         outcome = ("donor-assembly" if kind == "donor" else
                                    "donor-assembly-awaiting-symbols") if source_kind == "assembly" else kind
                         donated.setdefault(int(vram), (outcome, str(row.get("donor")), unit, source_kind))
+        scope_file = run / "state" / f"scope_{name}.json"
+        left_out = ({int(item["vram"], 16): item["reason"] for item in json.loads(scope_file.read_text())["left_out"]}
+                    if scope_file.is_file() else {})
         for function, vram, size in spec.rows():
             case = cases.get((name, vram))
-            outcome, how, path, score, code_size = "not attempted", "", "", "", size
+            outcome, how, path, score, code_size = "not attempted", left_out.get(vram, ""), "", "", size
             if vram in donated:
                 outcome, donor, unit, _source_kind = donated[vram]
                 how = f"donor unit {donor}: {unit}"
@@ -229,17 +244,10 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     reproduced = {"C": 0, "assembly (donor source)": 0, "assembly (hand-written)": 0,
                   "assembly (not decompiled)": 0, "nothing": 0}
     for row in rows:
-        if row[6].startswith("donor-assembly"):
-            kind = "assembly (donor source)"
-        elif row[6] == "assembly":
-            kind = "assembly (hand-written)"
-        elif row[6] in MATCHED:
-            kind = "C"
-        else:
-            found = disassembled.get((row[0], int(row[2], 16)))
-            kind = "assembly (not decompiled)" if found else "nothing"
-            if found:
-                row[8] = found
+        found = None if row[6] in MATCHED else disassembled.get((row[0], int(row[2], 16)))
+        kind = reproduced_by(row[6], bool(found))
+        if found:
+            row[8] = found
         reproduced[kind] += 1
         row.append(kind)
     header = "image\tfunction\tvram\trom_offset\tsize\tcode_size\toutcome\thow\tsource\tdistance\treproduced_by\n"
@@ -286,7 +294,8 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                "assembly": "hand-written code: assembly source that assembles to the same bytes",
                "near": "best draft within ten differences", "open": "best draft further away",
                "does-not-build": "no draft compiles", "blocked-boundary": "the catalogued range is not one whole function",
-               "not attempted": "outside the size limit of the run, or the run was cut short"}
+               "not attempted": "left out by the run's settings (the recipe column says which: size limit, sample, "
+                                "name set) or the run was cut short"}
     for key in order:
         if counts.get(key):
             readme.append(f"| {key} | {counts[key]:,} | {meaning.get(key, '')} |")

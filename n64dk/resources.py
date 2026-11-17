@@ -17,6 +17,8 @@ from pathlib import Path
 
 
 DEFAULT_MAX_JOBS = 4
+SMALL_MACHINE_MB = 12288      # below this much memory in all, the default ceiling is two jobs
+SMALL_MACHINE_JOBS = 2
 DEFAULT_RESERVE_MB = 2048
 DEFAULT_JOB_MB = 512
 
@@ -87,7 +89,9 @@ def plan_jobs(requested: int | None = 0, *, snapshot: MemorySnapshot | None = No
     memory = snapshot or memory_snapshot()
     cpus = max(1, os.cpu_count() or 1)
     raw = cpus if not requested or requested < 1 else requested
-    ceiling = max_jobs or _positive_env("N64DK_MAX_JOBS", DEFAULT_MAX_JOBS)
+    default = (SMALL_MACHINE_JOBS if memory.total_mb is not None and memory.total_mb < SMALL_MACHINE_MB
+               else DEFAULT_MAX_JOBS)
+    ceiling = max_jobs or _positive_env("N64DK_MAX_JOBS", default)
     reserve = reserve_mb or _positive_env("N64DK_MEMORY_RESERVE_MB", DEFAULT_RESERVE_MB)
     per_job = memory_per_job_mb or _positive_env("N64DK_MEMORY_PER_JOB_MB", DEFAULT_JOB_MB)
     oversubscribe = os.environ.get("N64DK_ALLOW_OVERSUBSCRIBE", "").lower() in {"1", "true", "yes"}

@@ -206,13 +206,15 @@ def _source_jobs(spec: dict, tc: dict, scratch: Path) -> list[Job]:
 
 def _run_sn(job: Job, sn: Path) -> None:
     pre, asm, psyq = job.output.with_suffix(".i"), job.output.with_suffix(".s"), job.output.with_suffix(".obj")
+    from .. import safety
     run = dict(cwd=job.cwd, check=True, capture_output=True)
-    subprocess.run(["gcc", "-E", "-P", "-undef", "-D__GNUC__=2", "-D__GNUC_MINOR__=8",
+    safety.run_tool(["gcc", "-E", "-P", "-undef", "-D__GNUC__=2", "-D__GNUC_MINOR__=8",
                     *[a for a in job.argv if a.startswith(("-I", "-D"))], str(job.source), "-o", str(pre)], **run)
-    subprocess.run([str(sn / "wibo"), str(sn / "cc1n64.exe"), "-quiet",
-                    *[a for a in job.argv if not a.startswith(("-I", "-D"))], str(pre), "-o", str(asm)], **run)
-    subprocess.run([str(sn / "wibo"), str(sn / "asn64.exe"), "-o", str(psyq), str(asm)], **run)
-    subprocess.run([str(sn / "psyq-obj-parser"), str(psyq), "-b", "-n", "-o", str(job.output)], **run)
+    safety.run_tool([str(sn / "wibo"), str(sn / "cc1n64.exe"), "-quiet",
+                    *[a for a in job.argv if not a.startswith(("-I", "-D"))], str(pre), "-o", str(asm)], kind="legacy",
+                    **run)
+    safety.run_tool([str(sn / "wibo"), str(sn / "asn64.exe"), "-o", str(psyq), str(asm)], kind="legacy", **run)
+    safety.run_tool([str(sn / "psyq-obj-parser"), str(psyq), "-b", "-n", "-o", str(job.output)], **run)
 
 
 def _run(job: Job, tc: dict) -> tuple[Job, str | None]:
@@ -222,7 +224,9 @@ def _run(job: Job, tc: dict) -> tuple[Job, str | None]:
             _run_sn(job, Path(tc["sn"]))
         else:
             env = dict(os.environ, **job.env)
-            subprocess.run(job.argv, cwd=job.cwd, env=env, check=True, capture_output=True, timeout=300)
+            from .. import safety
+            safety.run_tool(job.argv, kind="compile", cwd=job.cwd, env=env, check=True, capture_output=True,
+                            timeout=300)
         return job, None
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         err = getattr(exc, "stderr", b"") or b""

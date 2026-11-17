@@ -114,8 +114,23 @@ class ScanTransferTest(unittest.TestCase):
         image = image_with(self.delta, {0x80200100: target})
         hits = tp.scan(image, self.delta, [("t_f", 0x80200100, len(target))], self.index(unit))
         self.assertEqual([(h.kind, h.diffs) for h in hits], [("near", [5])])
+        self.assertFalse(hits[0].lost_lo)                              # a0 is no lui's register
         jobs, _partial = tp.plan(hits, image, self.delta)
         self.assertEqual(jobs, [])                                      # never transplanted
+
+    def test_a_near_hit_where_only_a_lost_lo_half_differs_is_verified(self):
+        # (the scan sets lost_lo when every differing word is a load/store/addiu immediate on a
+        # register some lui of the function sets; the near test above, on a pointer argument, is not)
+        unit = make_unit([("donor_f", donor_fn(0x8012, 0x3456, 0x80101000))], 0x80100000)
+        target = donor_fn(0x8012, 0x3456, 0x80101000)
+        image = image_with(self.delta, {0x80200100: target})
+        near = tp.Hit("t_f", 0x80200100, len(target), unit, unit["functions"][0], "near", [3], status="near",
+                      lost_lo=True)
+        jobs, _partial = tp.plan([near], image, self.delta)
+        self.assertEqual([job.vram for job in jobs], [0x80200100])
+        self.assertEqual(near.status, "candidate")
+        ordinary = tp.Hit("t_f", 0x80200100, len(target), unit, unit["functions"][0], "near", [5], status="near")
+        self.assertEqual(tp.plan([ordinary], image, self.delta)[0], [])
 
     def test_contradiction_marks_hits_for_review(self):
         a = make_unit([("fa", donor_fn(0x8012, 0x3456, 0x80101000))], 0x80100000, source="a.c")
@@ -257,6 +272,34 @@ class CommonShapeTest(unittest.TestCase):
         self.assertFalse(tp.common_shape([]))
 
 
+class SourceOrderTest(unittest.TestCase):
+    """A shape found at several places is placed by the functions written around it."""
+
+    def hit(self, function, unit_source, vram):
+        unit = {"donor": "T", "source": unit_source, "functions": [function]}
+        site = {"donor_symbol": "s", "donor_address": 1, "target_address": 2, "addend": 0, "kind": "lo", "index": 0}
+        function.setdefault("vram", 0x80100000)
+        return tp.Hit(function["name"], vram, 8, unit, function, "exact", sites=[site])
+
+    def test_a_repeated_shape_is_placed_next_to_its_uniquely_found_neighbour(self):
+        first, getter, other_getter = {"name": "first"}, {"name": "get"}, {"name": "get2"}
+        order = {("T", "u/first.c"): ("u.c", 0), ("T", "u/get.c"): ("u.c", 1), ("T", "v/get2.c"): ("v.c", 0)}
+        functions = [("a", 0x100, 8), ("b", 0x108, 8), ("c", 0x200, 8)]
+        hits = [self.hit(first, "u/first.c", 0x100),
+                self.hit(getter, "u/get.c", 0x108), self.hit(getter, "u/get.c", 0x200),        # same shape twice
+                self.hit(other_getter, "v/get2.c", 0x108), self.hit(other_getter, "v/get2.c", 0x200)]
+        self.assertEqual(tp.corroborate(hits, functions, order), 1)
+        self.assertEqual([(h.function["name"], h.vram) for h in hits if h.placed], [("get", 0x108)])
+        tp.transfer(hits)
+        self.assertEqual([(h.function["name"], h.vram, h.template) for h in hits[1:]],
+                         [("get", 0x108, False), ("get", 0x200, True), ("get2", 0x108, True), ("get2", 0x200, True)])
+
+    def test_nothing_is_placed_without_an_order(self):
+        getter = {"name": "get"}
+        hits = [self.hit(getter, "u/get.c", 0x108), self.hit(getter, "u/get.c", 0x200)]
+        self.assertEqual(tp.corroborate(hits, [("b", 0x108, 8), ("c", 0x200, 8)], {}), 0)
+
+
 class AlternativesTest(unittest.TestCase):
     def job(self, donor, source, functions=1, masked="m", flags=("-O2",), pipeline="kmc+as"):
         unit = {"donor": donor, "source": source, "functions": [{}] * functions, "unit_masked": masked,
@@ -305,3 +348,98 @@ class AssumedRowsTest(unittest.TestCase):
         found = tp.transfer(hits)["definitions"]
         self.assertEqual(found.get(("D", 0x80200100)), {0x80001000})
         del caller
+
+
+class RodataSettlementTest(unittest.TestCase):
+    """Rows that wait only for their read-only section's address are settled by chains of units
+    lying end to end; a lone small constant confirms nothing."""
+
+    class _Target:
+        def __init__(self, rom):
+            self.rom = rom
+
+        @staticmethod
+        def vram_to_rom(address):
+            return address - 0x80000000
+
+    def _piece(self, address, size, align=8):
+        return {"address": address, "size": size, "align": align, "name": ".rodata", "row": {}}
+
+    def test_chains_follow_alignment_and_zero_gaps(self):
+        from n64dk.match import transplant
+        rom = bytearray(0x100)
+        rom[0x14:0x18] = b"\x01\x02\x03\x04"                 # non-zero gap byte region
+        pieces = [self._piece(0x80000000, 4), self._piece(0x80000008, 8), self._piece(0x80000010, 4),
+                  self._piece(0x80000018, 4)]
+        chains = transplant.rodata_chains(pieces, bytes(rom), self._Target.vram_to_rom)
+        # 0x00..0x04 then (aligned to 8) 0x08..0x10 then 0x10..0x14; 0x18 is aligned too but the
+        # gap 0x14..0x18 is not zero
+        self.assertEqual([[p["address"] - 0x80000000 for p in chain] for chain in chains], [[0, 8, 0x10], [0x18]])
+
+    def test_a_lone_float_is_not_promoted_and_a_chain_is(self):
+        from unittest import mock
+        from n64dk.match import transplant
+        from n64dk.match.verify import Verdict
+        rom = bytearray(0x100)
+        rom[0:4] = b"\x45\x1e\xc0\x00"
+        rom[8:16] = b"\x3f\x80\x00\x01\x40\x20\x10\x08"             # 9 non-zero bytes in all
+        def row(base, size, waiting=True):
+            return {"verdict": transplant.ASSUMED_VERDICT if waiting else transplant.EXACT_VERDICT,
+                    "awaiting": {".rodata": f"0x{base:08X}"} if waiting else None, "target_vram": base, "size": 8,
+                    "strict": {"sections": [{"section": ".rodata", "base": f"0x{base:08X}", "size": size,
+                                             "compared": size, "status": "equal"}]},
+                    "_object": object(), "_elf_spec": (None, {}, {}, None)}
+        alone = [row(0x80000000, 4)]
+        found = mock.patch.object(transplant.cmp, "find_section",
+                                  lambda elf, name: type("S", (), {"align": 8, "name": name})())
+        exact = mock.patch("n64dk.match.verify.strict_compare",
+                           lambda *a, **k: Verdict("exact", True, sections=[]))
+        with found, exact:
+            report = transplant.settle_rodata(alone, self._Target(bytes(rom)), set())
+            self.assertEqual(report["promoted"], 0)
+            self.assertEqual(alone[0]["verdict"], transplant.ASSUMED_VERDICT)
+            both = [row(0x80000000, 4), row(0x80000008, 8, waiting=False)]
+            report = transplant.settle_rodata(both, self._Target(bytes(rom)), set())
+        self.assertEqual((report["chains"], report["promoted"]), (1, 1))
+        self.assertEqual(both[0]["verdict"], transplant.EXACT_VERDICT)
+        self.assertIn("end to end", both[0]["corroborated"][".rodata"])
+
+    def test_the_strict_verdict_still_decides(self):
+        from unittest import mock
+        from n64dk.match import transplant
+        from n64dk.match.verify import Verdict
+        rom = bytearray(0x100)
+        rom[0:8] = b"\x45\x1e\xc0\x00\x41\x00\x00\x00"
+        rom[8:16] = b"\x3f\x80\x00\x01\x40\x20\x10\x08"
+        rows = []
+        for base in (0x80000000, 0x80000008):
+            rows.append({"verdict": transplant.ASSUMED_VERDICT, "awaiting": {".rodata": f"0x{base:08X}"},
+                         "target_vram": base, "size": 8, "_object": object(), "_elf_spec": (None, {}, {}, None),
+                         "strict": {"sections": [{"section": ".rodata", "base": f"0x{base:08X}", "size": 8,
+                                                  "compared": 8, "status": "equal"}]}})
+        with mock.patch.object(transplant.cmp, "find_section",
+                               lambda elf, name: type("S", (), {"align": 8, "name": name})()), \
+                mock.patch("n64dk.match.verify.strict_compare",
+                           lambda *a, **k: Verdict("mismatch", False, sections=[])):
+            report = transplant.settle_rodata(rows, self._Target(bytes(rom)), set())
+        self.assertEqual((report["chains"], report["rows_rechecked"], report["promoted"]), (1, 2, 0))
+        self.assertTrue(all(r["verdict"] == transplant.ASSUMED_VERDICT for r in rows))
+
+
+class RodataThresholdTest(unittest.TestCase):
+    def test_adjacent_pieces_with_few_nonzero_bytes_confirm_nothing(self):
+        from unittest import mock
+        from n64dk.match import transplant
+        rom = bytearray(0x40)
+        rom[0:4] = b"\x45\x1e\xc0\x00"
+        rom[8:16] = b"\x3f\x80\x00\x00\x40\x00\x00\x00"          # 6 non-zero bytes over 16
+        rows = [{"verdict": transplant.ASSUMED_VERDICT, "awaiting": {".rodata": f"0x{base:08X}"}, "target_vram": base,
+                 "size": 8, "_object": object(), "_elf_spec": (None, {}, {}, None),
+                 "strict": {"sections": [{"section": ".rodata", "base": f"0x{base:08X}", "size": size,
+                                          "compared": size, "status": "equal"}]}}
+                for base, size in ((0x80000000, 4), (0x80000008, 8))]
+        target = RodataSettlementTest._Target(bytes(rom))
+        with mock.patch.object(transplant.cmp, "find_section",
+                               lambda elf, name: type("S", (), {"align": 8, "name": name})()):
+            report = transplant.settle_rodata(rows, target, set())
+        self.assertEqual((report["chains"], report["promoted"]), (0, 0))

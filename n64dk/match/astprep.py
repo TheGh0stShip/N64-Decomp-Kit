@@ -345,9 +345,11 @@ def preprocess(text: str, includes: list[str], defines: list[str]) -> tuple[str,
     timeout = float(os.environ.get("N64DK_AST_CPP_TIMEOUT", "15"))
     for _attempt in range(30):
         try:
-            proc = subprocess.run([cpp, "-P", "-nostdinc", "-undef", *_PP_DEFINES, *defines,
-                                   *[f"-I{p}" for p in includes], "-"],
-                                  input="\n".join(lines), capture_output=True, text=True, timeout=timeout)
+            from .. import safety
+            proc = safety.run_tool([cpp, "-P", "-nostdinc", "-undef", *_PP_DEFINES, *defines,
+                                    *[f"-I{p}" for p in includes], "-"],
+                                   kind="light", input="\n".join(lines), capture_output=True, text=True,
+                                   timeout=timeout)
         except subprocess.TimeoutExpired:
             raise PrepError("cpp", f"preprocessor timed out after {timeout:g}s") from None
         except OSError as error:

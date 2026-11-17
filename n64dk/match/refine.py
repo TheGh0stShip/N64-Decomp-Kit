@@ -24,6 +24,7 @@ configures the command decides where that text goes.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -70,7 +71,7 @@ class Settings:
     statuses: tuple[str, ...] = STATUSES
     max_size: int = 0x400
     max_cases: int = 0                    # 0: no limit
-    jobs: int = 4
+    jobs: int = 1                         # model work runs one case at a time unless configured otherwise
     max_score: int = 0                    # 0: no limit; otherwise only cases at most this far
     asm_limit: int = 400                  # instructions of target assembly shown
     diff_limit: int = 40                  # differing instructions shown per round
@@ -79,6 +80,7 @@ class Settings:
     output_limit: int = 512 * 1024        # combined stdout/stderr retained from one invocation
     source_limit: int = 256 * 1024        # one returned translation unit
     env: dict = field(default_factory=dict)
+    known_source: list = field(default_factory=list)   # folders of source the author must not be shown
 
     @classmethod
     def from_table(cls, table: dict | None, command: str | None = None) -> "Settings | None":
@@ -92,13 +94,14 @@ class Settings:
             return None
         return cls(command=argv, rounds=int(table.get("rounds", 3)), timeout=float(table.get("timeout", 600)),
                    statuses=tuple(table.get("statuses", STATUSES)), max_size=int(table.get("max_size", 0x400)),
-                   max_cases=int(table.get("max_cases", 0)), jobs=int(table.get("jobs", 4)),
+                   max_cases=int(table.get("max_cases", 0)), jobs=int(table.get("jobs", 1)),
                    max_score=int(table.get("max_score", 0)), asm_limit=int(table.get("asm_limit", 400)),
                    diff_limit=int(table.get("diff_limit", 40)), examples=int(table.get("examples", 3)),
                    prompt_limit=int(table.get("prompt_limit", 512 * 1024)),
                    output_limit=int(table.get("output_limit", 512 * 1024)),
                    source_limit=int(table.get("source_limit", 256 * 1024)),
-                   env={str(k): str(v) for k, v in (table.get("env") or {}).items()})
+                   env={str(k): str(v) for k, v in (table.get("env") or {}).items()},
+                   known_source=[str(v) for v in (table.get("known_source") or [])])
 
     def validate(self) -> None:
         if not self.command or any("\x00" in part for part in self.command):
@@ -124,7 +127,7 @@ class Settings:
                    "statuses": self.statuses, "max_size": self.max_size, "max_score": self.max_score,
                    "asm_limit": self.asm_limit, "diff_limit": self.diff_limit, "examples": self.examples,
                    "prompt_limit": self.prompt_limit, "output_limit": self.output_limit,
-                   "source_limit": self.source_limit,
+                   "source_limit": self.source_limit, "known_source": sorted(self.known_source),
                    "env_digest": hashlib.sha256(json.dumps(self.env, sort_keys=True).encode()).hexdigest()}
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -317,7 +320,8 @@ def build_prompt(name: str, recipe: str, assembly: str, best_source: str | None,
 
 def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, best_source: str | None,
            best_evaluation, causes: list[dict] | None = None, prepare=None, declarations: str = "",
-           emit=None, run=run_command, examples=None, failed_draft: tuple[str, str] | None = None) -> dict:
+           emit=None, run=run_command, examples=None, failed_draft: tuple[str, str] | None = None,
+           cache: Path | None = None, known: "KnownSource | None" = None) -> dict:
     """Converse about one function.  ``evaluate(text) -> (Evaluation, code)``; ``prepare(text)``
     turns an answer into a buildable unit (typedef prelude).  Returns ``{"rounds", "calls",
     "errors", "best_source", "best", "improved", "history"}`` where ``best`` is the Evaluation of
@@ -332,6 +336,7 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
     start = rank(best)
     attempts: list[tuple[str, str]] = []
     history, calls, errors = [], 0, []
+    cost = {"calls": 0, "cached": 0, "seconds": 0.0, "prompt_bytes": 0, "answer_bytes": 0}
     for round_number in range(1, settings.rounds + 1):
         prompt = build_prompt(name, recipe, assembly, best_text,
                               describe_evaluation(best, settings.diff_limit) if best_text else "",
@@ -341,13 +346,34 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
             errors.append(f"prompt exceeds the {settings.prompt_limit}-byte limit")
             history.append({"round": round_number, "error": errors[-1]})
             break
+        if known is not None and known.leaks(prompt):
+            # a blind evaluation must not show the author the source it is asked to find
+            errors.append("the prompt holds known source text; not sent")
+            history.append({"round": round_number, "error": errors[-1]})
+            break
         calls += 1
+        key = hashlib.sha256((settings.signature() + "\0" + prompt).encode()).hexdigest()
+        cached = cache / f"{key}.txt" if cache is not None else None
         try:
-            # The configured executable is trusted code and still has the user's OS permissions,
-            # but it should not receive the project checkout as its accidental working directory.
-            with tempfile.TemporaryDirectory(prefix="n64dk-refiner-") as cwd:
-                answer = run(settings.command, prompt, settings.timeout, settings.env, cwd=cwd,
-                             output_limit=settings.output_limit)
+            if cached is not None and cached.is_file():
+                answer = cached.read_text()
+                cost["cached"] += 1
+            else:
+                # The configured executable is trusted code and still has the user's OS permissions,
+                # but it should not receive the project checkout as its accidental working directory.
+                began = time.monotonic()
+                from .. import safety
+                with safety.token("model"), tempfile.TemporaryDirectory(prefix="n64dk-refiner-") as cwd:
+                    # model calls: a machine-wide capacity of one (N64DK_TOKENS_MODEL)
+                    answer = run(settings.command, prompt, settings.timeout, settings.env, cwd=cwd,
+                                 output_limit=settings.output_limit)
+                cost["calls"] += 1
+                cost["seconds"] += time.monotonic() - began
+                cost["prompt_bytes"] += len(prompt.encode())
+                cost["answer_bytes"] += len(answer.encode())
+                if cached is not None:
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    cached.write_text(answer)
         except RefineError as error:
             errors.append(str(error))
             history.append({"round": round_number, "error": str(error)[-200:]})
@@ -369,6 +395,11 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
         result = describe_evaluation(evaluation, settings.diff_limit)
         attempts.append((candidate, result))
         history.append({"round": round_number, "score": evaluation.score, "exact": bool(evaluation.exact)})
+        if known is not None:
+            share = known.share(candidate)
+            if share >= KNOWN_SHARE:
+                # the author reproduced published source: a recollection, not a blind recovery
+                history[-1]["known_source_share"] = round(share, 3)
         if emit:
             emit({"event": "refine-round", "name": name, "round": round_number, "score": evaluation.score,
                   "exact": bool(evaluation.exact)})
@@ -377,7 +408,57 @@ def refine(name: str, settings: Settings, evaluate, assembly: str, recipe: str, 
         if evaluation.exact or (evaluation.score == 0):
             break
     return {"rounds": len(history), "calls": calls, "errors": errors, "best_source": best_text, "best": best,
-            "improved": rank(best) < start, "history": history}
+            "improved": rank(best) < start, "history": history, "cost": {**cost, "seconds": round(cost["seconds"], 2)},
+            "known_source": any("known_source_share" in item for item in history)}
+
+
+KNOWN_SHARE = 0.5          # an answer whose body lines are at least this much known source is flagged
+_KNOWN_LINE_MIN = 24       # lines shorter than this (braces, "return 0;") say nothing
+
+
+def _normal_line(line: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"/\*.*?\*/|//.*$", "", line)).strip()
+
+
+class KnownSource:
+    """Lines of source that a blind evaluation must not show the author, and against which
+    answers are checked for recollection.  Built from directories of C (an imported tree's
+    split sources); only lines of at least ``_KNOWN_LINE_MIN`` characters inside function bodies
+    count, so shared declarations and boilerplate do not."""
+
+    def __init__(self, lines: set[str]):
+        self.lines = lines
+
+    @classmethod
+    def from_directories(cls, folders) -> "KnownSource":
+        lines: set[str] = set()
+        for folder in folders:
+            for path in Path(folder).rglob("*.c"):
+                try:
+                    text = path.read_text(errors="replace")
+                except OSError:
+                    continue
+                lines.update(cls._body_lines(text))
+        return cls(lines)
+
+    @staticmethod
+    def _body_lines(text: str) -> set[str]:
+        out, depth = set(), 0
+        for raw in text.splitlines():
+            line = _normal_line(raw)
+            if depth > 0 and len(line) >= _KNOWN_LINE_MIN:
+                out.add(line)
+            depth += raw.count("{") - raw.count("}")
+            depth = max(depth, 0)
+        return out
+
+    def share(self, source: str) -> float:
+        body = self._body_lines(source)
+        return len(body & self.lines) / len(body) if body else 0.0
+
+    def leaks(self, prompt: str) -> bool:
+        return any(_normal_line(line) in self.lines for line in prompt.splitlines()
+                   if len(_normal_line(line)) >= _KNOWN_LINE_MIN)
 
 
 # ---------------------------------------------------------------------------------------------

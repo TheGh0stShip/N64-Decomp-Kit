@@ -290,3 +290,38 @@ class DeadReturnTest(unittest.TestCase):
         before = len(cat.functions)
         self.assertEqual(functions.merge_dead_returns(cat, data, self.VRAM), {"merged": 0, "debug_build": False})
         self.assertEqual(len(cat.functions), before)
+
+
+class MappedImagePointerCodeTest(unittest.TestCase):
+    """A program run through the TLB at 0x00200400 whose functions are reached only through a
+    method table: calls inside it are valid, and every function after a function's end with a
+    frame is catalogued."""
+
+    def test_functions_reached_through_pointers_are_found(self):
+        from n64dk.analysis import functions as F
+        base = 0x00200400
+        nop, jr_ra = 0, 0x03E00008
+        entry = [jr_ra, nop]                                            # 0x200400
+        method = [addiu(29, 29, -24), sw(31, 20, 29), jal(base + 0x48), nop,
+                  lw(31, 20, 29), jr_ra, addiu(29, 29, 24), nop]       # 0x200408 (last word: padding)
+        method2 = [addiu(29, 29, -32), sw(31, 28, 29), jal(base + 0x48), nop,
+                   lw(31, 28, 29), jr_ra, addiu(29, 29, 32), nop]      # 0x200428
+        leaf = [jr_ra, nop]                                             # 0x200448
+        words = entry + method + method2 + leaf + [0] * 16
+        data = b"".join(w.to_bytes(4, "big") for w in words)
+        image = F.Image(data, base)
+        analyser = F.Analyser(image, base, text_lo=base)
+        analyser.add(base, "entry")
+        analyser.grow()
+        self.assertEqual(set(analyser.starts), {base})                 # no call reaches the methods
+        self.assertTrue(analyser.walk(base + 8, image.end, strict=True).ok)   # mapped calls are valid
+        self.assertEqual(analyser.prologue_seeds(base, image.end), 2)
+        self.assertEqual({a for a, seed in analyser.starts.items() if seed == "prologue"}, {base + 0x8, base + 0x28})
+
+    def test_a_prologue_inside_straight_code_is_not_a_start(self):
+        from n64dk.analysis import functions as F
+        base = 0x80000400
+        words = [addiu(29, 29, -24), lui(2, 0x8000), addiu(29, 29, -8), 0x03E00008, addiu(29, 29, 32)] + [0] * 4
+        image = F.Image(b"".join(w.to_bytes(4, "big") for w in words), base)
+        self.assertFalse(F._after_function_end(image, base + 8))
+        self.assertTrue(F._after_function_end(image, base + 20))       # after jr ra and its delay slot

@@ -161,9 +161,13 @@ class Image:
             return True
         if i.isJumpWithAddress():
             t = i.getInstrIndexAsVram()
-            # Outside RDRAM, or into the first 8 KiB below the image (RSP IMEM-style
-            # targets of microcode embedded in the segment).
-            if not 0x80000000 <= t < 0x80800000 or (t < 0x80002000 and t not in self):
+            # Outside the 8 MiB window the image runs in (RDRAM through KSEG0, or the mapped
+            # region of a program run through the TLB), or into the first 8 KiB of KSEG0 below
+            # the image (RSP IMEM-style targets of microcode embedded in the segment).
+            window = self.vram & 0xFF800000
+            if not window <= t < window + 0x800000 and t not in self:
+                return False
+            if window == 0x80000000 and t < 0x80002000 and t not in self:
                 return False
         # Compilers never write $zero except through the canonical nop, and never emit a
         # branch on $zero that can never be taken.
@@ -209,7 +213,21 @@ def _simm(ins) -> int:
     return v - 0x10000 if v & 0x8000 else v
 
 
-WEAK_SEEDS = ("tail", "pointer", "data_pointer", "sweep")     # starts no call vouches for
+WEAK_SEEDS = ("tail", "pointer", "data_pointer", "sweep", "prologue")     # starts no call vouches for
+JR_RA = 0x03E00008
+
+
+def _after_function_end(img: "Image", at: int, padding: int = 7) -> bool:
+    """A function ends right before ``at``: a ``jr ra`` or ``j`` and its delay slot, then at most
+    ``padding`` zero words."""
+    def ends(word):
+        return word == JR_RA or word >> 26 == 2
+    q = at
+    while q - 4 >= img.vram and img.word(q - 4) == 0 and at - q < 4 * padding:
+        q -= 4
+    if q < at and q - 4 >= img.vram and ends(img.word(q - 4)):     # its delay slot was a nop
+        return True
+    return q - 8 >= img.vram and ends(img.word(q - 8))
 
 
 class Analyser:
@@ -390,6 +408,21 @@ class Analyser:
             return False
         self.starts[v] = seed
         return True
+
+    def prologue_seeds(self, lo: int, hi: int) -> int:
+        """Seed every stack-frame prologue (``addiu sp, sp, -N``) in [lo, hi) that follows the end
+        of a function and walks strictly as one.  Code reached only through pointers the analysis
+        cannot resolve (method tables, callbacks) is otherwise never catalogued."""
+        added = 0
+        for at in range(lo + (-lo % 4), hi, 4):
+            word = self.img.word(at)
+            if word >> 16 != 0x27BD or not word & 0x8000 or at in self.starts:
+                continue
+            if any(x <= at < y for x, y in self.data_regions) or not _after_function_end(self.img, at):
+                continue
+            if self.walk(at, hi, strict=True).ok and self.add(at, "prologue"):
+                added += 1
+        return added
 
     # -- driver ------------------------------------------------------------------------------
     def grow(self, seeds_ok=lambda v: True) -> None:
@@ -580,8 +613,17 @@ def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds
     for seed in seeds:
         if image.vram <= seed < image.end and seed & 3 == 0:
             an.add(seed, "call")
-    # Phase 1: call closure inside the image.
+    # Phase 1: call closure inside the image, then function-shaped prologues reached only through
+    # pointers.  A conventionally linked KSEG0 image may contain a non-CPU block after its first
+    # text run (Madden's embedded RSP boot code is one example), so do not let an unrelated
+    # prologue-looking word beyond the established text bypass the evidence-backed extension
+    # pass below.  A TLB-mapped program has no KSEG0 text boundary to lean on; for those images
+    # the complete mapped image is the conservative search domain.
     an.grow()
+    call_text_end = an.find_text_end()
+    mapped = not 0x80000000 <= image.vram < 0x80800000
+    if mapped and an.prologue_seeds(an.text_lo, image.end):
+        an.grow()
     text_end = an.find_text_end()
     extensions: list[Finding] = []
     for _round in range(4):
@@ -589,6 +631,10 @@ def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds
         for s in [s for s in an.starts if s >= text_end]:
             del an.starts[s]
         an.grow(lambda v: v < text_end)
+        # Once the text extent is established (or extended below), callbacks and method-table
+        # entries inside that extent are safe prologue candidates even in a KSEG0 image.
+        if an.prologue_seeds(an.text_lo, text_end):
+            an.grow(lambda v: v < text_end)
         # Phase 2: fill gaps, then pointer seeds from code and data, to a fixpoint.
         for _ in range(8):
             refs = an.code_refs()

@@ -102,8 +102,9 @@ def prove(text: str, code: bytes, vram: int, cfg, names: dict[int, str] | None =
         path, obj = Path(work) / "unit.s", Path(work) / "unit.o"
         path.write_text(text)
         try:
-            done = subprocess.run([assembler, *ASSEMBLER_FLAGS, "-o", str(obj), str(path)], capture_output=True,
-                                  text=True, timeout=60, env={**os.environ, **env})
+            from .. import safety
+            done = safety.run_tool([assembler, *ASSEMBLER_FLAGS, "-o", str(obj), str(path)], kind="light",
+                                   capture_output=True, text=True, timeout=60, env={**os.environ, **env})
         except (OSError, subprocess.TimeoutExpired) as error:
             return {"verdict": "error", "notes": [str(error)[-200:]]}
         if done.returncode != 0 or not obj.is_file():

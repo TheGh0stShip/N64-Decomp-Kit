@@ -72,8 +72,10 @@ class CandidateRecipeTest(unittest.TestCase):
     def test_the_first_recipe_is_also_offered_at_the_other_levels(self):
         from n64dk.commands.sourcedonor import with_levels
         self.assertEqual(with_levels(["ido5.3 -g -mips2", "ido7.1 -O2 -mips2"]),
-                         ["ido5.3 -g -mips2", "ido7.1 -O2 -mips2", "ido5.3 -O2 -mips2", "ido5.3 -O1 -mips2"])
+                         ["ido5.3 -g -mips2", "ido7.1 -O2 -mips2", "ido5.3 -O2 -mips2", "ido5.3 -O1 -mips2",
+                          "ido5.3 -g -mips1"])
         self.assertEqual(with_levels(["kmc+as -O2 -G0"]), ["kmc+as -O2 -G0", "kmc+as -O0 -G0", "kmc+as -O1 -G0"])
+        self.assertEqual(with_levels(["kmc+as -O2 -G0 -mips3"])[-1], "kmc+as -O2 -G0 -mips2")
         self.assertEqual(with_levels([]), [])
 
     def test_recipes_come_from_what_a_run_matched(self):
@@ -89,7 +91,7 @@ class CandidateRecipeTest(unittest.TestCase):
                        [(str(i), status, json.dumps({"recipe": recipe})) for i, (status, recipe) in enumerate(rows)])
         db.commit()
         db.close()
-        self.assertEqual(recipes_of_run(run), ["a -O2", "b -O2", "a -O0", "a -O1"])
+        self.assertEqual(recipes_of_run(run), ["a -O2", "b -O2", "a -O0", "a -O1"])        # no ISA flag: none added
         self.assertEqual(recipes_of_run(run / "missing"), [])
 
 
@@ -110,6 +112,50 @@ class WrittenInCTest(unittest.TestCase):
         # pulled in through the assembler, or only declared: the title's own bytes, not a decompilation
         for label in ("func_80001000", "func_80001004", "call", "nowhere"):
             self.assertFalse(self.tree.defines("a.c", label), label)
+
+
+class StandInTest(unittest.TestCase):
+    """A file the tree's own build generates is missing: a stand-in lets the rest go through."""
+
+    def test_a_missing_file_gets_0_inside_an_initialiser_and_nothing_elsewhere(self):
+        root = tree_of({"a.c": '#include "made_by_the_build.h"\n'
+                               "static unsigned char picture[] = {\n#include \"pictures/face.inc.c\"\n};\n"
+                               "int f(void) { return picture[1]; }\n"})
+        standins = Path(tempfile.mkdtemp(prefix="n64dk-test-standins-"))
+        used = []
+        text = sourcedonor.preprocessed(root / "a.c", "kmc+as", [], [], standins, used)
+        self.assertIsNotNone(text)
+        self.assertEqual(used, [{"file": "made_by_the_build.h", "in_initialiser": False},
+                                {"file": "pictures/face.inc.c", "in_initialiser": True}])
+        self.assertEqual((standins / "pictures" / "face.inc.c").read_text(), "0\n")
+        self.assertIn("int f(void)", text)
+        # without a place for stand-ins the unit does not go through, as before
+        self.assertIsNone(sourcedonor.preprocessed(root / "a.c", "kmc+as", [], []))
+
+    def test_a_name_that_would_leave_the_directory_gets_no_stand_in(self):
+        root = tree_of({"a.c": '#include "../outside.h"\nint f(void) { return 1; }\n'})
+        standins = Path(tempfile.mkdtemp(prefix="n64dk-test-standins-"))
+        self.assertIsNone(sourcedonor.preprocessed(root / "a.c", "kmc+as", [], [], standins, []))
+        self.assertEqual(list(standins.iterdir()), [])
+
+
+class ObjectKeyTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("N64DK_TOOLCHAIN"), "needs the compilers")
+    def test_the_key_follows_the_source_its_headers_the_flags_and_nothing_else(self):
+        from n64dk.match.toolchain import load_config
+        root = tree_of({"a.c": '#include "deep.h"\nint f(void) { return N; }\n', "inc/deep.h": '#include "deeper.h"\n',
+                        "inc/deeper.h": "#define N 1\n"})
+        cfg = load_config(root, None, os.environ["N64DK_TOOLCHAIN"])
+        key = lambda flags=("-O2",): sourcedonor.object_key(root / "a.c", "kmc+as", list(flags), cfg, [root / "inc"])  # noqa: E731
+        first = key()
+        self.assertEqual(key(), first)
+        self.assertNotEqual(key(("-O1",)), first)
+        (root / "inc" / "deeper.h").write_text("#define N 2\n")         # two levels down
+        self.assertNotEqual(key(), first)
+        (root / "unrelated.h").write_text("int x;\n")
+        second = key()
+        (root / "unrelated.h").write_text("int y;\n")
+        self.assertEqual(key(), second)
 
 
 class SelectionTest(unittest.TestCase):
@@ -326,3 +372,44 @@ class WholePathTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinkNameTest(unittest.TestCase):
+    def test_a_symbol_spelled_like_a_number_links(self):
+        """``bb`` alone made the whole donor link fail (ld: --defsym: syntax error)."""
+        import os
+        import shutil
+        from n64dk.match import sourcedonor
+        from n64dk.match.toolchain import load_config
+        try:
+            cfg = load_config(Path(tempfile.mkdtemp(prefix="n64dk-test-link-")), None, os.environ.get("N64DK_TOOLCHAIN"))
+            assembler, env = sourcedonor.tool(cfg, "as")
+        except Exception as error:                          # noqa: BLE001
+            self.skipTest(f"no toolchain: {error}")
+        if not assembler or not Path(str(assembler)).exists():
+            self.skipTest("no assembler")
+        folder = Path(tempfile.mkdtemp(prefix="n64dk-test-link-"))
+        source = folder / "a.s"
+        source.write_text(".set noreorder\n.text\n.globl f\nf:\n jal bb\n nop\n jal fh\n nop\n jr $ra\n nop\n")
+        obj = folder / "a.o"
+        import subprocess
+        done = subprocess.run([assembler, "-EB", "-march=vr4300", "-mabi=32", "-o", str(obj), str(source)],
+                              capture_output=True, text=True, env={**os.environ, **env})
+        if done.returncode:
+            self.skipTest(done.stderr[:200])
+        linked = sourcedonor.link([obj], folder / "out", cfg, place_undefined=True)
+        self.assertNotIn("error", linked, linked.get("error"))
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+class C89PreprocessTest(unittest.TestCase):
+    def test_headers_see_a_c89_compiler(self):
+        folder = Path(tempfile.mkdtemp(prefix="n64dk-test-cpp-"))
+        source = folder / "a.c"
+        source.write_text("#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L\n#define bool _Bool\n"
+                          "#else\ntypedef int bool;\n#endif\nbool flag;\n")
+        for pipeline in ("ido5.3", "kmc+as"):
+            text = sourcedonor.preprocessed(source, pipeline, [], [])
+            if text is None:
+                self.skipTest("no host preprocessor")
+            self.assertNotIn("_Bool", text)

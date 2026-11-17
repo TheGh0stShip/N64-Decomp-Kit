@@ -297,7 +297,22 @@ def _command_for(spec: str) -> tuple[list[str] | None, str]:
     return None, f"{spec}: not found"
 
 
+_LOCATED: dict[tuple, "Discovery"] = {}
+
+
 def locate_m2c(explicit: str | None = None, environ: dict | None = None) -> Discovery:
+    """Cached per (explicit, $N64DK_M2C, PATH, interpreter) for the process's own environment:
+    every draft asks."""
+    if environ is not None:
+        return _locate_m2c(explicit, environ)
+    key = (explicit, os.environ.get(ENV_VAR), os.environ.get("PATH"), sys.executable)
+    found = _LOCATED.get(key)
+    if found is None or found.command is None:
+        found = _LOCATED[key] = _locate_m2c(explicit, None)
+    return found
+
+
+def _locate_m2c(explicit: str | None = None, environ: dict | None = None) -> Discovery:
     """Find m2c: ``explicit`` path/command, then ``$N64DK_M2C``, then ``m2c`` on PATH, then
     next to the running interpreter, then an importable ``m2c`` package.  An explicit or
     environment setting that does not resolve is an error, never silently replaced."""
@@ -404,7 +419,8 @@ def draft(name: str, code: bytes, vram: int, compiler: str = "kmc", context: Pat
         argv += [*(extra or []), str(path)]
         result["command"] = argv
         try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=tmp)
+            from .. import safety
+            done = safety.run_tool(argv, kind="light", capture_output=True, text=True, timeout=timeout, cwd=tmp)
         except subprocess.TimeoutExpired:
             return fail(TIMEOUT, f"m2c timed out after {timeout}s")
         except OSError as exc:

@@ -28,8 +28,8 @@ class Workbench:
         return cls(found)
 
     def version(self) -> str:
-        proc = subprocess.run([self.executable, "--version"], capture_output=True,
-                              text=True, timeout=10)
+        from .. import safety
+        proc = safety.run_tool([self.executable, "--version"], capture_output=True, text=True, timeout=10)
         if proc.returncode:
             raise WorkbenchError(proc.stderr.strip() or "workbench version probe failed")
         return proc.stdout.strip()
@@ -39,7 +39,8 @@ class Workbench:
         command = [self.executable, "diagnose-dumps", str(target), str(candidate), "--json"]
         if function:
             command += ["--function", function]
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        from .. import safety
+        proc = safety.run_tool(command, capture_output=True, text=True, timeout=120)
         if proc.returncode not in (0, 1):
             raise WorkbenchError(proc.stderr.strip() or proc.stdout.strip())
         try:

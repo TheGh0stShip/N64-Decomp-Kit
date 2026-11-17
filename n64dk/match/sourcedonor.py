@@ -27,6 +27,7 @@ and the bytes and relocations agree.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -220,6 +221,67 @@ def always_defined(text: str) -> set[str]:
     return names
 
 
+LICENCE_NAMES = re.compile(r"^(?:licen[cs]e|copying|unlicense|notice)(?:[._-].*)?$", re.I)
+
+
+def provenance(root: Path) -> dict:
+    """Where a source tree came from, read without changing it: its version-control state (no
+    lock, no index refresh), its licence files by digest and first line, and its own digest
+    over the files the importer reads (C and headers)."""
+    root = Path(root)
+    out: dict = {"path": str(root)}
+    if (root / ".git").exists():
+        def git(*args):
+            try:
+                from .. import safety
+                done = safety.run_tool(["git", "--no-optional-locks", "-C", str(root), *args], kind="light",
+                                       capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            return done.stdout.strip() if done.returncode == 0 else None
+        out.update(commit=git("rev-parse", "HEAD"), remote=git("config", "--get", "remote.origin.url"),
+                   commit_date=git("log", "-1", "--format=%cI"))
+        status = git("status", "--porcelain", "--untracked-files=no")
+        out["modified_files"] = None if status is None else len([line for line in status.splitlines() if line.strip()])
+    licences = []
+    for path in sorted(root.iterdir()) if root.is_dir() else []:
+        if path.is_file() and LICENCE_NAMES.match(path.name):
+            data = path.read_bytes()
+            first = next((line.strip() for line in data.decode(errors="replace").splitlines() if line.strip()), "")
+            licences.append({"file": path.name, "sha256": hashlib.sha256(data).hexdigest(), "first_line": first[:120]})
+    out["licence_files"] = licences
+    if not licences:
+        out["licence_note"] = "no licence file at the top of the tree: redistribution terms unknown"
+    digest, count = hashlib.sha256(), 0
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            if name.endswith((".c", ".h", ".inc", ".inc.c", ".def")):
+                path = Path(folder) / name
+                digest.update(str(path.relative_to(root)).encode())
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+                count += 1
+    out.update(source_files=count, source_digest=digest.hexdigest())
+    return out
+
+
+def prepared_copy(source: Path, where: Path, command: str, timeout: int = 1800) -> dict:
+    """Copy ``source`` to ``where`` (version control left out) and run ``command`` there, for a
+    tree whose headers its own build generates.  The tree itself is never written.  Returns what
+    ran and how it ended."""
+    shutil.rmtree(where, ignore_errors=True)
+    shutil.copytree(source, where, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    try:
+        from .. import safety
+        # a tree's own build step (make): one compile token, run serially inside it
+        done = safety.run_tool(["bash", "-c", command], kind="compile", cwd=where, capture_output=True, text=True,
+                               timeout=timeout, env={**os.environ, "MAKEFLAGS": os.environ.get("MAKEFLAGS", "-j1")})
+        result = {"command": command, "exit": done.returncode, "output_tail": (done.stdout + done.stderr)[-800:]}
+    except subprocess.TimeoutExpired:
+        result = {"command": command, "exit": None, "output_tail": f"timed out after {timeout} s"}
+    return result
+
+
 def spread(items: list, count: int) -> list:
     """At most ``count`` of ``items``, evenly spaced."""
     if len(items) <= count:
@@ -306,6 +368,21 @@ def split_recipe(recipe: str) -> tuple[str, list[str]]:
     return parts[0], parts[1:]
 
 
+def object_key(source: Path, pipeline: str, flags: list[str], cfg, includes: list[Path]) -> str:
+    """What an object depends on: the source, every header it reaches (recursively, by content),
+    the include search, the flags and macros, and the compiler's own files.  An object kept under
+    this key is reused only when none of them changed."""
+    from .pipeline import dependency_digest, split_flags, toolchain_digest
+    spec = split_flags(list(flags), pipeline)
+    try:
+        closure = dependency_digest(Path(source), spec, cfg, [Path(source).parent, *includes])
+    except OSError:
+        closure = "unreadable"
+    material = [str(source), hashlib.sha256(Path(source).read_bytes()).hexdigest() if Path(source).is_file() else "missing",
+                closure, pipeline, *flags, toolchain_digest(cfg, pipeline)]
+    return hashlib.sha256("\0".join(material).encode()).hexdigest()[:24]
+
+
 class Builder:
     """Compiles units of a tree and keeps every object, so that no (unit, recipe, macros) is built twice."""
 
@@ -323,7 +400,7 @@ class Builder:
         import tempfile
         from .pipeline import BuildError, build as compile_unit, split_flags
         pipeline, flags = split_recipe(recipe)[0], self.flags(recipe, macros)
-        key = hashlib.sha1("\0".join([unit, pipeline, *flags]).encode()).hexdigest()[:20]
+        key = object_key(self.tree.root / unit, pipeline, flags, self.cfg, list(self.includes))
         target, failed = self.objects / f"{key}.o", self.objects / f"{key}.err"
         if target.is_file():
             return target
@@ -378,21 +455,24 @@ def link(objects: list[Path], folder: Path, cfg, defsyms: dict[str, int] | None 
 
     def run_linker():
         given = {**placed_symbols, **(defsyms or {})}
-        return subprocess.run([linker, "-EB", "-T", str(script), "-Map", str(map_file), "-o", str(elf),
+        from .. import safety
+        return safety.run_tool([linker, "-EB", "-T", str(script), "-Map", str(map_file), "-o", str(elf),
                                "--unresolved-symbols=ignore-all", "-z", "muldefs", "--no-warn-mismatch",
                                "--no-check-sections", "--noinhibit-exec",
-                               *[f"--defsym={symbol}=0x{address:08X}" for symbol, address in given.items()],
+                               # quoted: ld reads a name made only of hex digits ("bb", "fh") as a number
+                               *[f'--defsym="{symbol}"=0x{address:08X}' for symbol, address in given.items()],
                                f"@{listing}"],
-                              capture_output=True, text=True, env=environment)
+                              kind="compile", capture_output=True, text=True, env=environment)
 
     linked = run_linker()
     if place_undefined and elf.is_file():
         nm, _env = tool(cfg, "nm")
         # what the objects ask for, less what the linked image defines (the image itself no
         # longer says what was left open)
-        wanted = subprocess.run([nm, "--undefined-only", f"@{listing}"], capture_output=True, text=True,
-                                env=environment)
-        defined = subprocess.run([nm, "--defined-only", str(elf)], capture_output=True, text=True, env=environment)
+        from .. import safety
+        wanted = safety.run_tool([nm, "--undefined-only", f"@{listing}"], capture_output=True, text=True,
+                                 env=environment)
+        defined = safety.run_tool([nm, "--defined-only", str(elf)], capture_output=True, text=True, env=environment)
         names = sorted({line.split()[-1] for line in wanted.stdout.splitlines() if line.split()[:1] == ["U"]}
                        - {line.split()[-1] for line in defined.stdout.splitlines() if line.split()}
                        - set(defsyms or {}))
@@ -406,12 +486,13 @@ def link(objects: list[Path], folder: Path, cfg, defsyms: dict[str, int] | None 
     if not elf.is_file():
         return {"error": "link failed: " + linked.stderr[-400:]}
     objcopy, _env = tool(cfg, "objcopy")
-    copied = subprocess.run([objcopy, "-O", "binary", str(elf), str(image)], capture_output=True, text=True,
+    from .. import safety
+    copied = safety.run_tool([objcopy, "-O", "binary", str(elf), str(image)], capture_output=True, text=True,
                             env=environment)
     if copied.returncode != 0 or not image.is_file():        # objects that hold no code or data at all
         return {"error": "no image: " + copied.stderr[-300:]}
     nm, _env = tool(cfg, "nm")
-    listed = subprocess.run([nm, "-n", "-S", "--defined-only", str(elf)], capture_output=True, text=True,
+    listed = safety.run_tool([nm, "-n", "-S", "--defined-only", str(elf)], capture_output=True, text=True,
                             env=environment)
     if listed.returncode != 0:
         return {"error": "no symbols: " + listed.stderr[-300:]}
@@ -546,9 +627,11 @@ def target_signatures(project) -> dict[tuple[str, int], list[tuple[str, int]]]:
     return out
 
 
-def found_in_target(objects: dict[str, Path], folder: Path, cfg, signatures: dict, is_function=None) -> dict[str, set]:
+def found_in_target(objects: dict[str, Path], folder: Path, cfg, signatures: dict, is_function=None,
+                    totals: dict | None = None) -> dict[str, set]:
     """``{unit: {target functions found}}`` for units built to ``objects``, linked together.
-    With ``is_function(unit, label)``, only the symbols it accepts are compared."""
+    With ``is_function(unit, label)``, only the symbols it accepts are compared.  ``totals``, when
+    given, receives the number of functions long enough to compare in each unit."""
     from .transplant import mask, signature, strip_padding
     if not objects:
         return {}
@@ -566,6 +649,8 @@ def found_in_target(objects: dict[str, Path], folder: Path, cfg, signatures: dic
         code = strip_padding(data[address - BASE:address - BASE + size])
         if unit is None or len(code) < 4 * MIN_WORDS or (is_function is not None and not is_function(unit, _label)):
             continue
+        if totals is not None:
+            totals[unit] = totals.get(unit, 0) + 1
         for place in signatures.get((signature(mask(code, address)[0]), len(code)), ()):
             found[unit].add(place)
     for stale in linked["scratch"]:
@@ -574,20 +659,33 @@ def found_in_target(objects: dict[str, Path], folder: Path, cfg, signatures: dic
 
 
 def calibrate(tree: Tree, signatures: dict, recipes: list[str], cfg, work: Path, jobs: int = 4,
-              macros: list[str] | None = None, max_macros: int = MAX_MACROS, emit=None) -> dict:
+              macros: list[str] | None = None, max_macros: int = MAX_MACROS, emit=None,
+              objects: Path | None = None) -> dict:
     """Find, by building and comparing with the target, each unit's recipe and the tree's
     configuration macros.  ``macros`` are taken as given and not measured."""
     emit = emit or (lambda *_a, **_k: None)
     includes = tree.resolve_all()
-    builder = Builder(tree, includes, cfg, work / "obj", jobs)
     given = list(macros or [])
+    # files the tree's own build would generate: stand-ins, so that a unit including one is
+    # still measured (see ``preprocessed``)
+    standins = Path(work) / "standins"
+    for unit in tree.units:
+        preprocessed(tree.root / unit, split_recipe(recipes[0])[0] if recipes else "ido5.3",
+                     [*BASE_DEFINES, *[f"-D{m}" if "=" in m else f"-D{m}=1" for m in given]], includes, standins, [])
+    if standins.is_dir():
+        includes = [*includes, standins]
+    builder = Builder(tree, includes, cfg, objects or work / "obj", jobs)
+    totals: dict[str, int] = {}
 
     def survey(defined: list[str]) -> dict[str, dict[str, int]]:
         table = {}
         for recipe in recipes:
             built = builder.many(tree.units, lambda _unit: recipe, defined)
+            counted: dict[str, int] = {}
             table[recipe] = {unit: len(places) for unit, places in
-                             found_in_target(built, work / "probe", cfg, signatures, tree.defines).items()}
+                             found_in_target(built, work / "probe", cfg, signatures, tree.defines, counted).items()}
+            for unit, count in counted.items():
+                totals[unit] = max(totals.get(unit, 0), count)
             emit("recipe", recipe=recipe, compiled=len(built), found=sum(table[recipe].values()))
         return table
 
@@ -599,9 +697,17 @@ def calibrate(tree: Tree, signatures: dict, recipes: list[str], cfg, work: Path,
     measured, skipped = candidates[:max_macros], candidates[max_macros:]
     samples: dict[str, list[str]] = {}
 
+    # A macro is measured on the units that can see it, those with the most functions not yet
+    # found first: a setting that changes few functions shows there, and nowhere else.
+    best = {unit: max((table.get(unit, 0) for table in first.values()), default=0) for unit in tree.units}
+    unfound = {unit: totals.get(unit, 0) - best[unit] for unit in tree.units}
+
     def measure(defined: list[str], candidate: str) -> int:
         if candidate not in samples:
-            samples[candidate] = spread(tree.seeing(candidate), SAMPLE)
+            seeing = tree.seeing(candidate)
+            ranked = sorted(seeing, key=lambda unit: -unfound.get(unit, 0))
+            worst = [unit for unit in ranked if unfound.get(unit, 0) > 0][:SAMPLE // 2]
+            samples[candidate] = worst + [unit for unit in spread(seeing, SAMPLE) if unit not in worst][:SAMPLE - len(worst)]
         built = builder.many(samples[candidate], recipe_of, [*given, *defined])
         return sum(len(places) for places in found_in_target(built, work / "probe", cfg, signatures, tree.defines).values())
 
@@ -622,50 +728,117 @@ GCC_PREDEFINED = ("-D__GNUC__=2", "-D__GNUC_MINOR__=7", "-Dmips", "-D__mips__", 
                   "-D__MIPSEB__", "-D__LANGUAGE_C__", "-D_MIPS_SZINT=32", "-D_MIPS_SZLONG=32", "-D_MIPS_SZPTR=32")
 
 
-def preprocessed(source: Path, pipeline: str, flags: list[str], includes: list[Path]) -> str | None:
+MISSING_INCLUDE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):\d+: fatal error: (?P<name>[^:\n]+): No such file",
+                             re.M)
+MAX_STANDINS = 40
+
+
+def _inside_braces(path: Path, line: int) -> bool:
+    """Whether line ``line`` of ``path`` stands inside braces (an initialiser), comments and
+    literals left out."""
+    try:
+        text = COMMENT.sub(lambda found: re.sub(r"[^\n]", " ", found.group()), path.read_text(errors="replace"))
+    except OSError:
+        return False
+    from .splitunit import blank_literals
+    before = blank_literals("\n".join(text.split("\n")[:max(0, line - 1)]))
+    return before.count("{") > before.count("}")
+
+
+def preprocessed(source: Path, pipeline: str, flags: list[str], includes: list[Path],
+                 standins: Path | None = None, used: list | None = None) -> str | None:
     """``source`` after the preprocessor, with what its compiler would have predefined; None
-    when it does not go through."""
+    when it does not go through.
+
+    With ``standins`` (a directory), an included file that does not exist (a file the tree's
+    own build would generate: converted text, an image as an array) is given a stand-in there:
+    ``0`` where it is included inside an initialiser, nothing elsewhere.  A function never
+    depends on the contents of another object's initialiser, which the split leaves out; a
+    function that needs the real file fails to compile or compiles to other bytes, and the
+    comparison with the title refuses it.  Each stand-in is appended to ``used``."""
     ido = pipeline.startswith(("ido", "custom:ido", "custom:mipspro"))
-    command = [os.environ.get("N64DK_CPP", "cpp"), "-P", "-nostdinc", "-undef",
+    search = [source.parent, *includes, *([standins] if standins else [])]
+    # -std=gnu89: both compilers are C89 compilers and define no __STDC_VERSION__; a host
+    # preprocessor's default (C17) makes headers that test it take their C99 branch (``bool`` as
+    # ``_Bool``), which neither compiler accepts
+    command = [os.environ.get("N64DK_CPP", "cpp"), "-P", "-nostdinc", "-undef", "-std=gnu89",
                *(IDO_PREDEFINED if ido else GCC_PREDEFINED),
                *[flag for flag in flags if flag.startswith(("-D", "-U"))],
-               *[f"-I{path}" for path in (source.parent, *includes)], str(source)]
-    try:
-        done = subprocess.run(command, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return done.stdout if done.returncode == 0 else None
+               *[f"-I{path}" for path in search], str(source)]
+    for _attempt in range(MAX_STANDINS + 1):
+        try:
+            from .. import safety
+            done = safety.run_tool(command, kind="light", capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if done.returncode == 0:
+            return done.stdout
+        missing = MISSING_INCLUDE.search(done.stderr)
+        if standins is None or missing is None:
+            return None
+        name = missing.group("name").strip()
+        if name.startswith("/") or ".." in Path(name).parts:
+            return None
+        stand_in = standins / name
+        if stand_in.exists():                                # already given: something else is wrong
+            return None
+        initialiser = _inside_braces(Path(missing.group("file")), int(missing.group("line")))
+        stand_in.parent.mkdir(parents=True, exist_ok=True)
+        stand_in.write_text("0\n" if initialiser else "/* stand-in: generated by the tree's own build */\n")
+        if used is not None:
+            used.append({"file": name, "in_initialiser": initialiser})
+    return None
 
 
 def split_units(tree: Tree, built: dict[str, Path], recipe_of, flags_of, includes: list[Path], root: Path, cfg,
                 objects: Path, jobs: int = 4) -> tuple[list[tuple[str, str, list[str], Path]], dict]:
-    """Write one source file per function of the units in ``built`` under ``root`` and compile
-    each (see ``n64dk.match.splitunit``).  Returns the donor rows and what was left out."""
+    """Write one source file per function of every unit of the tree under ``root`` and compile
+    each (see ``n64dk.match.splitunit``).  Returns the donor rows and what was left out.
+
+    A unit that did not compile whole (a generated header missing) is split all the same: its
+    functions that do not need what is missing compile on their own.  ``root/order.json`` keeps
+    the functions of each unit in source order, which places a function the title holds between
+    two that were found."""
     import tempfile
     from . import splitunit
     from .pipeline import BuildError, build as compile_unit, split_flags
     todo, not_split, written = [], [], 0
-    for unit in sorted(built):
+    errors: dict[str, str] = {}
+    order: dict[str, list[str]] = {}
+    excluded: dict[str, dict[str, str]] = {}
+    standins_used: dict[str, list] = {}
+    standins = root.parent / "standins"
+    for unit in sorted(tree.units):
         pipeline, flags = split_recipe(recipe_of(unit))[0], flags_of(unit)
-        text = preprocessed(tree.root / unit, pipeline, flags, includes)
-        parts = splitunit.split(text, unit) if text else {}
+        used: list = []
+        text = preprocessed(tree.root / unit, pipeline, flags, includes, standins, used)
+        if used:
+            standins_used[unit] = used
+        left_out: dict[str, str] = {}
+        parts = splitunit.split(text, unit, left_out) if text else {}
+        if left_out:
+            excluded[unit] = left_out
         if not parts:
-            not_split.append(unit)
+            not_split.append({"unit": unit, "reason": "preprocessing failed" if text is None else
+                              "the configuration leaves no function in it" if not left_out else
+                              "every function holds inline assembly"})
             continue
+        order[unit] = list(parts)
         # the preprocessor has applied the macros and found the headers: neither is needed again
         plain = [flag for flag in flags if not flag.startswith(("-D", "-U", "-I"))]
-        for label, source in sorted(parts.items()):
+        for label, source in parts.items():
             relative = f"{unit[:-2]}/{label}.c"
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source)
             written += len(source)
             todo.append((relative, pipeline, plain))
+    (root / "order.json").write_text(json.dumps({"order": order, "excluded": excluded, "standins": standins_used},
+                                                indent=1) + "\n")
 
     def one(item):
         relative, pipeline, plain = item
-        key = hashlib.sha1("\0".join([relative, pipeline, *plain,
-                                      hashlib.sha1((root / relative).read_bytes()).hexdigest()]).encode()).hexdigest()[:20]
+        key = object_key(root / relative, pipeline, plain, cfg, [])
         target = objects / f"f{key}.o"
         if target.is_file():
             return relative, pipeline, plain, target
@@ -673,7 +846,8 @@ def split_units(tree: Tree, built: dict[str, Path], recipe_of, flags_of, include
             with tempfile.TemporaryDirectory(prefix="n64dk-split-") as work:
                 made = compile_unit(root / relative, split_flags(list(plain), pipeline), cfg, Path(work), includes=[])
                 shutil.copyfile(made, target)
-        except (BuildError, OSError, RuntimeError):
+        except (BuildError, OSError, RuntimeError) as error:
+            errors[relative] = str(error)[-600:]
             return relative, pipeline, plain, None
         return relative, pipeline, plain, target
 
@@ -682,10 +856,16 @@ def split_units(tree: Tree, built: dict[str, Path], recipe_of, flags_of, include
         done = list(pool.map(one, todo))
     rows = [row for row in done if row[3] is not None]
     failed = [row[0] for row in done if row[3] is None]
-    for relative in failed:                                  # a file that does not compile is no use to anyone
-        (root / relative).unlink(missing_ok=True)
+    for relative in failed:                                  # kept apart, for diagnosis, out of the donor
+        kept = root.parent / "split_failed" / relative
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(root / relative), kept)
+        kept.with_suffix(".err").write_text(errors.get(relative, ""))
     return rows, {"functions_written": len(todo), "functions_compiled": len(rows), "functions_not_compiled": len(failed),
-                  "not_compiled": failed[:12], "units_not_split": not_split[:12], "units_not_split_count": len(not_split),
+                  "not_compiled": failed[:40], "units_not_split": not_split, "units_not_split_count": len(not_split),
+                  "functions_excluded_inline_assembly": sum(len(v) for v in excluded.values()),
+                  "units_given_standins": len(standins_used),
+                  "standin_files": sorted({item["file"] for items in standins_used.values() for item in items}),
                   "split_source_bytes": written}
 
 
@@ -710,6 +890,7 @@ def build(tree: Tree, plan: dict, out: Path, name: str, cfg, signatures: dict | 
     if by_function:
         root = folder / "split"
         shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(folder / "split_failed", ignore_errors=True)      # no failure kept from an earlier import
         rows, left_out = split_units(tree, built, recipe_of, lambda unit: builder.flags(recipe_of(unit), plan["macros"]),
                                      plan["includes"], root, cfg, builder.objects, builder.jobs)
         own = lambda relative, label: Path(relative).stem == label         # noqa: E731

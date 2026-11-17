@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 import tomllib
@@ -42,6 +43,7 @@ from ..cli import command
 from ..resources import plan_jobs
 from ..match import images as imagemod
 from ..match import resolve as resolvemod
+from ..match import solver
 
 
 def _settings(project: Path, image: str) -> dict:
@@ -71,6 +73,22 @@ def _stage(folder: Path, name: str, compute, redo: bool, identity: str = ""):
         temporary_meta.write_text(json.dumps({"identity": identity}))
         temporary_meta.replace(meta)
     return result, False
+
+
+def _profiled(profiler, name: str, image: str, compute):
+    """``compute`` measured as one stage of the run's profile (``n64dk.profiling``), with what it
+    produced recorded as the stage's gain."""
+    def run():
+        with profiler.stage(name, image) as record:
+            result = compute()
+            if isinstance(result, dict):
+                record["gain"] = {key: result[key] for key in (
+                    "functions_recovered", "functions_awaiting_symbols", "statuses", "promoted", "declared",
+                    "chosen", "rodata_settlement") if key in result and not isinstance(result[key], list)}
+                if isinstance(record["gain"].get("chosen"), dict):
+                    record["gain"]["chosen"] = record["gain"]["chosen"].get("label")
+            return result
+    return run
 
 
 def _identity(**values) -> str:
@@ -131,6 +149,8 @@ def refine_settings(settings: dict, args):
         value = getattr(args, f"refine_{key}", None)
         if value is not None:
             setattr(built, key, value)
+    if getattr(args, "refine_known_source", None):
+        built.known_source = [*built.known_source, *args.refine_known_source]
     return built
 
 
@@ -172,8 +192,123 @@ def declare_assumed(resolve_hard, resolve_options, state: Path, image: str, fold
             "still_assumed": statuses.get("assumed", 0)}
 
 
+def resolve_options_for(args, settings: dict, *, mode, project: Path, spec, jobs: int, events: Path, out: Path,
+                        manifests: list[str], recipes: dict, recovered: set[int]):
+    """The ``resolve-hard`` options of one image, as a function of per-call overrides.  ``mode`` is
+    the effort policy; the options themselves come from ``args`` after ``solver.apply_policy``
+    (``normal`` fills exactly the defaults decompile-run had before effort modes)."""
+    def resolve_options(**overrides):
+        options = argparse.Namespace(
+            project=str(project), config=None, toolchain_dir=args.toolchain_dir, normalizer=None, include=[],
+            rom=str(spec.path), vram_delta=spec.vram_delta if spec.delta_source == "declared" else None,
+            jobs=jobs, workers=args.workers,
+            worker_memory_mb=args.worker_memory_mb, memory_reserve_mb=args.memory_reserve_mb,
+            refine=refine_settings(settings, args) if mode.refine else None, refine_command=None, keep_padding=False,
+            search_ceiling=(args.search_ceiling if args.search_ceiling is not None
+                            else settings.get("search_ceiling", resolvemod.SEARCH_CEILING)),
+            symbols=[str(project / s) for s in settings.get("symbols", [])],
+            catalogue=str(spec.catalogue), catalogue_shift=spec.catalogue_shift,
+            manifest=[m + ("=" + recipes[str(Path(m).resolve())] if str(Path(m).resolve()) in recipes else "")
+                      for m in manifests],
+            limit=args.limit, max_size=args.max_size, min_size=4, every=1, holdout=0, show=5,
+            image_name=spec.name, pipeline=settings.get("pipeline", args.pipeline),
+            flags=settings.get("flags", args.flags), context="auto",
+            context_parts="structs,globals,prototypes", proto_confidence=0.9, budget=args.budget,
+            context_headers=[str(project / h) for h in settings.get("context_headers", [])],
+            state=str(out / "state"), events=str(events), no_draft=False, no_recipes=False,
+            draft_portfolio=True, draft_options=settings.get("draft_options", ""), force=False,
+            skip_vrams=recovered, addr=None, size=None, cross_recipes=getattr(args, "cross_recipes", None),
+            only_names=getattr(args, "only_names", None),
+            region_recipes=bool(getattr(args, "region_recipes", False) or
+                                settings.get("region_recipes", False)),
+            unit_recipes=bool(getattr(args, "unit_recipes", False) or
+                              settings.get("unit_recipes", False)),
+            skip_unknown_search=bool(getattr(args, "skip_unknown_search", False) or
+                                     settings.get("skip_unknown_search", False)),
+            search_economics=bool(getattr(args, "search_economics", False) or
+                                  settings.get("search_economics", False)))
+        for key, value in overrides.items():
+            setattr(options, key, value)
+        return options
+
+    return resolve_options
+
+
 @command("decompile-run", "Drive every configured image through boundaries, donors, resolution, strict queue and ledger")
 def decompile_run(args):
+    """One heavy job at a time, with a preflight and a lease (see ``n64dk.safety``)."""
+    from .. import safety
+    prepare_invocation(args)
+    try:
+        with safety.heavy_job("decompile-run", Path(args.out), wait_for_lock=getattr(args, "wait_for_lock", False),
+                              force=getattr(args, "force_resources", False), argv=sys.argv[1:]) as check:
+            result = _decompile_run(args)
+    except safety.Busy as error:
+        raise SystemExit(str(error)) from None
+    if isinstance(result, dict) and not check.get("nested"):
+        result["preflight"] = check
+        result["paused"] = safety.pauses()
+    return result
+
+
+# options a resumed invocation takes from its own command line; every other one comes from the
+# invocation that started the run (solver/invocation.json)
+RESUME_FROM_COMMAND_LINE = ("budget_time", "budget_builds", "budget_model_calls", "wait_for_lock", "force_resources",
+                            "jobs", "workers", "worker_memory_mb", "memory_reserve_mb")
+_NOT_SAVED = {"_fn", "format", "resume", "command", "redo"} | set(RESUME_FROM_COMMAND_LINE)
+
+
+def prepare_invocation(args) -> solver.Policy:
+    """Merge ``--resume RUN_DIR`` with the invocation that started the run, check the effort mode
+    and fill every option the command line left unset from it."""
+    if getattr(args, "resume", None):
+        run_dir = Path(args.resume).resolve()
+        path = run_dir / "solver" / "invocation.json"
+        if not path.is_file():
+            raise SystemExit(f"--resume {run_dir}: no solver/invocation.json; only a run made by this version "
+                             "of decompile-run can be resumed")
+        saved = json.loads(path.read_text())
+        rounds, effort, schedule = (getattr(args, "rounds", None), getattr(args, "effort", None),
+                                    getattr(args, "schedule", None))
+        for key, value in saved.items():
+            if key not in _NOT_SAVED:
+                setattr(args, key, value)
+        if effort is not None and effort != saved.get("effort"):
+            # another mode for the rounds still to come (e.g. a finished normal run continued as deep):
+            # its rounds, scheduling, techniques and cascade apply; the options the run was started
+            # with (budget per function, sizes, recipes) stay as they were, so round 1 is comparable
+            args.effort, args.rounds, args.schedule = effort, None, None
+        if rounds is not None:
+            args.rounds = rounds
+        if schedule is not None:
+            args.schedule = schedule
+        args.out, args.redo = str(run_dir), False
+    if not getattr(args, "project", None) or not getattr(args, "out", None):
+        raise SystemExit("decompile-run needs --project and --out (or --resume RUN_DIR)")
+    mode = solver.policy(getattr(args, "effort", None))
+    solver.check_policy(mode)
+    args.effort = mode.name
+    solver.apply_policy(args, mode)
+    return mode
+
+
+def save_invocation(args, out: Path) -> None:
+    keep = {}
+    for key, value in vars(args).items():
+        if key in _NOT_SAVED or callable(value):
+            continue
+        try:
+            json.dumps(value)
+        except TypeError:
+            continue
+        keep[key] = value
+    for key in ("project", "donors", "donor_index", "library", "toolchain_dir"):    # resumable from anywhere
+        if isinstance(keep.get(key), str) and keep[key]:
+            keep[key] = str(Path(keep[key]).expanduser().resolve())
+    solver.write_json(out / "solver" / "invocation.json", keep)
+
+
+def _decompile_run(args):
     if getattr(args, "donors", None) and not Path(args.donors).is_file():
         raise SystemExit(f"--donors {args.donors}: no such file")
     project = Path(args.project).resolve()
@@ -183,12 +318,27 @@ def decompile_run(args):
         raise SystemExit("refusing to write generated run state inside the project source tree; "
                          "use <project>/.n64dk/... or --allow-project-output")
     out.mkdir(parents=True, exist_ok=True)
+    from ..profiling import Profiler
+    profiler = Profiler(out)
     registry = imagemod.load_registry(project)
     if not registry:
         raise SystemExit("no [images.<name>] tables in the project's n64dk.toml: declare each image (path, "
                          "vram_delta for linear images, catalogue, manifests)")
     names = sorted(registry) if args.all_images or not args.image else args.image
     events = out / "events.jsonl"
+    # --- effort mode, rounds log, observations and budgets (n64dk.match.solver)
+    mode = solver.policy(getattr(args, "effort", None))
+    resume = bool(getattr(args, "resume", None))
+    solver_dir = out / "solver"
+    log = solver.RoundsLog(out / "rounds.jsonl")
+    session = (log.latest_session() if resume else None) or f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    if not resume:
+        save_invocation(args, out)
+    observations = solver.Observations(solver_dir / "observations.json")
+    if not resume:
+        observations.cells, observations.facts, observations.evidence, observations.plateaus = {}, {}, {}, {}
+    budget = solver.Budget(solver.parse_duration(getattr(args, "budget_time", None)),
+                           getattr(args, "budget_builds", None), getattr(args, "budget_model_calls", None))
     resource_plan = plan_jobs(args.jobs, reserve_mb=args.memory_reserve_mb or None,
                               memory_per_job_mb=args.worker_memory_mb or None)
     jobs = resource_plan.jobs
@@ -245,7 +395,7 @@ def decompile_run(args):
                     "file": str(folder / "boundary_operations.json")}
         if "boundaries" not in args.skip_stage:
             try:
-                image_report["boundaries"], _cached = _stage(folder, "boundaries", boundaries, args.redo,
+                image_report["boundaries"], _cached = _stage(folder, "boundaries", _profiled(profiler, "boundaries", spec.name, boundaries), args.redo,
                                                                stage_identity)
             except Exception as error:                       # a stage failure is reported, not fatal
                 image_report["boundaries"] = {"error": str(error)[-300:]}
@@ -271,7 +421,7 @@ def decompile_run(args):
                                         jobs=min(jobs, 4), toolchain_root=Path(toolchain) if toolchain else None,
                                         other_starts=title_starts - {v for _n, v, _s in rows})
                 keep = {k: v for k, v in result.items()
-                        if not k.startswith("_") and (not isinstance(v, (list, dict)) or k in ("verdicts", "timing_s"))}
+                        if not k.startswith("_") and (not isinstance(v, (list, dict)) or k in ("verdicts", "timing_s", "rodata_settlement"))}
                 by_name = {n: v for n, v, _s in rows}
                 keep["verified"] = [{"functions": r.get("functions", []), "vram": r.get("target_vram"),
                                      "size": r.get("size"), "donor": r.get("donor"), "unit": r.get("donor_unit"),
@@ -292,7 +442,7 @@ def decompile_run(args):
                                    if r.get("verdict") == transplant.ASSUMED_VERDICT]
                 return keep
             try:
-                image_report["donors"], _cached = _stage(folder, "donors", donors, args.redo,
+                image_report["donors"], _cached = _stage(folder, "donors", _profiled(profiler, "donors", spec.name, donors), args.redo,
                                                           _identity(base=stage_identity, donors=args.donors,
                                                                     selected=args.donor,
                                                                     excluded=args.exclude_donor,
@@ -305,90 +455,142 @@ def decompile_run(args):
                  verified=len(image_report["donors"].get("verified", [])) if isinstance(image_report["donors"], dict) else 0)
 
         # --- 3. resolve
-        def resolve_options(**overrides):
-            options = argparse.Namespace(
-                project=str(project), config=None, toolchain_dir=args.toolchain_dir, normalizer=None, include=[],
-                rom=str(spec.path), vram_delta=spec.vram_delta if spec.delta_source == "declared" else None,
-                jobs=jobs, workers=args.workers,
-                worker_memory_mb=args.worker_memory_mb, memory_reserve_mb=args.memory_reserve_mb,
-                refine=refine_settings(settings, args), refine_command=None, keep_padding=False,
-                search_ceiling=(args.search_ceiling if args.search_ceiling is not None
-                                else settings.get("search_ceiling", resolvemod.SEARCH_CEILING)),
-                symbols=[str(project / s) for s in settings.get("symbols", [])],
-                catalogue=str(spec.catalogue), catalogue_shift=spec.catalogue_shift,
-                manifest=[m + ("=" + recipes[str(Path(m).resolve())] if str(Path(m).resolve()) in recipes else "")
-                          for m in manifests],
-                limit=args.limit, max_size=args.max_size, min_size=4, every=1, holdout=0, show=5,
-                image_name=spec.name, pipeline=settings.get("pipeline", args.pipeline),
-                flags=settings.get("flags", args.flags), context="auto",
-                context_parts="structs,globals,prototypes", proto_confidence=0.9, budget=args.budget,
-                state=str(out / "state"), events=str(events), no_draft=False, no_recipes=False,
-                draft_portfolio=True, draft_options=settings.get("draft_options", ""), force=False,
-                skip_vrams=recovered, addr=None, size=None, cross_recipes=None,
-                only_names=getattr(args, "only_names", None),
-                region_recipes=bool(getattr(args, "region_recipes", False) or
-                                    settings.get("region_recipes", False)),
-                unit_recipes=bool(getattr(args, "unit_recipes", False) or
-                                  settings.get("unit_recipes", False)),
-                skip_unknown_search=bool(getattr(args, "skip_unknown_search", False) or
-                                         settings.get("skip_unknown_search", False)))
-            for key, value in overrides.items():
-                setattr(options, key, value)
-            return options
+        resolve_options = resolve_options_for(args, settings, mode=mode, project=project, spec=spec, jobs=jobs,
+                                              events=events, out=out, manifests=manifests, recipes=recipes,
+                                              recovered=recovered)
 
-        chosen_recipe = None
-        if "resolve" not in args.skip_stage:
+        plan = solver.stage_plan(mode, args, settings)
+        held = {"overrides": {}}
+        if "resolve" in plan:
             from .resolve import resolve_hard
-            # --- 3a. calibrate: measure the title's recipe on a sample of its own functions
-            sample = args.calibrate if args.calibrate is not None else int(settings.get("calibrate", 0) or 0)
-            if sample == 0 and "calibrate" not in args.skip_stage and settings.get("pipeline"):
-                # No calibration asked for: the configured recipe is taken on trust.  When the code's
-                # own marks say most of the image was built another way, measure instead.
+            round1 = solver_dir / f"round1_{spec.name}.json"
+            last, stopped = log.progress(session, spec.name) if resume else (0, None)
+
+            def sweep():
+                """Round 1: today's decompile-run resolve stage, unchanged (calibrate, sweep, declare)."""
+                chosen_recipe = None
+                # --- 3a. calibrate: measure the title's recipe on a sample of its own functions
+                sample = args.calibrate if args.calibrate is not None else int(settings.get("calibrate", 0) or 0)
+                if sample == 0 and "calibrate" not in args.skip_stage and settings.get("pipeline"):
+                    # No calibration asked for: the configured recipe is taken on trust.  When the code's
+                    # own marks say most of the image was built another way, measure instead.
+                    try:
+                        from ..match import idioms
+                        table = idioms.Table.load()
+                        marked = [(vram, idioms.features(data[vram - delta:vram - delta + size], vram))
+                                  for _name, vram, size in rows if size >= 8]
+                        found = idioms.doubt(marked, table, f"{settings['pipeline']} {settings.get('flags', '')}")
+                        if found["share"] >= RECIPE_DOUBT:
+                            image_report["recipe_doubt"] = found
+                            sample = DOUBT_SAMPLE
+                            emit("stage", image=spec.name, stage="recipe-doubt", share=found["share"])
+                    except Exception:                            # noqa: BLE001 - a hint, never a reason to stop
+                        pass
+                if sample > 0 and "calibrate" not in args.skip_stage:
+                    def calibrate():
+                        return calibrate_recipe(resolve_hard, resolve_options, out / "state", spec.name, rows, recovered,
+                                                sample, delta)
+                    try:
+                        image_report["calibrate"], _cached = _stage(
+                            folder, "calibrate", _profiled(profiler, "calibrate", spec.name, calibrate), args.redo,
+                            _identity(base=stage_identity, sample=sample, donors=sorted(recovered)))
+                        chosen_recipe = image_report["calibrate"].get("chosen")
+                    except Exception as error:
+                        image_report["calibrate"] = {"error": str(error)[-300:]}
+                    emit("stage", image=spec.name, stage="calibrate",
+                         chosen=(chosen_recipe or {}).get("label"))
+                overrides = held["overrides"] = {}
+                if chosen_recipe:
+                    overrides = held["overrides"] = {"pipeline": chosen_recipe["pipeline"], "flags": chosen_recipe["flags"]}
                 try:
-                    from ..match import idioms
-                    table = idioms.Table.load()
-                    marked = [(vram, idioms.features(data[vram - delta:vram - delta + size], vram))
-                              for _name, vram, size in rows if size >= 8]
-                    found = idioms.doubt(marked, table, f"{settings['pipeline']} {settings.get('flags', '')}")
-                    if found["share"] >= RECIPE_DOUBT:
-                        image_report["recipe_doubt"] = found
-                        sample = DOUBT_SAMPLE
-                        emit("stage", image=spec.name, stage="recipe-doubt", share=found["share"])
-                except Exception:                            # noqa: BLE001 - a hint, never a reason to stop
-                    pass
-            if sample > 0 and "calibrate" not in args.skip_stage:
-                def calibrate():
-                    return calibrate_recipe(resolve_hard, resolve_options, out / "state", spec.name, rows, recovered,
-                                            sample, delta)
-                try:
-                    image_report["calibrate"], _cached = _stage(
-                        folder, "calibrate", calibrate, args.redo,
-                        _identity(base=stage_identity, sample=sample, donors=sorted(recovered)))
-                    chosen_recipe = image_report["calibrate"].get("chosen")
+                    image_report["resolve"] = _profiled(profiler, "resolve", spec.name,
+                                                        lambda: resolve_hard(resolve_options(**overrides)))()
                 except Exception as error:
-                    image_report["calibrate"] = {"error": str(error)[-300:]}
-                emit("stage", image=spec.name, stage="calibrate",
-                     chosen=(chosen_recipe or {}).get("label"))
-            overrides = {}
-            if chosen_recipe:
-                overrides = {"pipeline": chosen_recipe["pipeline"], "flags": chosen_recipe["flags"]}
+                    image_report["resolve"] = {"error": str(error)[-300:]}
+                # --- 3b. declare: settle byte-identical cases that only wait for an address to be declared
+                if (args.declare_assumed or settings.get("declare_assumed")) and "error" not in image_report["resolve"]:
+                    try:
+                        image_report["declare"] = _profiled(profiler, "declare", spec.name, lambda: declare_assumed(
+                            resolve_hard, resolve_options, out / "state", spec.name, folder, overrides))()
+                        moved = image_report["declare"].get("promoted", 0)
+                        statuses = image_report["resolve"].get("statuses")
+                        if moved and isinstance(statuses, dict):
+                            statuses["exact"] = statuses.get("exact", 0) + moved
+                            statuses["assumed"] = max(0, statuses.get("assumed", 0) - moved)
+                    except Exception as error:
+                        image_report["declare"] = {"error": str(error)[-300:]}
+                    emit("stage", image=spec.name, stage="declare", promoted=image_report["declare"].get("promoted"))
+
+                solver.write_json(round1, {**{key: image_report.get(key) for key in
+                                              ("recipe_doubt", "calibrate", "resolve", "declare") if key in image_report},
+                                           "overrides": held["overrides"]})
+                return {"model_calls": int(((image_report.get("resolve") or {}).get("refine") or {}).get("calls") or 0),
+                        "declared": isinstance(image_report.get("declare"), dict)
+                        and "error" not in image_report["declare"]}
+
+            if last >= 1 and round1.is_file():               # a resume: round 1 is not redone
+                saved = json.loads(round1.read_text())
+                held["overrides"] = saved.pop("overrides", None) or {}
+                image_report.update(saved)
+
+            def technique(name, decisions, calls_left):
+                """One later-round technique on a named set of stored cases (n64dk.match.solver)."""
+                options = resolve_options(**held["overrides"], **solver.technique_options(name, mode),
+                                          only_names=[",".join(sorted({d.name for d in decisions}))])
+                if name == "refine":
+                    if options.refine is None:
+                        return {"error": "no refiner configured"}
+                    if calls_left is not None:
+                        cap = max(1, calls_left // max(1, options.refine.rounds))
+                        options.refine.max_cases = min(options.refine.max_cases or cap, cap)
+                else:
+                    options.refine = None                    # a build technique never asks the refiner
+                result = _profiled(profiler, f"round:{name}", spec.name, lambda: resolve_hard(options))()
+                return {"model_calls": int(((result.get("refine") or {}).get("calls")) or 0),
+                        "error": result.get("error")}
+
+            def declare():
+                result = declare_assumed(resolve_hard, resolve_options, out / "state", spec.name, folder,
+                                         held["overrides"])
+                listing = folder / "declared_symbols.txt"
+                names = [line.split(" = ")[0] for line in listing.read_text().splitlines()
+                         if " = " in line] if listing.is_file() else []
+                image_report.setdefault("declare_rounds", []).append(result)
+                return {**result, "names": names}
+
+            graph: dict[int, set[int]] = {}
+
+            def neighbours(vram: int) -> set[int]:
+                if not graph:                                  # rows and cases are both in link space
+                    graph.update(solver.call_graph(data, delta, rows) or {0: set()})
+                return graph.get(vram, set())
+
+            ceiling = (args.search_ceiling if args.search_ceiling is not None
+                       else settings.get("search_ceiling", resolvemod.SEARCH_CEILING))
+            model = bool(mode.refine and refine_settings(settings, args) is not None)
+            finished = stopped is not None and str(stopped.get("reason", "")).startswith(
+                ("fixed point", "nothing applicable"))
+            if finished:
+                image_report["solver_stop"] = stopped
+            else:
+                image_report["solver_stop"] = solver.solve_image(
+                    image=spec.name, store_root=out / "state", mode=mode, budget=budget, log=log,
+                    observations=observations, hooks=solver.Hooks(sweep, technique, declare, neighbours),
+                    session=session, rounds=args.rounds, start_round=last + 1,
+                    unknown=lambda: solver.Stretches((image_report.get("resolve") or {}).get("unknown_toolchain")),
+                    ceiling=ceiling, model=model, emit=emit)
+
+        # --- 3c. solver outputs (read the store, build nothing): coverage, primary causes, dossiers
+        if "resolve" in plan:
             try:
-                image_report["resolve"] = resolve_hard(resolve_options(**overrides))
-            except Exception as error:
-                image_report["resolve"] = {"error": str(error)[-300:]}
-            # --- 3b. declare: settle byte-identical cases that only wait for an address to be declared
-            if (args.declare_assumed or settings.get("declare_assumed")) and "error" not in image_report["resolve"]:
-                try:
-                    image_report["declare"] = declare_assumed(resolve_hard, resolve_options, out / "state",
-                                                              spec.name, folder, overrides)
-                    moved = image_report["declare"].get("promoted", 0)
-                    statuses = image_report["resolve"].get("statuses")
-                    if moved and isinstance(statuses, dict):
-                        statuses["exact"] = statuses.get("exact", 0) + moved
-                        statuses["assumed"] = max(0, statuses.get("assumed", 0) - moved)
-                except Exception as error:
-                    image_report["declare"] = {"error": str(error)[-300:]}
-                emit("stage", image=spec.name, stage="declare", promoted=image_report["declare"].get("promoted"))
+                image_report["solver"] = solver_outputs(
+                    out, spec.name, mode, observations, rows=rows, data=data, delta=delta, recovered=recovered,
+                    manifest_rows=[(r.vram, r.size) for m in manifests for r in _rows_of(m, delta)],
+                    stretches=solver.Stretches((image_report.get("resolve") or {}).get("unknown_toolchain")),
+                    ceiling=ceiling, model=model, stop=image_report.get("solver_stop") or {},
+                    boundary_file=folder / "boundary_operations.json")
+            except Exception as error:                       # an observation failure never costs the run
+                image_report["solver"] = {"observation_error": f"{type(error).__name__}: {error}"[-300:]}
 
         # --- 4. strict queue
         store = resolvemod.CaseStore(out / "state")
@@ -417,7 +619,7 @@ def decompile_run(args):
                     kinds[violation.kind] = kinds.get(violation.kind, 0) + 1
                 return {"totals": built.totals(), "violations": kinds, "file": str(folder / "ownership.tsv")}
             try:
-                image_report["ledger"], _cached = _stage(folder, "ledger", ledger, args.redo, stage_identity)
+                image_report["ledger"], _cached = _stage(folder, "ledger", _profiled(profiler, "ledger", spec.name, ledger), args.redo, stage_identity)
             except Exception as error:
                 image_report["ledger"] = {"error": str(error)[-300:]}
         report["images"][spec.name] = image_report
@@ -443,6 +645,10 @@ def decompile_run(args):
     except Exception as error:
         report["donor"] = {"error": str(error)[-300:]}
     report["seconds"] = round(time.time() - started, 1)
+    report["profile"] = profiler.summary()
+    if os.environ.get("N64DK_MEASURE_RSS") == "1":
+        from .. import safety as safetymod
+        report["tool_profile"] = str(safetymod.save_tool_profile())
     report["failed_stages"] = {name: _headline(item)["errors"] for name, item in report["images"].items()
                                if _headline(item)["errors"]}
     report["status"] = "incomplete" if report["failed_stages"] else "complete"
@@ -452,6 +658,65 @@ def decompile_run(args):
             "report": str(out / "report.md"), "events": str(events),
             "images": {name: _headline(item) for name, item in report["images"].items()},
             "seconds": report["seconds"]}
+
+
+def solver_outputs(out: Path, image: str, mode, observations, *, rows, data: bytes, delta: int, recovered,
+                   manifest_rows, stretches, ceiling, model: bool, stop: dict, boundary_file: Path) -> dict:
+    """Coverage of every catalogued function and a dossier for every unresolved one, from the
+    case store (read-only).  Every address is in link space (``ImageSpec.rows``), as cases are."""
+    store = resolvemod.CaseStore(out / "state", readonly=True)
+    try:
+        cases = [case for case in store.all() if case.image == image]
+    finally:
+        store.close()
+    left_out = {}
+    scope = out / "state" / f"scope_{image}.json"
+    if scope.is_file():
+        try:
+            left_out = {int(row["vram"], 16): row["reason"] for row in json.loads(scope.read_text()).get("left_out", [])}
+        except (ValueError, KeyError, TypeError):
+            left_out = {}
+
+    def covered(vram: int) -> bool:
+        return any(start <= vram < start + size for start, size in manifest_rows)
+    found = solver.coverage(rows, cases, recovered=recovered, left_out=left_out, covered=covered,
+                            image_size=len(data), delta=delta)
+    solver.write_json(out / "solver" / f"coverage_{image}.json", found)
+    graph = solver.call_graph(data, delta, rows)
+    order = sorted(vram for _n, vram, _s in rows)
+    position = {vram: i for i, vram in enumerate(order)}
+    exact = {case.vram: case.name for case in cases if case.status == "exact"}
+    boundary = solver.boundary_operations(boundary_file)
+    recipes = solver.recipe_confidence(cases)
+    records, by_cause = [], {}
+    for case in sorted(cases, key=lambda c: c.vram):
+        if case.status not in solver.UNRESOLVED:
+            continue
+        decision = solver.decide(case, mode, observations, unknown=stretches, ceiling=ceiling, model=model)
+        index = position.get(case.vram, -1)
+        adjacent = {order[i] for i in (index - 1, index + 1) if 0 <= i < len(order)} if index >= 0 else set()
+        related = sorted({(exact[v], "calls or is called by") for v in graph.get(case.vram, set()) if v in exact}
+                         | {(exact[v], "adjacent in the catalogue") for v in adjacent if v in exact})
+        records.append(solver.dossier(case, decision, observations,
+                                      related=[{"name": n, "relation": r} for n, r in related],
+                                      boundary=boundary.get(case.vram, []), stop=stop.get("reason") or "",
+                                      image_recipes=recipes))
+        group = by_cause.setdefault(decision.cause, {"functions": 0, "bytes": 0, "next": {}})
+        group["functions"] += 1
+        group["bytes"] += case.size
+        key = decision.technique or "stop"
+        group["next"][key] = group["next"].get(key, 0) + 1
+    solver.write_json(out / "solver" / f"hard_queue_{image}.json", records)
+    warning = None
+    if mode.require_reasons and found["unexplained"]:
+        warning = (f"effort {mode.name} requires a recorded reason for every function not attempted: "
+                   f"{found['unexplained']} have none (see coverage_{image}.json)")
+    return {"mode": mode.name, "stop": stop.get("reason"), "after_round": stop.get("after_round"),
+            "coverage_warning": warning,
+            "coverage": {k: found[k] for k in ("functions", "attempted", "not_attempted", "unexplained", "reasons")},
+            "remaining_by_cause": dict(sorted(by_cause.items(), key=lambda kv: -kv[1]["bytes"])),
+            "files": {"rounds": str(out / "rounds.jsonl"), "coverage": str(out / "solver" / f"coverage_{image}.json"),
+                      "hard_queue": str(out / "solver" / f"hard_queue_{image}.json")}}
 
 
 def _rows_of(manifest: str, delta: int):
@@ -504,6 +769,22 @@ def _markdown(report: dict) -> str:
             lines.append(f"- boundary operations proposed: {item['boundaries'].get('operations')}")
         if item.get("ledger") and "totals" in item["ledger"]:
             lines.append(f"- ledger violations: {item['ledger'].get('violations')}")
+        solved = item.get("solver") or {}
+        if solved.get("mode"):
+            lines.append(f"- effort `{solved['mode']}`: stopped after round {solved.get('after_round')} "
+                         f"({solved.get('stop')}); rounds in `rounds.jsonl`, dossiers in "
+                         f"`solver/hard_queue_{name}.json`")
+            cover = solved.get("coverage") or {}
+            if solved.get("coverage_warning"):
+                lines.append(f"- WARNING: {solved['coverage_warning']}")
+            lines.append(f"- coverage: {cover.get('attempted')} of {cover.get('functions')} catalogued functions "
+                         f"attempted, {cover.get('not_attempted')} not attempted (each with a recorded reason), "
+                         f"{cover.get('unexplained')} unexplained")
+            if solved.get("remaining_by_cause"):
+                lines += ["", "| primary cause | functions | bytes | next action |", "|---|---:|---:|---|"]
+                lines += [f"| {cause} | {g['functions']} | {g['bytes']} | "
+                          + ", ".join(f"{k} {v}" for k, v in sorted(g["next"].items(), key=lambda kv: -kv[1]))
+                          + " |" for cause, g in solved["remaining_by_cause"].items()]
         if item.get("hard_queue"):
             lines += ["", "| remaining cause | functions | bytes |", "|---|---:|---:|"]
             lines += [f"| {g['cause']} | {g['functions']} | {g['bytes']} |" for g in item["hard_queue"]]
@@ -514,10 +795,23 @@ def _markdown(report: dict) -> str:
 
 
 def _args(p):
-    p.add_argument("--project", required=True)
+    p.add_argument("--project", help="project directory (required unless --resume)")
     p.add_argument("--image", action="append", default=[], help="logical image name (repeatable)")
     p.add_argument("--all-images", action="store_true")
-    p.add_argument("--out", required=True, help="output directory for state, queue, reports (not a source tree)")
+    p.add_argument("--out", help="output directory for state, queue, reports (not a source tree; required unless "
+                                 "--resume)")
+    p.add_argument("--effort", choices=sorted(solver.MODES), default=None,
+                   help="effort mode (default normal: exactly the single pass decompile-run always made); deep and "
+                        "exhaustive add later rounds until a fixed point; see docs/solver.md")
+    p.add_argument("--rounds", type=int, help="most rounds (default: the effort mode's)")
+    p.add_argument("--schedule", choices=("observe", "order"),
+                   help="observe: record the ranking's predictions only; order: let it order later rounds' work "
+                        "(default: the effort mode's; never changes what is credited)")
+    p.add_argument("--budget-time", help="stop starting work after this long: seconds, or 30m, 2h")
+    p.add_argument("--budget-builds", type=int, help="stop starting work after this many builds (all images)")
+    p.add_argument("--budget-model-calls", type=int, help="stop asking the refiner after this many calls")
+    p.add_argument("--resume", metavar="RUN_DIR",
+                   help="continue a run from its case store and rounds.jsonl (finished rounds are not redone)")
     p.add_argument("--declare-assumed", action="store_true",
                    help="declare self-describing data addresses (D_<address>) that byte-identical cases lean on "
                         "and verify those cases again (default: [run] declare_assumed)")
@@ -545,7 +839,10 @@ def _args(p):
     p.add_argument("--refine-rounds", type=int)
     p.add_argument("--refine-max-cases", type=int)
     p.add_argument("--refine-max-score", type=int)
-    p.add_argument("--refine-jobs", type=int)
+    p.add_argument("--refine-jobs", type=int, help="refiner calls at once (default 1)")
+    p.add_argument("--refine-known-source", action="append", default=[], metavar="DIR",
+                   help="folder of known source (an imported tree's split/): prompts holding its lines are not "
+                        "sent, and answers reproducing it are flagged as recollection; repeatable")
     p.add_argument("--workers", type=int, default=0,
                    help="worker processes for the resolve stage (default 0: automatic, from hardware "
                         "threads and free memory)")
@@ -553,20 +850,25 @@ def _args(p):
                    help="memory estimate used by automatic worker selection (0: adaptive)")
     p.add_argument("--memory-reserve-mb", type=int, default=0,
                    help="memory excluded from automatic workers (0: adaptive)")
-    p.add_argument("--budget", type=int, default=200, help="maximum builds per function")
+    p.add_argument("--budget", type=int, default=None, help="maximum builds per function (default: the effort "
+                                                                 "mode's; normal 200)")
     p.add_argument("--search-ceiling", type=int, default=None,
                    help="skip the variant search when the best draft scores above this "
                         "(default: [run] search_ceiling, else the resolver's measured default; 0: always search)")
     p.add_argument("--limit", type=int, default=0, help="at most this many functions per image (smallest first)")
-    p.add_argument("--region-recipes", action="store_true",
+    p.add_argument("--region-recipes", action="store_true", default=None,
                    help="enable the experimental region-recipe retry (measured 3/126; off by default)")
-    p.add_argument("--unit-recipes", action="store_true",
+    p.add_argument("--unit-recipes", action="store_true", default=None,
                    help="enable the experimental nearest-unit recipe retry (measured 0/165; off by default)")
     p.add_argument("--skip-unknown-search", action="store_true",
                    help="experimental: skip variant search in unknown-toolchain regions; advisory only by default")
+    p.add_argument("--search-economics", action="store_true", default=None,
+                   help="stop the variant search in a stratum (recipe x first-draft distance) whose searches have "
+                        "returned nothing after a fixed spend, probing it now and then (n64dk.match.economics)")
     p.add_argument("--only-names", action="append",
                    help="attempt only these functions: comma-separated names or @FILE (one per line); repeatable")
-    p.add_argument("--max-size", type=lambda s: int(s, 0), default=0)
+    p.add_argument("--max-size", type=lambda s: int(s, 0), default=None,
+                   help="attempt only functions up to this size (default: the effort mode's; 0: no limit)")
     p.add_argument("--min-confidence", type=float, default=0.8)
     p.add_argument("--strict-only", action="store_true", help="queue only strictly exact cases")
     p.add_argument("--skip-stage", action="append", default=[],
@@ -574,4 +876,16 @@ def _args(p):
     p.add_argument("--redo", action="store_true", help="recompute checkpointed stages")
 
 
-decompile_run.arguments = _args
+def _all_args(p):
+    _args(p)
+    _guard_arguments(p)
+
+
+def _guard_arguments(p):
+    p.add_argument("--wait-for-lock", action="store_true",
+                   help="wait for another heavy n64dk job to finish instead of refusing to start")
+    p.add_argument("--force-resources", action="store_true",
+                   help="start even when memory, memory pressure or disk space are below the thresholds")
+
+
+decompile_run.arguments = _all_args

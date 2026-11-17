@@ -44,10 +44,17 @@ def _run_bounded(command: list[str], workspace: Path, environment: dict[str, str
     """Run a build in its own process group with disk-backed bounded diagnostics."""
     started = time.monotonic_ns()
     output_path = workspace / ".n64dk-build.log"
-    with output_path.open("w+b") as output:
+    from .. import safety
+    # a project build command counts as one worker: nested make runs serially inside it unless
+    # the caller set its own MAKEFLAGS (the machine-wide token bounds the whole tree)
+    environment = {**environment, "MAKEFLAGS": environment.get("MAKEFLAGS", "-j1")}
+    safety.throttle()
+    with safety.token("compile"), output_path.open("w+b") as output:
         process = subprocess.Popen(command, cwd=workspace, env=environment,
                                    stdout=output, stderr=subprocess.STDOUT,
                                    start_new_session=True)
+        safety.limit_child(process.pid)
+        safety.register_tool(process.pid)        # its own session: killed with the job
         deadline = time.monotonic() + limits.timeout_seconds
         exceeded_output = False
         while process.poll() is None:
@@ -63,6 +70,7 @@ def _run_bounded(command: list[str], workspace: Path, environment: dict[str, str
             except ProcessLookupError:
                 pass
             process.wait()
+            safety.unregister_tool(process.pid)
             output.flush()
             output.seek(0, os.SEEK_END)
             size = output.tell()
@@ -76,6 +84,7 @@ def _run_bounded(command: list[str], workspace: Path, environment: dict[str, str
                 f"{reason} ({elapsed_ms} ms):\n{tail.decode(errors='replace')}"
             )
         returncode = process.returncode
+        safety.unregister_tool(process.pid)
         output.flush()
         output.seek(0, os.SEEK_END)
         size = output.tell()

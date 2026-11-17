@@ -67,3 +67,14 @@ class OriginTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReproducedByTest(unittest.TestCase):
+    def test_generated_assembly_is_never_c(self):
+        from n64dk.commands.export import reproduced_by
+        for outcome in ("open", "near", "does-not-build", "not attempted", "blocked-boundary", "matched-source-missing"):
+            self.assertEqual(reproduced_by(outcome, True), "assembly (not decompiled)")
+            self.assertEqual(reproduced_by(outcome, False), "nothing")
+        self.assertEqual(reproduced_by("exact", False), "C")
+        self.assertEqual(reproduced_by("donor-assembly-awaiting-symbols", False), "assembly (donor source)")
+        self.assertEqual(reproduced_by("assembly", False), "assembly (hand-written)")
