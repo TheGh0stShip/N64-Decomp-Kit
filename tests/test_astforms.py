@@ -514,6 +514,7 @@ class KmcRecoveryTest(unittest.TestCase):
         _perturb_and_recover(self, self.compile, TRUTHS["loop"], "control")
 
 
+@unittest.skipUnless(HAVE_PYCPARSER, "pycparser not installed")
 class ConstantFalseLoopTest(unittest.TestCase):
     """``do { ... } while (0)`` must never become a pre-tested loop: the body would stop running."""
 
