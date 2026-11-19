@@ -12,4 +12,6 @@ CI checks accounting and source drift from the reviewed export. Independent ROM-
 
 For ByteMatch, also pass `--objdiff build/report.json` and upload it from successful default-branch push workflows as `<VERSION>_report`. For an incomplete catalogue, use a version label such as `usa-catalogued` and document its scope. Check ByteMatch's versioned project JSON for ingestion at the pushed commit before adding badges. The report measures matching code and functions. Full relink and data remain unmeasured.
 
-ByteMatch displays a missing fuzzy score as zero. Set the score to the verified exact-match percentage as a lower bound, at the report, category, and unit levels. Document that partial matches are unmeasured. Keep linked-code and completed-unit credit reserved for verified project relinks.
+ByteMatch displays a missing fuzzy score as zero. Set the score to the verified exact-match percentage as a lower bound, at the report, category, and unit levels. Document that partial matches are unmeasured.
+
+For a verified project relink, commit `progress-linked.tsv` with tab-separated columns `image function vram code_size source_sha256`. Credit only strict C ranges actually placed from compiled objects in a byte-identical linked image. Check the linker's per-unit report and record the ROM digest, exact tool and input revisions, link result, and preserved-input policy. Exclude raw stand-ins and padding from the credited byte count. Keep original object order, source-only reconstruction, and whole-ROM coverage separate.
