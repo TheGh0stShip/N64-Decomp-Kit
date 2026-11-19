@@ -9,3 +9,5 @@ Use this procedure for each title import and every later progress change. Preser
 5. Update the README with the scoped byte ratio first, the function ratio second, and the report link. Push source, inventory, and report in the same change. Verify the remote head and CI artifact. Where a tracker is configured, check its ingestion or listing separately. A refresh request is not confirmation of a published listing.
 
 CI checks accounting and source drift from the reviewed export. Independent ROM-backed rebuilds supply matching evidence. Use the same report for further progress updates. Preserve distinct scopes for assets, overall ROM mapping, assembly, and full relinking.
+
+For ByteMatch, also pass `--objdiff build/report.json` and upload it from successful default-branch push workflows as `<VERSION>_report`. For an incomplete catalogue, use a version label such as `usa-catalogued` and document its scope. Check ByteMatch's versioned project JSON for ingestion at the pushed commit before adding badges. The report measures matching code and functions. Full relink and data remain unmeasured.
