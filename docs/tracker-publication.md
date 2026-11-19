@@ -11,3 +11,5 @@ Use this procedure for each title import and every later progress change. Preser
 CI checks accounting and source drift from the reviewed export. Independent ROM-backed rebuilds supply matching evidence. Use the same report for further progress updates. Preserve distinct scopes for assets, overall ROM mapping, assembly, and full relinking.
 
 For ByteMatch, also pass `--objdiff build/report.json` and upload it from successful default-branch push workflows as `<VERSION>_report`. For an incomplete catalogue, use a version label such as `usa-catalogued` and document its scope. Check ByteMatch's versioned project JSON for ingestion at the pushed commit before adding badges. The report measures matching code and functions. Full relink and data remain unmeasured.
+
+ByteMatch displays a missing fuzzy score as zero. Set the score to the verified exact-match percentage as a lower bound, at the report, category, and unit levels. Document that partial matches are unmeasured. Keep linked-code and completed-unit credit reserved for verified project relinks.
