@@ -66,6 +66,12 @@ unpacked when the game packs it). Games whose boot loader unpacks the program wi
 unknown codec are emulated, and the game's own routine is used as the codec. Add
 `--require-complete` to fail while any byte is still `unknown`.
 
+The published [N64 retail build survey](docs/research/N64_BUILD_VERSIONS.md) applies this evidence
+pipeline to 66 ROMs and reports detected libultra release ranges, compiler-family shares, graphics
+microcode strings and function counts. Machine-readable [CSV](docs/research/N64_BUILD_VERSIONS.csv)
+and [JSON](docs/research/N64_BUILD_VERSIONS.json) accompany the report. Compiler results are family
+classifications rather than exact historical version claims; ambiguous SDK ranges remain explicit.
+
 For a ROM-only unattended decompilation pass:
 
 ```bash
