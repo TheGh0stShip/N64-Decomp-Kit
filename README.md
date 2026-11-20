@@ -21,6 +21,9 @@ manifests, sources); nothing is hard-coded to one game.
   compare it relocated against the ROM with classified diffs, sweep pipelines and flags,
   re-verify whole manifests, diagnose the residual mechanism, explain GCC 2.7.x allocator
   dumps, enforce provenance, and use permutation only for the appropriate residual stage.
+* **Code rules**: identical bytes alone are not a match. A mechanical checker reports the
+  fakematches (unused locals, `volatile` carriers, empty blocks, offset casts, scattered
+  declarations) that make a byte-identical function `MATCH-PENDING`, and the open naming work.
 * **Autonomous tranches**: build interval-correct progress inventories, rank complete remaining
   functions, collect one-call context bundles, and distribute persistent matching sessions
   across functions while stopping exact winners independently.
@@ -89,6 +92,11 @@ resume without repeating settled work. `decompile-export` keeps four categories
 separate: strictly verified C, C awaiting independent symbol declarations, verified assembly, and
 generated assembly for code not decompiled. Generated assembly and raw-word fallbacks provide byte
 coverage but never count as C decompilation.
+
+The export reports two numbers for C: *bytes identical* and *matched under the code rules*. The
+second is the headline: a byte-identical function whose source carries fake code, an offset cast
+or a declaration outside its header is `MATCH-PENDING` and is not counted. See
+[docs/code-rules.md](docs/code-rules.md).
 
 The run planner is deliberately conservative: at most four build jobs by default, with 2 GiB held
 in reserve and observed swap reported in the `resource-plan` event. Set `N64DK_MAX_JOBS` to lower
@@ -200,7 +208,8 @@ export, and proof boundaries.
 | `match-diagnose COMPILED TARGET` | Rank boundary/toolchain/semantic/type/regalloc/reload/scheduling causes |
 | `gcc27-regalloc FILE.lreg [--global-dump FILE.greg]` | Explain GCC 2.7.x pseudo priorities, ties and hard-register assignments |
 | `toolchain-fingerprint --profile P --file ROLE=PATH...` | Content-hash the real compiler/assembler/linker identity |
-| `provenance-audit SOURCE...` | Reject assembly escapes, unproven assembly and non-proof-grade credit |
+| `provenance-audit SOURCE...` | Reject assembly escapes, fake code (the [match] code rules), unproven assembly and non-proof-grade credit |
+| `code-rules SOURCE... [--project DIR] [--strict] [--declarations]` | Check sources against the code rules: [match] findings (`MATCH-PENDING`), exceptions, `ORIGINAL-ASM`, and advisory open work |
 | `research-audit SOURCES.tsv FINDINGS.tsv` | Reject unindexed, search-only or low-quality evidence before automation |
 
 `match-iterate` never edits its input. It validates the project image and strict function entry,
@@ -263,6 +272,8 @@ report = survey.run(rom)["report"]
 * [docs/audio.md](docs/audio.md), [docs/graphics.md](docs/graphics.md),
   [docs/compression.md](docs/compression.md): assets
 * [docs/matching.md](docs/matching.md): toolchains, pipelines and matching
+* [docs/code-rules.md](docs/code-rules.md): what counts as matched: the [match] rules, the
+  checker, the project profile and how credit, search and export apply them
 * [docs/autonomous-matching.md](docs/autonomous-matching.md): persistent matching jobs,
   usage, evidence, verification boundary and limitations
 * [docs/autonomous-tranches.md](docs/autonomous-tranches.md): interval inventories, context

@@ -81,7 +81,22 @@ def _candidate(project: Path, row: dict) -> dict | None:
             "function_name_present": named, "prototypes": prototypes[:4],
             "include_order": re.findall(r'(?m)^\s*#\s*include\s*[<"]([^>"]+)', text),
             "callees": calls,
-            "provenance": verdict.verdict.value, "provenance_reasons": list(verdict.reasons)}
+            "provenance": verdict.verdict.value, "provenance_reasons": list(verdict.reasons),
+            "code_rules": _code_rules(project, selected["path"], text)}
+
+
+def _code_rules(project: Path, path: str, text: str) -> dict:
+    """What the code rules say about the selected candidate as it stands: whether identical bytes
+    would count, and the open naming work."""
+    from . import coderules
+    try:
+        profile = coderules.Profile.load(project)
+    except (OSError, ValueError) as error:
+        return {"status": "unknown", "reason": str(error)}
+    report = coderules.check_source(text, path, profile)
+    summary = report.summary()
+    return {"status": summary["status"], "match_findings": summary["match_findings"],
+            "advisory": summary["advisory"], "blocking": [finding.text() for finding in report.blocking[:12]]}
 
 
 def _declarations(project: Path, candidate: dict | None) -> dict:

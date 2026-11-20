@@ -56,6 +56,12 @@ Rules:
 - The compiler output is compared instruction by instruction. Registers, instruction order,
   stack frame size and stack offsets all have to agree, so the types, the order of declarations
   and statements, and the use of temporaries matter.
+- Write what the original programmer would have typed. Identical bytes reached through a trick
+  are not a match and are not counted: no unused or dummy locals, no `volatile` to force a load
+  or a store, no empty `if`/`else` blocks or bare `;`, no `do { } while (0)`, no self-assignment,
+  no `+ 0` or `* 1`, no `*(T *)((u8 *)p + N)` where a struct member fits. When only such a trick
+  matches, look for what it hides: a macro or inline helper, a different type, two variables
+  merged into one, a different statement order.
 """
 
 

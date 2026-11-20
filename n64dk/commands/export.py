@@ -44,6 +44,73 @@ def reproduced_by(outcome: str, disassembled: bool) -> str:
     return "assembly (not decompiled)" if disassembled else "nothing"
 
 
+def rules_column(outcome: str, blocked: list[str] | None) -> str:
+    """The ``rules`` column of a function's row.  ``blocked`` is the [match] rules that fire in its
+    source (None when the source was not checked).  Identical bytes with a blocked rule are
+    ``MATCH-PENDING``; hand-written assembly is ``ORIGINAL-ASM``, counted neither as matched nor
+    in the total; a donor's source belongs to another project and keeps that project's profile."""
+    if outcome == "assembly":
+        return "ORIGINAL-ASM"
+    if outcome in ("donor", "donor-awaiting-symbols"):
+        return "unchecked (donor)"
+    if outcome not in ("exact", "awaiting-symbols") or blocked is None:
+        return ""
+    return "MATCH-PENDING: " + ",".join(blocked) if blocked else "pass"
+
+
+def _profile_text(name: str, recipes: dict[str, int], summary: dict, relaxed: dict) -> str:
+    """The project profile the code rules expect in a project's ``AGENTS.md``, filled with what the
+    run established and saying plainly what it did not."""
+    seen = [f"  - `{recipe}`: {count:,} functions" for recipe, count in
+            sorted(recipes.items(), key=lambda item: -item[1])[:12]] or ["  - none: no function matched from C"]
+    changes = [f"- {rule} relaxed: {reason}" for rule, reason in sorted(relaxed.items())] or [
+        "- none.  A rule is tightened or relaxed here, with its reason, and in `[code_rules]` of `n64dk.toml`."]
+    pending = ", ".join(f"{rule} {count:,}" for rule, count in sorted(summary["pending_by_rule"].items()))
+    return "\n".join([
+        f"# Project profile: {name}", "",
+        "Written by `n64dk decompile-export`.  It is the profile the code rules read (`docs/code-rules.md` in",
+        "n64dk): edit it as evidence arrives.  Where it says *not established*, nothing has been proved yet.", "",
+        "## Compiler and dialect", "",
+        "- Build recipes of the functions matched from C (pipeline and flags, from `FUNCTIONS.tsv`):", *seen,
+        "- Dialect: write only what these compilers accept.  IDO is C89: declarations at the top of a block, no",
+        "  declarations in a `for` header.  KMC and SN GCC are GCC 2.x: pre-C99, with the GNU extensions of",
+        "  that release.  No `stdint.h`, no `stdbool.h`.", "",
+        "## Annotation and parking", "",
+        "- One function per file, as verified.  No parking mechanism is defined: a function that does not match",
+        "  stays as assembly under `asm_not_decompiled/` and is not C.",
+        "- A function the evidence shows was written in assembly is `ORIGINAL-ASM` (`asm/`), listed apart and",
+        "  counted neither as matched nor in the total.", "",
+        "## Naming style", "",
+        "- *Not established.*  No evidence of the original's naming has been recorded.  Names are addresses",
+        "  (`func_80012345`, `D_80123456`) unless an SDK signature named them.  These are placeholders and open",
+        "  naming work (R7), not a failed match.  Never replace one with a confident invented name: use the",
+        "  binary's own evidence first (error strings that start with a function name, SDK signatures).",
+        "- Placeholder patterns the checker reports: `func_XXXXXXXX`, `D_XXXXXXXX`, `jtbl_XXXXXXXX`, `argN`,",
+        "  `temp_*`, `var_*`, `phi_*`, `spXX`, `unkXX`, `M2C_*`, and address-like names.", "",
+        "## Layout style", "",
+        "- *Not established.*  Record the brace placement, indent, line limit and banner forms here once chosen,",
+        "  per module where modules differ.", "",
+        "## Evidence sources", "",
+        "- SDK signatures (`symbols/sdk_symbols.txt`), the survey's ledger (`config/ledger.tsv`), strings in the",
+        "  ROM, donor units (`donors/`), development records where `n64dk dev-records-scan` finds any.", "",
+        "## Line information", "",
+        "- *Not established.*  If the retail image or its development records carry source line numbers, layout",
+        "  changes are not free: rerun the byte gate after any reformatting.", "",
+        "## Commands", "",
+        "- Per-function check: `n64dk match --project project --addr VRAM --size SIZE --pipeline PIPELINE",
+        "  --flags=\"FLAGS\" src/<image>/FUNCTION.c` (values from the function's row in `FUNCTIONS.tsv`).",
+        "- Byte gate: `n64dk match-batch` or `n64dk manifest-verify` over `manifests/`.",
+        "- Rule checker: `n64dk code-rules src --project . --strict`.", "",
+        "## Where this export stands", "",
+        f"- Functions matched under the rules: {summary['pass']:,}.  MATCH-PENDING: {summary['match_pending']:,}"
+        + (f" ({pending})." if pending else "."),
+        "- A function is matched only when its bytes are identical *and* every [match] rule passes (R1, R2, R4,",
+        "  R13, R17, R18).  `RULES.tsv` lists every finding; `DECLARATIONS.tsv` lists every `extern` by name.",
+        "- Each exported source declares what it needs locally.  That is scaffolding: give every global one",
+        "  `extern` in one header and every type one definition, rebuild, and rerun the byte gate.", "",
+        "## Rule changes", "", *changes, ""])
+
+
 def _origin(case) -> str:
     """How a case was matched, from its own record."""
     kinds = [stage.get("stage") for stage in case.stages]
@@ -166,6 +233,8 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
         store.close()
     out.mkdir(parents=True, exist_ok=True)
     rows, counts, pending = [], {}, []
+    checked: dict[str, str] = {}             # exported C of this run, by its path in the tree
+    recipes: dict[str, int] = {}
     rom_sha1, rom_name, rom_size = None, None, None
     for name in sorted(registry):
         spec = imagemod.resolve(project, name)
@@ -212,6 +281,9 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                     target = out / path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(text)
+                    if outcome != "assembly":
+                        checked[path] = text
+                        recipes[case.recipe] = recipes.get(case.recipe, 0) + 1
                     how = f"{case.recipe} ({_origin(case)})" if outcome != "assembly" else case.recipe
                 elif outcome in ("exact", "awaiting-symbols", "assembly"):
                     outcome = "matched-source-missing"
@@ -250,7 +322,33 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
             row[8] = found
         reproduced[kind] += 1
         row.append(kind)
-    header = "image\tfunction\tvram\trom_offset\tsize\tcode_size\toutcome\thow\tsource\tdistance\treproduced_by\n"
+    # Identical bytes are not yet a match: every [match] code rule has to pass as well.
+    from ..match import coderules
+    profile = coderules.Profile.load(project)
+    report = coderules.check(checked, profile)
+    rules = {"pass": 0, "match_pending": 0, "original_asm": 0, "unchecked_donor": 0, "pass_awaiting_symbols": 0,
+             "pending_by_rule": {}}
+    for row in rows:
+        blocked = report.blocked_rules(row[8]) if row[8] in checked else None
+        column = rules_column(row[6], blocked)
+        row.append(column)
+        key = {"pass": "pass", "ORIGINAL-ASM": "original_asm", "unchecked (donor)": "unchecked_donor"}.get(
+            column, "match_pending" if column.startswith("MATCH-PENDING") else None)
+        if key == "pass" and row[6] != "exact":
+            key = "pass_awaiting_symbols"            # no rule fires, but only a strict verdict is a match
+        if key:
+            rules[key] += 1
+        for rule in blocked or ():
+            rules["pending_by_rule"][rule] = rules["pending_by_rule"].get(rule, 0) + 1
+    rules["open_naming"] = len({finding.path for finding in report.of(coderules.ADVISORY) if finding.rule == "R7"})
+    rules["relaxed"] = dict(profile.relax)
+    (out / "RULES.tsv").write_text("source\tline\tfunction\trule\ttier\tmessage\n" + "".join(
+        f"{f.path}\t{f.line}\t{f.function or ''}\t{f.rule}\t{f.tier}\t{f.message}\n" for f in report.findings))
+    (out / "DECLARATIONS.tsv").write_text("name\tkind\tfiles\tconflict\tdeclarations\n" + "".join(
+        f"{row['name']}\t{row['kind']}\t{row['files']}\t{'yes' if row['conflict'] else 'no'}\t"
+        f"{' | '.join(row['declarations'])}\n" for row in coderules.declarations(checked)))
+    header = ("image\tfunction\tvram\trom_offset\tsize\tcode_size\toutcome\thow\tsource\tdistance\treproduced_by"
+              "\trules\n")
     (out / "FUNCTIONS.tsv").write_text(header + "".join("\t".join(row) + "\n" for row in rows))
     (out / "MATCHED.tsv").write_text(header + "".join("\t".join(row) + "\n" for row in rows if row[6] in MATCHED))
     for item in sorted((run / "queue").glob("*")) if (run / "queue").is_dir() else []:
@@ -272,13 +370,22 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
         counts.get("donor-assembly-awaiting-symbols", 0)
     name = title or rom_name or project.name
     order = [*MATCHED, *sorted(key for key in counts if key not in MATCHED)]
+    counted = total - rules["original_asm"]          # hand-written assembly is in neither count
+    by_rule = ", ".join(f"{rule} {count:,}" for rule, count in sorted(rules["pending_by_rule"].items()))
+    (out / "AGENTS.md").write_text(_profile_text(name, recipes, rules, profile.relax))
     readme = [f"# {name}", "",
               "Functions of this title that an unattended `n64dk decompile-run` reproduced byte for byte, from the ROM",
               "alone.  Nothing of the ROM is in this tree: sources, symbol files, build recipes and the function table.", "",
               f"- ROM header name: `{rom_name}`", f"- ROM SHA-1: `{rom_sha1}`", f"- ROM size: {rom_size} bytes",
               f"- Functions found: {total:,}",
-              f"- Matched from C: {from_c:,} ({from_c / total:.1%})" if total else "- Matched from C: 0",
-              f"- Hand-written code kept as assembly: {counts.get('assembly', 0):,}",
+              f"- **Matched under the code rules: {rules['pass']:,} of {counted:,} ({rules['pass'] / counted:.1%})**: "
+              "strictly exact C with every [match] rule passing" if counted else "- Matched under the code rules: 0",
+              f"- Bytes identical from C: {from_c:,} ({from_c / total:.1%})" if total else "- Bytes identical from C: 0",
+              f"- MATCH-PENDING (bytes identical, a [match] rule fails; not counted): {rules['match_pending']:,}"
+              + (f" ({by_rule})" if by_rule else ""),
+              f"- Donor C, rules not checked here (the donor project's profile applies): {rules['unchecked_donor']:,}",
+              f"- Sources with placeholder names (open naming work, not a failed match): {rules['open_naming']:,}",
+              f"- Hand-written code kept as assembly (ORIGINAL-ASM, in neither count): {counts.get('assembly', 0):,}",
               f"- Verified donor assembly (not counted as C): "
               f"{counts.get('donor-assembly', 0) + counts.get('donor-assembly-awaiting-symbols', 0):,}",
               f"- Not decompiled, covered by assembly that assembles to the same bytes: "
@@ -302,7 +409,12 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     readme += ["", "## Layout", "",
                "- `FUNCTIONS.tsv`: every function with its address, size, outcome, recipe and source file.  `size` is",
                "  the catalogue's span (it may end in alignment padding); `code_size` is what the source reproduces.",
-               "- `MATCHED.tsv`: the matched ones only.",
+               "  `rules` says whether identical bytes count: `pass`, `MATCH-PENDING: <rules>`, `ORIGINAL-ASM` or",
+               "  `unchecked (donor)`.",
+               "- `MATCHED.tsv`: the byte-identical ones only (read `rules` before counting one as matched).",
+               "- `RULES.tsv`: every code-rule finding in the exported C, [match] and advisory.",
+               "- `DECLARATIONS.tsv`: every `extern` by name, with each way it is declared and in how many files.",
+               "- `AGENTS.md`: the project profile the code rules read (dialect, naming, commands, rule changes).",
                "- `src/<image>/<function>.c`: strictly exact functions, one per file, as they were verified.",
                "- `src_awaiting_symbols/`: byte-identical functions that wait for a symbol to be declared",
                "  (`manifests/symbols.assumed.txt` lists the declarations).",
@@ -318,6 +430,17 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                "Each source is a single function with the declarations the decompiler needed; names are addresses",
                "(`func_80012345`, `D_80123456`) unless a library signature named them.  Sources under `donors/` come",
                "from other projects (the SDK library source, other decompiled titles) and keep those projects' terms.", "",
+               "## Matched, and matched under the rules", "",
+               "Identical bytes prove a source is faithful; they do not prove it is the source.  A function counts",
+               "as matched only when its bytes are identical and no [match] code rule fires in its source: one",
+               "declaration per type and global (R1, R2), typed members instead of offset casts (R4), no fake code",
+               "(R17: unused locals, `volatile` carriers, empty blocks, `do { } while (0)`, `+ 0`), no assembly",
+               "bodies (R18).  Otherwise it is MATCH-PENDING: reported, not counted.", "",
+               "A source exported here declares what it needs in its own file, so a function that names a global is",
+               "MATCH-PENDING under R2 until the declarations are gathered into shared headers (`DECLARATIONS.tsv`",
+               "is the work list; a name declared in two ways is a conflict to settle first).  Rebuild and rerun",
+               "the byte gate after each such change: moving a declaration can move data.  `n64dk code-rules src",
+               "--project . --strict` repeats the check.", "",
                "## Checking a function", "",
                "```sh", "n64dk decompile-init ROM.z64 --out project",
                "n64dk match --project project --addr VRAM --size SIZE --pipeline PIPELINE --flags=\"FLAGS\" src/main/FUNCTION.c",
@@ -345,6 +468,7 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     (out / "COVERAGE.md").write_text("\n".join(lines))
     (out / "README.md").write_text("\n".join(readme))
     return {"title": name, "rom_sha1": rom_sha1, "functions": total, "matched": matched, "from_c": from_c,
+            "code_rules": rules,
             "reproduced_by": reproduced, "rom": coverage and {k: coverage[k] for k in (
                 "rom_bytes", "rows", "gap_bytes", "overlap_bytes", "bytes_by_class", "unclassified_ranges")},
             "counts": {key: counts[key] for key in order if counts.get(key)}, "out": str(out)}

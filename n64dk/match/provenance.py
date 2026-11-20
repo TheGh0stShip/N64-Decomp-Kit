@@ -1,4 +1,10 @@
-"""Credit policy for genuine C and positively proven handwritten assembly."""
+"""Credit policy for genuine C and positively proven handwritten assembly.
+
+Two questions are kept apart.  ``scan_c`` asks whether a candidate is ordinary C at all (no
+assembly escape); a search uses it to decide what it may compile.  ``judge_c`` asks whether a
+byte-identical source may be *credited*: it must also pass every [match] code rule
+(``n64dk.match.coderules``).  A source that is ordinary C and fails one is ``MATCH_PENDING``:
+reported, never counted."""
 from __future__ import annotations
 
 import re
@@ -13,6 +19,7 @@ class Verdict(str, Enum):
     GENERATED_ASM = "generated-or-reference-assembly"
     INSUFFICIENT = "insufficient-provenance"
     FORBIDDEN = "forbidden-matching-escape"
+    MATCH_PENDING = "match-pending"
 
 
 FORBIDDEN_C = {
@@ -41,10 +48,25 @@ def scan_c(source: str) -> ProvenanceResult:
     return ProvenanceResult(Verdict.GENUINE_C, ("no forbidden assembly escape found",))
 
 
-def classify_source(path: str | Path, handwritten_evidence: tuple[str, ...] = ()) -> ProvenanceResult:
+def judge_c(source: str, path: str = "<source>.c", profile=None) -> ProvenanceResult:
+    """Whether byte-identical C may be credited: no assembly escape and no [match] rule finding.
+    The evidence lists each blocking finding (``path:line: rule: message``)."""
+    scanned = scan_c(source)
+    if scanned.verdict == Verdict.FORBIDDEN:
+        return scanned
+    from . import coderules
+    report = coderules.check_source(source, path, profile)
+    if report.blocking:
+        return ProvenanceResult(Verdict.MATCH_PENDING,
+                                tuple(f"code rule {rule}" for rule in report.by_rule(coderules.MATCH)),
+                                tuple(finding.text() for finding in report.blocking))
+    return ProvenanceResult(Verdict.GENUINE_C, ("no forbidden assembly escape found", "every [match] code rule passes"))
+
+
+def classify_source(path: str | Path, handwritten_evidence: tuple[str, ...] = (), profile=None) -> ProvenanceResult:
     path = Path(path)
     if path.suffix.lower() == ".c":
-        return scan_c(path.read_text(errors="replace"))
+        return judge_c(path.read_text(errors="replace"), path.name, profile)
     if path.suffix.lower() not in (".s", ".asm"):
         return ProvenanceResult(Verdict.INSUFFICIENT, ("unsupported source type",))
     if handwritten_evidence:

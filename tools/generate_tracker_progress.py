@@ -104,11 +104,33 @@ def generate(root):
         linked_bytes = sum(int(row["code_size"], 0) for row in rows if function_key(row) in linked)
         tracks.append(track("linked-c-code", "Matching C linked in a verified pinned image",
                             linked_bytes, total_bytes, "bytes"))
+    if "rules" in rows[0]:
+        tracks.append(track("matched-under-rules", "Matching C that passes every [match] code rule",
+                            *rules_measure(rows, verified), "bytes"))
     return {
         "format": "decomphub.progress/v1",
         "repository": config["repository"],
         "tracks": tracks,
     }
+
+
+def rules_measure(rows, verified):
+    """Bytes matched under the code rules, and the bytes they are measured against.
+
+    Identical bytes count only when the inventory's ``rules`` column says ``pass``; a
+    ``MATCH-PENDING`` function is byte-identical and not counted.  ``ORIGINAL-ASM`` (code written
+    in assembly) is in neither number."""
+    completed = total = 0
+    for row in rows:
+        status, size = row["rules"], int(row["code_size"], 0)
+        if status == "ORIGINAL-ASM":
+            continue
+        if status not in ("", "pass", "unchecked (donor)") and not status.startswith("MATCH-PENDING: R"):
+            raise ValueError(f"unknown rules status {status!r}: {function_key(row)}")
+        total += size
+        if status == "pass" and function_key(row) in verified:
+            completed += size
+    return completed, total
 
 
 def main():

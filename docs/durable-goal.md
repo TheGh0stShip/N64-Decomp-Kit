@@ -11,7 +11,9 @@ similarity, not compiler utilisation.
 
 **Invariants (never traded for progress).**
 1. Credit requires ordinary C, an unmodified historical toolchain and equality of every owned byte
-   under `verify.strict_compare` (no address taken from the retail bytes being compared).
+   under `verify.strict_compare` (no address taken from the retail bytes being compared), and source
+   that passes every [match] code rule (`match/coderules.py`). Byte-identical source that fails one is
+   `MATCH-PENDING`: a clue to the original, reported and not counted.
 2. No copied bytes, raw instruction directives, inline or register assembly, function-specific
    output rewriting, weakened comparison or invalid boundaries.
 3. Nothing in core is specific to one game: no names, addresses, directory or manifest conventions.
@@ -24,6 +26,7 @@ similarity, not compiler utilisation.
 |---|---|---|
 | Facts from bytes | `analysis/flow.py` (CFG, liveness, frame, NOP roles, shapes), `analysis/values.py` (value tracking), `analysis/abi.py` (prototype evidence), `analysis/structures.py` (cross-function layout constraints), `analysis/fragments.py` | integrated; ABI/layout results are evidence, never truth |
 | Proof | `match/verify.py` (strict oracle), `manifest-verify`, durable verification receipts, `match/reconcile.py` | integrated; only strict current-target receipts grant C coverage |
+| Source honesty | `match/coderules.py` ([match] rules, advisory findings, project profile), `provenance.judge_c`, `code-rules` | integrated in credit, `provenance-audit`, `investigate` and `decompile-export`; not yet measured on a finished project |
 | Diagnosis | `match/causes.py` (stable taxonomy, typed residuals, compiler family), `match/hints.py` | integrated |
 | Search | `match/iterate.py` + `match/families.py` (types, lifetime, volatile, globals, pointer, control), recipe stage | integrated with semantic-review flags and full-object ranking |
 | Cases | `match/resolve.py` (durable cases, strict escalation ladder, hard queue), tranche JSONL events | integrated |
@@ -45,5 +48,7 @@ records those limits instead of silently presenting guesses as recovered source.
   recover it.
 - *Strict share*: fraction of manifest units that are `exact` (not `assumed`) under
   `manifest-verify`.
+- *Rule share*: fraction of byte-identical C functions that are matched under the code rules
+  (`pass`, not `MATCH-PENDING`), and the checker's false-positive rate on a finished project.
 
 **Order of work.** See `ROUND4_REPORT.md` section 6 (next steps) and the wishlist coverage table.

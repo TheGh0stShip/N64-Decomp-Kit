@@ -88,13 +88,16 @@ def _diagnose_args(p):
 match_diagnose.arguments = _diagnose_args
 
 
-@command("provenance-audit", "Reject assembly escapes and unproven assembly progress credit")
+@command("provenance-audit", "Reject assembly escapes, fake code (the [match] code rules) and unproven assembly "
+                             "progress credit")
 def provenance_audit(args):
+    from ..match.coderules import Profile
     evidence = tuple(args.handwritten_evidence)
+    profile = Profile.load(args.project)
     rows = []
     for name in args.source:
         path = Path(name)
-        result = classify_source(path, evidence if path.suffix.lower() in (".s", ".asm") else ())
+        result = classify_source(path, evidence if path.suffix.lower() in (".s", ".asm") else (), profile)
         rows.append({"source": str(path), "verdict": result.verdict.value,
                      "creditable": result.creditable, "reasons": result.reasons,
                      "evidence": result.evidence,
@@ -111,6 +114,7 @@ def _provenance_args(p):
     p.add_argument("--exact", action="store_true")
     p.add_argument("--ownership-verified", action="store_true")
     p.add_argument("--normalizer-specific", action="store_true")
+    p.add_argument("--project", help="project directory whose n64dk.toml [code_rules] profile applies")
 
 
 provenance_audit.arguments = _provenance_args
