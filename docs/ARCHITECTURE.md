@@ -43,6 +43,7 @@ and Mario Kart 64 (NKTE), located through `n64dk.fixtures` (roms.toml / N64DK_RO
 | `n64dk.match.results` | content-addressed historical observations, target validity and residual families |
 | `n64dk.operations` | project-script discovery, typed operation schema and shell-free invocation gateway |
 | `n64dk.match.provenance` | genuine-C and positive handwritten-assembly credit policy |
+| `n64dk.match.coderules` | mechanical code rules: [match] findings that make identical bytes `MATCH-PENDING`, advisory open work, the project profile |
 | `n64dk.research` | source/finding quality audit before research is automated |
 | `n64dk.commands.*` | CLI subcommands (one module per area), registered with `@command` |
 
@@ -70,6 +71,10 @@ bytes under an authoritative mapping.
 * Production proof uses the unmodified original toolchain and exact owned sections. Compiler
   traces and forced decisions are diagnostic only; function-specific output normalizers are
   not proof-grade.
+* Identical bytes alone are not a match. Credit also requires every [match] code rule to pass
+  (`provenance.judge_c`, [code-rules.md](code-rules.md)); otherwise the function is
+  `MATCH-PENDING`. A search may write any shape; what it may claim is decided on its result's
+  text. Reports give both numbers.
 * ROMs, compiler binaries, absolute private paths, credentials, remote-worker identities and
   local content caches stay outside Git.
 * Tests: `python -m unittest discover -s tests -t .`; ROM-dependent tests skip when the

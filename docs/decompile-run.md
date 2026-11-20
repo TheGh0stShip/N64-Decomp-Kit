@@ -455,6 +455,11 @@ Dr. Mario 64 732 strict + 50 awaiting of 1,430.
   (`asm_not_decompiled/`).  That is a disassembly, not a decompilation; the table
   (`FUNCTIONS.tsv`, column `reproduced_by`) and the counts keep the three apart.  A function
   with several jump tables gets each table in a section of its own.
+- a function matched from C counts as matched only when every [match] code rule passes in its
+  source.  The `rules` column says so (`pass`, `MATCH-PENDING: <rules>`, `ORIGINAL-ASM`,
+  `unchecked (donor)`), the README gives *matched under the code rules* as the headline next to
+  *bytes identical*, `RULES.tsv` lists every finding, `DECLARATIONS.tsv` every `extern` by name,
+  and `AGENTS.md` is the project profile ([code-rules.md](code-rules.md));
 - `COVERAGE.md` gives the functions by what reproduces them and **every byte of the ROM by
   class**, from the survey's ledger: its rows cover the ROM from the first byte to the last, and
   the report states the bytes no row covers and the bytes two rows claim (both must be 0).

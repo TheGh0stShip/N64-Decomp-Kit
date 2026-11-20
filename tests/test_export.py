@@ -78,3 +78,83 @@ class ReproducedByTest(unittest.TestCase):
         self.assertEqual(reproduced_by("exact", False), "C")
         self.assertEqual(reproduced_by("donor-assembly-awaiting-symbols", False), "assembly (donor source)")
         self.assertEqual(reproduced_by("assembly", False), "assembly (hand-written)")
+
+
+class CodeRulesTest(unittest.TestCase):
+    """Identical bytes are counted as matched only when every [match] code rule passes."""
+    CLEAN = "/* adds one */\ns32 func_80000000(s32 arg0) {\n    return arg0 + 1;\n}\n"
+    PADDED = "/* adds two */\ns32 func_80000010(s32 arg0) {\n    s32 pad;\n    return arg0 + 2;\n}\n"
+    GLOBAL = "extern s32 D_80000100;\n/* reads */\ns32 func_80000020(void) {\n    return D_80000100;\n}\n"
+    ROUTINE = "glabel func_80000030\n    jr $ra\n     nop\n"
+
+    def test_the_rules_column(self):
+        self.assertEqual(export.rules_column("exact", []), "pass")
+        self.assertEqual(export.rules_column("awaiting-symbols", ["R2", "R17"]), "MATCH-PENDING: R2,R17")
+        self.assertEqual(export.rules_column("assembly", None), "ORIGINAL-ASM")
+        self.assertEqual(export.rules_column("donor", None), "unchecked (donor)")
+        self.assertEqual(export.rules_column("near", None), "")
+        self.assertEqual(export.rules_column("exact", None), "")
+
+    def _project(self, root, relax=""):
+        import csv
+        from n64dk.match import resolve
+        project, run, out = root / "project", root / "run", root / "out"
+        project.mkdir()
+        (project / "main.bin").write_bytes(bytes(0x50))
+        (project / "functions.tsv").write_text("VRAM\tSIZE\tNAME\n" + "".join(
+            f"{0x80000000 + 0x10 * index:08X}\t10\tfunc_{0x80000000 + 0x10 * index:08X}\n" for index in range(5)))
+        (project / "n64dk.toml").write_text('[images.main]\npath = "main.bin"\nvram_delta = 0x80000000\n'
+                                            'catalogue = "functions.tsv"\n' + relax)
+        store = resolve.CaseStore(run / "state")
+        try:
+            for index, (status, text) in enumerate((("exact", self.CLEAN), ("exact", self.PADDED),
+                                                    ("assumed", self.GLOBAL), ("assembly", self.ROUTINE))):
+                vram = 0x80000000 + 0x10 * index
+                store.put(resolve.Case(resolve.case_id("main", vram, 0x10), "main", f"func_{vram:08X}", vram, 0x10,
+                                       "digest", status=status, best_score=0, best_digest=store.save_source(text),
+                                       recipe="kmc -O2"))
+        finally:
+            store.close()
+        result = export.export(project, run, out, title="Test", cover=False)
+        with (out / "FUNCTIONS.tsv").open(newline="") as handle:
+            rows = {row["function"]: row for row in csv.DictReader(handle, delimiter="\t")}
+        return out, result, rows
+
+    def test_an_export_reports_both_numbers(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            out, result, rows = self._project(Path(tmp))
+            self.assertEqual([rows[f"func_800000{index}0"]["rules"] for index in range(5)],
+                             ["pass", "MATCH-PENDING: R17", "MATCH-PENDING: R2", "ORIGINAL-ASM", ""])
+            rules = result["code_rules"]
+            self.assertEqual((result["from_c"], rules["pass"], rules["match_pending"], rules["original_asm"]), (3, 1, 2, 1))
+            self.assertEqual(rules["pending_by_rule"], {"R17": 1, "R2": 1})
+            self.assertEqual(rules["open_naming"], 3)
+            readme = (out / "README.md").read_text()
+            self.assertIn("**Matched under the code rules: 1 of 4 (25.0%)**", readme)        # ORIGINAL-ASM is in neither count
+            self.assertIn("- Bytes identical from C: 3 (60.0%)", readme)
+            self.assertIn("- MATCH-PENDING (bytes identical, a [match] rule fails; not counted): 2 (R17 1, R2 1)", readme)
+            findings = (out / "RULES.tsv").read_text()
+            self.assertIn("src/main/func_80000010.c\t3\tfunc_80000010\tR17\tmatch\tlocal `pad` is never used", findings)
+            self.assertIn("src_awaiting_symbols/main/func_80000020.c\t1\t\tR2\tmatch\t", findings)
+            self.assertIn("D_80000100\tobject\t1\tno\ts32", (out / "DECLARATIONS.tsv").read_text())
+            profile = (out / "AGENTS.md").read_text()
+            self.assertIn("- `kmc -O2`: 3 functions", profile)
+            self.assertIn("Functions matched under the rules: 1.  MATCH-PENDING: 2 (R17 1, R2 1).", profile)
+            self.assertIn("*Not established.*", profile)
+            matched = (out / "MATCHED.tsv").read_text().splitlines()
+            self.assertTrue(matched[0].endswith("\treproduced_by\trules"))
+            self.assertEqual(len(matched), 5)
+
+    def test_a_relaxed_rule_is_named_in_the_profile(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            out, result, rows = self._project(
+                Path(tmp), '[code_rules.relax]\nR2 = "the surviving SDK source declares externs in each unit"\n')
+            self.assertEqual(rows["func_80000020"]["rules"], "pass")
+            # no rule fires any more, but an address nothing confirms is still not a match
+            self.assertEqual((result["code_rules"]["pass"], result["code_rules"]["pass_awaiting_symbols"]), (1, 1))
+            self.assertIn("- R2 relaxed: the surviving SDK source declares externs in each unit",
+                          (out / "AGENTS.md").read_text())

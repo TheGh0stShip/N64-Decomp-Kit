@@ -14,7 +14,14 @@ Every exact result is strictly verified by recompilation, and byte identity mean
 code, so the behaviour, is the retail code's.  The class is provenance: a function whose exact
 source came through ``exploration`` steps was found by search, not recovered by reasoning, and
 reports say so.  Frame padding is ``preserving`` but is reconstruction scaffolding, never natural
-source: it is marked in the source (``SCAFFOLD_MARK``) and counted apart."""
+source: it is marked in the source (``SCAFFOLD_MARK``) and counted apart.
+
+The class says what a step may do to *behaviour*.  It says nothing about whether the result is
+source a programmer would have typed.  Several families write exactly the shapes the code rules
+list as fakematches (``STEERING``): a block that exists only to steer the compiler, a temporary
+with no meaning, a ``volatile`` carrier, an unused frame local.  A winner that came through one
+of them is a clue to the real source; whether it may be credited is decided on its text by
+``n64dk.match.coderules``, never by its class."""
 from __future__ import annotations
 
 PRESERVING, CONDITIONAL, EXPLORATION = "preserving", "conditional", "exploration"
@@ -30,6 +37,18 @@ FAMILY_CLASS = {
     "frame-inline": PRESERVING, "frame-pad": PRESERVING,
 }
 RANK = {PRESERVING: 0, CONDITIONAL: 1, EXPLORATION: 2}
+# Families whose output is a known fakematch shape, with the rule it answers to and what the
+# shape usually hides (the original construct to look for instead).
+STEERING = {
+    "ast-block": ("R17", "`do { } while (0)` / `if (1) { }` wrappers: a macro the original called, or a scoped local"),
+    "frame-pad": ("R17", "an unused local that only sizes the frame: a local or an inlined helper not yet recovered"),
+    "volatile": ("R17", "a `volatile` carrier: a wrong type, an aliasing pointer or a missing call, unless the memory "
+                        "really is a hardware register or shared with an interrupt handler"),
+    "ast-temp": ("R30", "a temporary with no meaning: a named intermediate value or an inlined accessor"),
+    "ast-sameline": ("R35", "two statements on one line: a macro, or line information the recipe depends on"),
+    "ast-cast": ("R19", "an added cast: a wrong declared type"),
+    "casts": ("R19", "an added cast: a wrong declared type"),
+}
 SCAFFOLD_MARK = "/* n64dk: frame padding, reconstruction scaffolding */"
 
 
@@ -51,4 +70,6 @@ def provenance(stages) -> dict:
             scaffold = True
         if stage.get("stage") == "frame-fit" and str(stage.get("chosen") or "").startswith("inlined"):
             helpful.append("frame-inline")
-    return {"families": sorted(set(helpful)), "class": classify(helpful), "scaffolding": scaffold}
+    steering = sorted(set(helpful) & set(STEERING)) + (["frame-pad"] if scaffold else [])
+    return {"families": sorted(set(helpful)), "class": classify(helpful), "scaffolding": scaffold,
+            "steering": steering}

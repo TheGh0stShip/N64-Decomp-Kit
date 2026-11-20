@@ -16,6 +16,11 @@ Use this workflow when bringing a project-adapter unit closer to an exact match.
    temporary object.
 7. An exact score is exploratory until independent verification and project-native checks
    pass.
+8. Identical bytes alone are not a match. Run `n64dk code-rules` on the candidate: a [match]
+   finding (an unused local, a `volatile` carrier, an empty block, `do { } while (0)`, an offset
+   cast, an `extern` outside its header) makes it `MATCH-PENDING`. Treat the trick as a clue to
+   what the original programmer wrote (a macro or helper, a different type, two variables merged
+   into one) and keep looking. See [code-rules.md](code-rules.md).
 
 ## Standard invocation
 
@@ -75,11 +80,14 @@ Report:
 - owned spans verified;
 - residual before and after;
 - exact versus merely best-scoring status;
+- code-rule status: matched under the rules or `MATCH-PENDING` with the rules that fire, the
+  exceptions recorded, and the open naming work;
 - independent-verification result;
 - provenance and ownership obligations still open;
 - exported candidate/evidence paths;
 - project-native commands run and their results.
 
 Never report a completed match when only the diagnostic score reached zero, only `.text`
-agrees, an output normalizer forced equality, or independent verification was not run. Use
+agrees, an output normalizer forced equality, a [match] code rule fires in the source, or
+independent verification was not run. Use
 “exploratory exact candidate” until all proof obligations are closed.
