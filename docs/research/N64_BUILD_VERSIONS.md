@@ -1,6 +1,6 @@
 # Nintendo 64 retail builds: SDK release, compiler family and microcode per game
 
-A lookup table of 66 Nintendo 64 ROM images: which libultra (SDK) release each was linked against, which compiler family built the game code, and which graphics microcode it carries. Every row was produced unattended by [N64 Decomp Kit](https://github.com/TheGh0stShip/N64-Decomp-Kit) from the ROM alone, with no symbols or source. No ROM content is included: only titles, IDs, hashes and version facts.
+A lookup table of 66 Nintendo 64 ROM images: which libultra (SDK) release each was linked against, which compiler family built the game code, and which graphics microcode it carries. Every row was initially produced unattended by [N64 Decomp Kit](https://github.com/TheGh0stShip/N64-Decomp-Kit) from the ROM alone, with no symbols or source. The two Sesame Street function totals were subsequently corrected from their completed matching-decompilation catalogues; the original blind discovery was short by one function in each title. No ROM content is included: only titles, IDs, hashes and version facts.
 
 The presentation is inspired by DecompPipeline's public build-version references for [Xbox 360](https://github.com/GeneralAtrox/DecompPipeline/blob/master/docs/XBOX360_BUILD_VERSIONS.md) and [GameCube](https://github.com/GeneralAtrox/DecompPipeline/blob/master/docs/GAMECUBE_BUILD_VERSIONS.md). The N64 evidence and conclusions below were produced independently from the surveyed ROMs using the methods documented here.
 
@@ -30,7 +30,7 @@ The first is an F3DEX-family microcode with its version. The second is the older
 | SDK (libultra) | library functions located in the game by comparing its code with builds of each libultra release; the releases whose functions fit are listed | evidence from code. Releases whose code is identical for the functions found cannot be told apart, so `2.0D-I` is a real range. |
 | SDK fns | number of library functions identified that way | a count; more functions means a firmer SDK answer |
 | Compiler | share of the game's functions whose code shape fits each compiler family: `kmc` = GCC 2.7.2 as shipped by KMC, `ido` = SGI IDO | inferred. It is a family, not a version or flags, and code from other compilers (SN Systems GCC, GCC 2.8, C++) is counted under the nearest family. |
-| Functions | functions found in the program image | a count from automatic discovery |
+| Functions | functions found in the program image | normally a count from automatic discovery; completed-decompilation corrections are called out explicitly |
 | Middleware | names found as text in the ROM | weak: a string only |
 
 `libgultra` is the GCC-built SDK and `libultra` the IDO-built one; the table shows the release (`_rom`) variant where found.
@@ -87,8 +87,8 @@ The first is an F3DEX-family microcode with its version. The second is the older
 | Ready 2 Rumble Boxing - Round 2 (USA) | N22E | 0 | 32 MB | libgultra 2.0D-I | 304 | kmc 95% | 2224 | F3DLX 1.23, L3DEX 1.23 | - | `42ad558c20dd` |
 | Robotron 64 (USA) | NRXE | 0 | 8 MB | libultra_rom 2.0D-H | 186 | ido 98% | 1542 | F3DEX 1.21, F3DLP.Rej 1.21 | - | `285c720f6426` |
 | Scooby-Doo! - Classic Creep Capers (USA) (Rev 1) | NSYE | 1 | 16 MB | libgultra_rom 2.0K-L | 248 | kmc 96% | 934 | F3DEX 2.08 fifo, L3DEX 2.08 fifo | - | `44dc4f2a148e` |
-| Sesame Street - Elmo's Letter Adventure (USA) | NELE | 0 | 8 MB | libgultra 2.0D-I | 302 | kmc 96% | 963 | F3DEX 1.23 | Factor 5 | `97777ca06f4e` |
-| Sesame Street - Elmo's Number Journey (USA) | NENE | 0 | 8 MB | libgultra 2.0D-I | 302 | kmc 96% | 972 | F3DEX 1.23 | Factor 5 | `7195ea96d9fe` |
+| Sesame Street - Elmo's Letter Adventure (USA) | NELE | 0 | 8 MB | libgultra 2.0D-I | 302 | kmc 96% | 964 | F3DEX 1.23 | Factor 5 | `97777ca06f4e` |
+| Sesame Street - Elmo's Number Journey (USA) | NENE | 0 | 8 MB | libgultra 2.0D-I | 302 | kmc 96% | 973 | F3DEX 1.23 | Factor 5 | `7195ea96d9fe` |
 | Snowboard Kids 2 (USA) | NK2E | 0 | 16 MB | libgultra_rom 2.0J | 191 | kmc 94%, ido 6% | 2789 | F3DEX 2.05 fifo, S2DEX 2.05 fifo | - | `5ce896fd6427` |
 | South Park - Chef's Luv Shack (USA) (packed) | NCYE | 0 | 16 MB | libgultra_rom 2.0D-I | 125 | kmc 92%, ido 8% | 1204 | none read | - | `0344b569e841` |
 | South Park Rally (USA) | NPRE | 0 | 16 MB | libgultra_rom 2.0K-L | 132 | kmc 95%, ido 5% | 1636 | F3DEX 2.08 xbus, L3DEX 2.08 xbus | - | `e0b9e2358b09` |
@@ -181,13 +181,27 @@ The first is an F3DEX-family microcode with its version. The second is the older
 
 ## Checked against full decompilations
 
-For three titles the compiler answer has been tested by rebuilding code to identical bytes, which is much stronger than the family column above:
+For five titles the compiler answer has been tested by rebuilding code to identical bytes, which is much stronger than the family column above:
 
 - **Wheel of Fortune (USA):** game code is KMC GCC 2.7.2 with optimisation off; the SDK is the IDO build. The whole cartridge rebuilds byte-identical from source.
+- **Sesame Street - Elmo's Letter Adventure (USA):** the final catalogue contains 964 functions. The conventional project builds 912 C files and 22 assembly files using KMC GCC 2.7.2 plus SGI IDO 7.1/5.3 for the speech-codec lane. A fresh `make extract` followed by `make`, with the base ROM made unreadable during the build, reproduced SHA-1 `97777ca06f4e8aff8f1e95033cc8d3833be40f76`.
+- **Sesame Street - Elmo's Number Journey (USA):** the final catalogue contains 973 functions. The conventional project builds 921 C files and 22 assembly files with the same mixed KMC/IDO toolchain. The corresponding isolated rebuild reproduced SHA-1 `7195ea96d9fe5de065af61f70d55c92c8ee905e6`.
 - **Madden Football 64 (USA):** game code is KMC GCC 2.7.2 at `-O2`, in several overlays. Partly decompiled.
 - **Sydney 2000 (USA prototype, not in the table):** resident code is KMC GCC; its overlays are SN Systems GCC and include C++, where GCC 2.8.1's C++ compiler reproduces constructors byte for byte. In progress.
 
-The Sydney case shows the limit of the family column: C++ and SN-built code would be reported there as plain `kmc`.
+The Sydney and Sesame cases show the limit of the family column: C++ and SN-built code would be reported as plain `kmc`, while a small IDO-built library inside a mostly KMC title can be hidden by the majority share.
+
+### Sesame Street completed-project findings
+
+The final Letter and Number projects are conventional matching-decompilation trees rather than loose verification sources. After a one-time extraction from a user-supplied ROM, `make` compiles and assembles the sources, links the program, re-encodes the extracted assets, builds the cartridge image and checks its SHA-1 without reading the base ROM again.
+
+- Code is entirely rebuilt from source. Letter has 912 C files and 22 assembly files; Number has 921 C files and 22 assembly files.
+- The projects use 183 and 182 libultra source files, respectively, on SDK headers. Shared headers cover the audio library, speech-codec stream, maths library and named game-actor classes.
+- Of the former assembly-assisted set, 52 routines per title are proven original hand-written assembly and are grouped into their original assembly units. `strcpy` was recovered as matching C. One function per title still requires an inline empty assembly statement to preserve the original register allocation.
+- The DOS gzip 1.2.4 small-memory recipe reproduces all 16 compressed level streams exactly. Together with the other encoders, this removes the largest former verbatim-data exception from the whole-ROM pipeline.
+- Source quality is improved but not fully human-restored: 281 private structure definitions remain in 128 Letter files and 326 remain in 140 Number files; many symbols remain address-based; functions have not yet been regrouped into their original translation units.
+- A small amount of extracted state remains explicit data because decoded meaning does not uniquely determine the original bytes: ADPCM frame headers, clamped audio frames, boot/microcode tables, ROM-header fields and small untyped arrays. These bytes are produced from the extracted project inputs, not copied from the ROM during `make`.
+- The completed rebuild exposed and corrected two semantic lifting errors: a game function in each title used `+1.0` where the ROM has `-1.0`, and three callers had `sin`/`cos` reversed.
 
 ## Known limits
 
