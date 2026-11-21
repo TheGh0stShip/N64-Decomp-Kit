@@ -5,7 +5,7 @@ description = "Analysis, matching and asset tooling for N64 decompilation projec
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
 requires-python = ">=3.11"
-dependencies = ["rabbitizer>=1.16"]
+dependencies = ["rabbitizer>=1.16", "pycparser>=2.21"]
 
 [project.optional-dependencies]
 draft = ["m2c @ git+https://github.com/matt-kempster/m2c"]
