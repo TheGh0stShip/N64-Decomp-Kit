@@ -231,6 +231,8 @@ def _doctor_args(p):
     p.add_argument("--fix-user", action="store_true",
                    help="print user-local remediation commands; never mutates the host")
     p.add_argument("--skip-functional", action="store_true", help="skip functional smoke tests")
+    from .doctor import host_arguments
+    host_arguments(p)
 
 
 def _doctor_functional_smokes(project: Path) -> list[dict]:
@@ -312,6 +314,9 @@ def _doctor_functional_smokes(project: Path) -> list[dict]:
 
 @command("doctor", "Validate project, toolchains, host tools and optional research profiles")
 def doctor(args):
+    if getattr(args, "host", False):                  # machine checks only (n64dk.commands.doctor)
+        from .doctor import host_doctor
+        return host_doctor(args)
     project = Path(args.project).expanduser().resolve()
     cfg = load_config(project)
     workbench = _project_workbench_config(project)
