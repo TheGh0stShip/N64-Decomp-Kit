@@ -2588,7 +2588,7 @@ n64dk scheduler-plan [--project PROJECT] [--jobs JOBS] [--gpu] [--limit LIMIT]
 | argument | value | required | default | description |
 |---|---|---|---|---|
 | `--project` | `PROJECT` |  | `'.'` |  |
-| `--jobs` | `JOBS` |  | `30` |  |
+| `--jobs` | `JOBS` |  |  | compile workers (default: CPU count minus two, at least one) |
 | `--gpu` |  |  |  |  |
 | `--limit` | `LIMIT` |  | `500` |  |
 

@@ -1559,7 +1559,7 @@ gate_policy.arguments = _gate_policy_args
 
 def _scheduler_args(p):
     p.add_argument("--project", default=".")
-    p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    p.add_argument("--jobs", type=int, help="compile workers (default: CPU count minus two, at least one)")
     p.add_argument("--gpu", action="store_true")
     p.add_argument("--limit", type=int, default=500)
 
@@ -1567,6 +1567,7 @@ def _scheduler_args(p):
 @command("scheduler-plan", "Build persistent discovery, exploitation, family, recovery, boundary and verification lanes")
 def scheduler_plan(args):
     project = Path(args.project).resolve(); inventory = build_inventory(project); rows = inventory["functions"]
+    jobs = args.jobs if args.jobs is not None else max(1, (os.cpu_count() or 2) - 2)
     lane = {name: [] for name in ("discovery", "exploitation", "family-propagation", "recovery", "boundary-audit", "integration")}
     for row in rows:
         if row["state"] == "conflict" or row["ownership_state"] == "fragment": lane["boundary-audit"].append(row)
@@ -1579,7 +1580,7 @@ def scheduler_plan(args):
                "usable_candidate_source": sum(bool(x.get("candidate_source")) for x in rows),
                "selected": sum(map(len, lane.values())), "compiled": 0, "unique_sources": 0,
                "unique_objects": 0, "exact": 0, "improved": 0, "unchanged": 0, "invalid_mappings": 0}
-    plan = {"cpu": {"compile_workers": args.jobs, "reserved_orchestration": 1, "reserved_verification": 1},
+    plan = {"cpu": {"compile_workers": jobs, "reserved_orchestration": 1, "reserved_verification": 1},
             "gpu": {"enabled": args.gpu, "role": "bounded retrieval and ranking only"},
             "lanes": {key: [row["id"] for row in value] for key, value in lane.items()}, "metrics": metrics}
     plan_id = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()[:20]

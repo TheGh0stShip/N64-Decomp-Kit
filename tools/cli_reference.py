@@ -134,8 +134,10 @@ def render() -> str:
         for action in rows:
             label = ", ".join(f"`{s}`" for s in action.option_strings) or f"`{action.dest}` (positional)"
             value = _value(action)
+            required = (action.required if action.option_strings
+                        else action.nargs not in ("?", "*", argparse.OPTIONAL, argparse.ZERO_OR_MORE))
             lines.append(f"| {label} | {('`' + value + '`') if value else ''} | "
-                         f"{'yes' if action.required or not action.option_strings and action.nargs not in ('?', '*') else ''} | "
+                         f"{'yes' if required else ''} | "
                          f"{_default(action)} | {_help(action, parser.prog)} |")
     return "\n".join(lines) + "\n"
 
